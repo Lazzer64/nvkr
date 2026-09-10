@@ -1,0 +1,23 @@
+apiVersion: nkd.dev/definition/v2
+catalog:
+  base: catalog
+kind: Definition
+metadata:
+  description: Render and package AICR; the NKE OS build owns embedded worker components.
+  name: nke-aicr
+outputs:
+- format: helm-oci
+  name: gpu-runtime
+  recipe: h100-runtime
+recipes:
+- aicrGenerator: aicr
+  criteria:
+    arch: amd64
+    category: accelerated-runtime
+    k8sVersion: 1.32.0
+    os: ubuntu
+  name: h100-runtime
+  parameters:
+    accelerator: h100
+    intent: training
+    service: eks

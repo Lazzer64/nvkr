@@ -1,0 +1,361 @@
+apiVersion: nkd.dev/catalog/v1
+components:
+  cni-plugins:
+    artifactPath: bin/bridge
+    buildCommand:
+    - sh
+    - ./build_linux.sh
+    cgo: false
+    fromSource: true
+    outputType: host-package
+    roles:
+    - control-plane
+    - worker
+    - gpu-worker
+    source: cni-plugins
+    writeDir: bin
+  containerd:
+    artifactPath: bin/containerd
+    buildCommand:
+    - go
+    - build
+    - -mod=vendor
+    - -trimpath
+    - -ldflags=-buildid=
+    - -tags
+    - urfave_cli_no_docs
+    - -o
+    - /src/bin/containerd
+    - ./cmd/containerd
+    cgo: false
+    fromSource: true
+    outputType: host-package
+    roles:
+    - control-plane
+    - worker
+    - gpu-worker
+    source: containerd
+    writeDir: bin
+  coredns:
+    artifactPath: bin/coredns
+    buildCommand:
+    - go
+    - build
+    - -mod=vendor
+    - -trimpath
+    - -ldflags=-buildid= -s -w
+    - -o
+    - /src/bin/coredns
+    - .
+    cgo: false
+    fromSource: true
+    outputType: oci-image
+    roles:
+    - control-plane
+    source: coredns
+    writeDir: bin
+  crictl:
+    artifactPath: bin/crictl
+    buildCommand:
+    - go
+    - build
+    - -mod=vendor
+    - -trimpath
+    - -ldflags=-buildid=
+    - -o
+    - /src/bin/crictl
+    - ./cmd/crictl
+    cgo: false
+    fromSource: true
+    outputType: host-package
+    roles:
+    - control-plane
+    - worker
+    - gpu-worker
+    source: crictl
+    writeDir: bin
+  etcd:
+    artifactPath: bin/etcd
+    buildCommand:
+    - sh
+    - -c
+    - cd server && go build -mod=vendor -trimpath -ldflags=-buildid= -o /src/bin/etcd
+      .
+    cgo: false
+    fromSource: true
+    outputType: oci-image
+    roles:
+    - control-plane
+    source: etcd
+    writeDir: bin
+  helm:
+    artifactPath: bin/helm
+    buildCommand:
+    - go
+    - build
+    - -mod=vendor
+    - -trimpath
+    - -ldflags=-buildid=
+    - -o
+    - /src/bin/helm
+    - ./cmd/helm
+    cgo: false
+    fromSource: true
+    outputType: host-package
+    roles:
+    - control-plane
+    source: helm
+    writeDir: bin
+  kube-apiserver:
+    artifactPath: _output/local/bin/linux/{{.Arch}}/kube-apiserver
+    buildCommand:
+    - make
+    - WHAT=cmd/kube-apiserver
+    - KUBE_BUILD_PLATFORMS=linux/{{.Arch}}
+    cgo: false
+    fromSource: true
+    outputType: oci-image
+    roles:
+    - control-plane
+    source: kubernetes
+    versionStamp:
+      KUBE_GIT_COMMIT: '{{.Commit}}'
+      KUBE_GIT_MAJOR: '{{.Major}}'
+      KUBE_GIT_MINOR: '{{.Minor}}'
+      KUBE_GIT_TREE_STATE: clean
+      KUBE_GIT_VERSION: '{{.Tag}}'
+    writeDir: _output
+  kube-controller-manager:
+    artifactPath: _output/local/bin/linux/{{.Arch}}/kube-controller-manager
+    buildCommand:
+    - make
+    - WHAT=cmd/kube-controller-manager
+    - KUBE_BUILD_PLATFORMS=linux/{{.Arch}}
+    cgo: false
+    fromSource: true
+    outputType: oci-image
+    roles:
+    - control-plane
+    source: kubernetes
+    versionStamp:
+      KUBE_GIT_COMMIT: '{{.Commit}}'
+      KUBE_GIT_MAJOR: '{{.Major}}'
+      KUBE_GIT_MINOR: '{{.Minor}}'
+      KUBE_GIT_TREE_STATE: clean
+      KUBE_GIT_VERSION: '{{.Tag}}'
+    writeDir: _output
+  kube-proxy:
+    artifactPath: _output/local/bin/linux/{{.Arch}}/kube-proxy
+    buildCommand:
+    - make
+    - WHAT=cmd/kube-proxy
+    - KUBE_BUILD_PLATFORMS=linux/{{.Arch}}
+    cgo: false
+    fromSource: true
+    outputType: oci-image
+    roles:
+    - control-plane
+    - worker
+    - gpu-worker
+    source: kubernetes
+    versionStamp:
+      KUBE_GIT_COMMIT: '{{.Commit}}'
+      KUBE_GIT_MAJOR: '{{.Major}}'
+      KUBE_GIT_MINOR: '{{.Minor}}'
+      KUBE_GIT_TREE_STATE: clean
+      KUBE_GIT_VERSION: '{{.Tag}}'
+    writeDir: _output
+  kube-scheduler:
+    artifactPath: _output/local/bin/linux/{{.Arch}}/kube-scheduler
+    buildCommand:
+    - make
+    - WHAT=cmd/kube-scheduler
+    - KUBE_BUILD_PLATFORMS=linux/{{.Arch}}
+    cgo: false
+    fromSource: true
+    outputType: oci-image
+    roles:
+    - control-plane
+    source: kubernetes
+    versionStamp:
+      KUBE_GIT_COMMIT: '{{.Commit}}'
+      KUBE_GIT_MAJOR: '{{.Major}}'
+      KUBE_GIT_MINOR: '{{.Minor}}'
+      KUBE_GIT_TREE_STATE: clean
+      KUBE_GIT_VERSION: '{{.Tag}}'
+    writeDir: _output
+  kubeadm:
+    artifactPath: _output/local/bin/linux/{{.Arch}}/kubeadm
+    buildCommand:
+    - make
+    - WHAT=cmd/kubeadm
+    - KUBE_BUILD_PLATFORMS=linux/{{.Arch}}
+    cgo: false
+    fromSource: true
+    outputType: host-package
+    roles:
+    - control-plane
+    - worker
+    - gpu-worker
+    source: kubernetes
+    versionStamp:
+      KUBE_GIT_COMMIT: '{{.Commit}}'
+      KUBE_GIT_MAJOR: '{{.Major}}'
+      KUBE_GIT_MINOR: '{{.Minor}}'
+      KUBE_GIT_TREE_STATE: clean
+      KUBE_GIT_VERSION: '{{.Tag}}'
+    writeDir: _output
+  kubectl:
+    artifactPath: _output/local/bin/linux/{{.Arch}}/kubectl
+    buildCommand:
+    - make
+    - WHAT=cmd/kubectl
+    - KUBE_BUILD_PLATFORMS=linux/{{.Arch}}
+    cgo: false
+    fromSource: true
+    outputType: host-package
+    roles:
+    - control-plane
+    - worker
+    - gpu-worker
+    source: kubernetes
+    versionStamp:
+      KUBE_GIT_COMMIT: '{{.Commit}}'
+      KUBE_GIT_MAJOR: '{{.Major}}'
+      KUBE_GIT_MINOR: '{{.Minor}}'
+      KUBE_GIT_TREE_STATE: clean
+      KUBE_GIT_VERSION: '{{.Tag}}'
+    writeDir: _output
+  kubelet:
+    artifactPath: _output/local/bin/linux/{{.Arch}}/kubelet
+    buildCommand:
+    - make
+    - WHAT=cmd/kubelet
+    - KUBE_BUILD_PLATFORMS=linux/{{.Arch}}
+    cgo: true
+    fromSource: true
+    outputType: host-package
+    roles:
+    - control-plane
+    - worker
+    - gpu-worker
+    source: kubernetes
+    versionStamp:
+      CC: gcc
+      KUBE_GIT_COMMIT: '{{.Commit}}'
+      KUBE_GIT_MAJOR: '{{.Major}}'
+      KUBE_GIT_MINOR: '{{.Minor}}'
+      KUBE_GIT_TREE_STATE: clean
+      KUBE_GIT_VERSION: '{{.Tag}}'
+    writeDir: _output
+  pause:
+    artifactPath: out/pause
+    buildCommand:
+    - sh
+    - -c
+    - gcc -Os -Wall -Werror -static -o /src/out/pause build/pause/linux/pause.c &&
+      strip /src/out/pause
+    cgo: false
+    fromSource: true
+    outputType: oci-image
+    roles:
+    - control-plane
+    source: kubernetes
+    writeDir: out
+  runc:
+    artifactPath: out/runc
+    buildCommand:
+    - sh
+    - -c
+    - go build -trimpath -tags 'seccomp netgo osusergo static_build' -ldflags '-buildid=
+      -extldflags -static' -o /src/out/runc .
+    cgo: true
+    fromSource: true
+    outputType: host-package
+    roles:
+    - control-plane
+    - worker
+    - gpu-worker
+    source: runc
+    writeDir: out
+kind: SourceBuildRegistry
+metadata:
+  description: NVIDIA Kubernetes Definition — default LAYERED catalog (top-level recipes/,
+    like AICR). Sources + the full Tier-1 component set are declared here once; the
+    recipe for a query is COMPOSED from overlays/ (base + the kubernetes category
+    overlay) + mixins/. Resolved pins live in pins.lock.yaml (machine-managed by `nkdctl
+    catalog pin/bump`), so a version bump touches only the lock. See docs/versioning.md.
+  name: nkd-default
+sources:
+  checkout:
+    kind: github-action
+    repo: https://github.com/actions/checkout
+    constraint: 7.x
+  download-artifact:
+    kind: github-action
+    repo: https://github.com/actions/download-artifact
+    constraint: 8.x
+  setup-go:
+    kind: github-action
+    repo: https://github.com/actions/setup-go
+    constraint: 7.x
+  upload-artifact:
+    kind: github-action
+    repo: https://github.com/actions/upload-artifact
+    constraint: 7.x
+  aicr:
+    constraint: 0.18.x
+    repo: https://github.com/NVIDIA/aicr
+    tool:
+      executablePath: aicr
+      format: tar-gzip
+      platform: linux/amd64
+      url: https://github.com/NVIDIA/aicr/releases/download/{{.Tag}}/aicr_{{.Version}}_linux_amd64.tar.gz
+  cni-plugins:
+    constraint: 1.7.x
+    repo: https://github.com/containernetworking/plugins
+    toolchainImage: golang@sha256:59b8183301af6dc358c9258d7b2ab0ee1a9363618552334fb3b160d454cbda72
+  containerd:
+    constraint: 1.7.x
+    repo: https://github.com/containerd/containerd
+    toolchainImage: golang@sha256:fe5d57d3b718e7a4986bae156c2d73f44973bfd313073aed08a4de6692bb6161
+  coredns:
+    constraint: 1.12.x
+    repo: https://github.com/coredns/coredns
+    toolchainBaseImage: golang
+    vendorCommand:
+    - go
+    - mod
+    - vendor
+  crictl:
+    constraint: 1.34.x
+    repo: https://github.com/kubernetes-sigs/cri-tools
+    toolchainImage: golang@sha256:fe5d57d3b718e7a4986bae156c2d73f44973bfd313073aed08a4de6692bb6161
+  etcd:
+    constraint: 3.5.x
+    repo: https://github.com/etcd-io/etcd
+    toolchainBaseImage: golang
+    vendorCommand:
+    - sh
+    - -c
+    - cd server && go mod vendor
+  helm:
+    constraint: 3.20.x
+    repo: https://github.com/helm/helm
+    toolchainImage: golang@sha256:fe5d57d3b718e7a4986bae156c2d73f44973bfd313073aed08a4de6692bb6161
+    vendorCommand:
+    - go
+    - mod
+    - vendor
+  kubernetes:
+    constraint: 1.32.x
+    repo: https://github.com/kubernetes/kubernetes
+    toolchainImagesByArch:
+      amd64: nkd-toolchain-go@sha256:2154cb16a59fee9fa8d53167de0899936ed09b3b1a816b465bcce363e485c0ee
+      arm64: nkd-toolchain-go@sha256:0604f5c92d7dc2358ba205fd5474428022bab1b77cfbe297b370f7f7461c1c5e
+  runc:
+    constraint: 1.5.x
+    repo: https://github.com/opencontainers/runc
+    toolchainImagesByArch:
+      amd64: nkd-toolchain-cgo@sha256:d9ca6b8de5ae00fd2b25c2768652adb92e86c44db199c51520730cbc31f3f0ac
+      arm64: nkd-toolchain-cgo@sha256:e2d93f718fc21fa61f9157c54e03336daf7649b0f9a866667e35dec51fecc56a
