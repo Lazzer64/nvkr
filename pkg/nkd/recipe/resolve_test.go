@@ -8,8 +8,36 @@ import (
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/catalog"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/criteria"
 	nkderr "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/execution"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/ir"
 )
+
+const (
+	testVMRepo      = "https://github.com/example/node-image"
+	testVMCommit    = "1111111111111111111111111111111111111111"
+	testVMTree      = "2222222222222222222222222222222222222222"
+	testVMToolchain = "example.invalid/nkd-vm-builder@sha256:59b8183301af6dc358c9258d7b2ab0ee1a9363618552334fb3b160d454cbda72"
+)
+
+func testVMImageComponent(hosts []execution.HostPlatform, policy execution.CapabilityPolicy) catalog.Component {
+	return catalog.Component{
+		FromSource: true, BuilderType: catalog.BuilderVMImage, OutputType: "disk-image",
+		Disk: &catalog.DiskSpec{Format: "qcow2", Encryption: "none"},
+		BuildRequirements: &execution.Requirements{
+			Resources: &execution.ResourceRequest{
+				CPUMillis: 1000, MemoryMiB: 1024, EphemeralStorageMiB: 4096,
+			},
+			AllowedHostPlatforms: hosts,
+			Capabilities: []execution.CapabilityRequirement{{
+				Name: execution.CapabilityKVM, Policy: policy,
+			}},
+			TimeoutSeconds: 3600,
+		},
+		Repo: testVMRepo, Commit: testVMCommit, TreeHash: testVMTree,
+		ToolchainImage: testVMToolchain,
+		BuildCommand:   []string{"make", "image"}, ArtifactPath: "out/image.qcow2", SourceDate: 1733939955,
+	}
+}
 
 func layeredKubernetesFixture(t *testing.T) *catalog.Catalog {
 	t.Helper()
@@ -76,6 +104,63 @@ func TestResolveNoMatch(t *testing.T) {
 	_, err := Resolve(cat, criteria.Criteria{Category: "kubernetes"}, nil)
 	if code(err) != nkderr.CodeNoMatch {
 		t.Fatalf("want CodeNoMatch, got %v", err)
+	}
+}
+
+func TestResolveVMImageKVMHostRoutes(t *testing.T) {
+	makeCatalog := func(component catalog.Component) *catalog.Catalog {
+		return &catalog.Catalog{
+			Recipes: []catalog.Recipe{{
+				ID: "os", Criteria: criteria.Criteria{Category: "os", OS: "ubuntu", Arch: "any"}, Components: []string{"image"},
+			}},
+			Components: map[string]catalog.Component{"image": component},
+		}
+	}
+	query := criteria.Criteria{Category: "os", OS: "ubuntu", Arch: "arm64"}
+	for _, test := range []struct {
+		name     string
+		hosts    []execution.HostPlatform
+		policy   execution.CapabilityPolicy
+		wantCode nkderr.Code
+	}{
+		{
+			name:     "required cross-architecture",
+			hosts:    []execution.HostPlatform{execution.HostPlatformLinuxAMD64},
+			policy:   execution.CapabilityRequired,
+			wantCode: nkderr.CodeInvalidCatalog,
+		},
+		{
+			name: "required native",
+			hosts: []execution.HostPlatform{
+				execution.HostPlatformLinuxAMD64,
+				execution.HostPlatformLinuxARM64,
+			},
+			policy: execution.CapabilityRequired,
+		},
+		{
+			name:   "preferred cross-architecture",
+			hosts:  []execution.HostPlatform{execution.HostPlatformLinuxAMD64},
+			policy: execution.CapabilityPreferred,
+		},
+		{
+			name:   "forbidden cross-architecture",
+			hosts:  []execution.HostPlatform{execution.HostPlatformLinuxAMD64},
+			policy: execution.CapabilityForbidden,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			component := testVMImageComponent(test.hosts, test.policy)
+			resolved, err := Resolve(makeCatalog(component), query, nil)
+			if test.wantCode != "" {
+				if code(err) != test.wantCode || resolved != nil {
+					t.Fatalf("Resolve() = %#v, %v; want no result and %s", resolved, err, test.wantCode)
+				}
+				return
+			}
+			if err != nil || resolved == nil {
+				t.Fatalf("Resolve() = %#v, %v; want success", resolved, err)
+			}
+		})
 	}
 }
 

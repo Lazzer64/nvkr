@@ -8,12 +8,13 @@ import (
 	"testing"
 
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/criteria"
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/execution"
 )
 
-func TestLogicalIdentityDTOClassifiesEveryExecutionField(t *testing.T) {
-	assertIdentityClassification(t, reflect.TypeOf(Node{}), reflect.TypeOf(LogicalNode{}), nodeIdentityFieldClass)
-	assertIdentityClassification(t, reflect.TypeOf(criteria.Criteria{}), reflect.TypeOf(LogicalCriteria{}), criteriaIdentityFieldClass)
-	assertIdentityClassification(t, reflect.TypeOf(Graph{}), reflect.TypeOf(LogicalGraph{}), graphIdentityFieldClass)
+func TestRecipeIdentityFieldRulesCoverEveryGraphField(t *testing.T) {
+	assertRecipeIdentityFieldRules(t, reflect.TypeOf(Node{}), reflect.TypeOf(LogicalNode{}), nodeRecipeIdentityRules)
+	assertRecipeIdentityFieldRules(t, reflect.TypeOf(criteria.Criteria{}), reflect.TypeOf(LogicalCriteria{}), criteriaRecipeIdentityRules)
+	assertRecipeIdentityFieldRules(t, reflect.TypeOf(Graph{}), reflect.TypeOf(LogicalGraph{}), graphRecipeIdentityRules)
 
 	activation := reflect.TypeOf(AICRActivation{})
 	logicalActivation := reflect.TypeOf(LogicalAICRActivation{})
@@ -29,40 +30,41 @@ func TestLogicalIdentityDTOClassifiesEveryExecutionField(t *testing.T) {
 	}
 }
 
-func assertIdentityClassification(t *testing.T, execution, logical reflect.Type,
-	classification map[string]identityFieldClass,
+func assertRecipeIdentityFieldRules(t *testing.T, full, logical reflect.Type,
+	rules map[string]recipeIdentityFieldRule,
 ) {
 	t.Helper()
-	if len(classification) != execution.NumField() {
-		t.Fatalf("%s identity classification has %d entries for %d execution fields",
-			execution.Name(), len(classification), execution.NumField())
+	if len(rules) != full.NumField() {
+		t.Fatalf("%s Recipe-identity rules have %d entries for %d fields",
+			full.Name(), len(rules), full.NumField())
 	}
-	for i := 0; i < execution.NumField(); i++ {
-		field := execution.Field(i)
-		class, ok := classification[field.Name]
+	for i := 0; i < full.NumField(); i++ {
+		field := full.Field(i)
+		rule, ok := rules[field.Name]
 		if !ok {
-			t.Fatalf("new %s field %s has no explicit recipe-identity classification", execution.Name(), field.Name)
+			t.Fatalf("new %s field %s has no explicit Recipe-identity rule", full.Name(), field.Name)
 		}
 		logicalField, represented := logical.FieldByName(field.Name)
-		switch class {
-		case identityLogical, identityContentReference:
+		switch rule {
+		case includeLogicalValueInRecipeIdentity, includeContentReferenceInRecipeIdentity:
 			if !represented {
-				t.Fatalf("T1 %s field %s is classified for identity but absent from %s", execution.Name(), field.Name, logical.Name())
+				t.Fatalf("T1 %s field %s is classified for identity but absent from %s", full.Name(), field.Name, logical.Name())
 			}
 			if logicalField.Tag.Get("json") != field.Tag.Get("json") {
-				t.Fatalf("T1 %s field %s changed canonical key in %s", execution.Name(), field.Name, logical.Name())
+				t.Fatalf("T1 %s field %s changed canonical key in %s", full.Name(), field.Name, logical.Name())
 			}
-		case identityTransport, identityComposition:
+		case excludeTransportFromRecipeIdentity, excludeCompositionFromRecipeIdentity,
+			excludeExecutionMetadataFromRecipeIdentity:
 			if represented {
-				t.Fatalf("non-T1 %s field %s leaked into %s", execution.Name(), field.Name, logical.Name())
+				t.Fatalf("non-T1 %s field %s leaked into %s", full.Name(), field.Name, logical.Name())
 			}
 		default:
-			t.Fatalf("%s field %s has unknown identity classification %d", execution.Name(), field.Name, class)
+			t.Fatalf("%s field %s has unknown Recipe-identity rule %d", full.Name(), field.Name, rule)
 		}
 	}
-	for name := range classification {
-		if _, ok := execution.FieldByName(name); !ok {
-			t.Fatalf("identity classification retains removed %s field %s", execution.Name(), name)
+	for name := range rules {
+		if _, ok := full.FieldByName(name); !ok {
+			t.Fatalf("Recipe-identity rules retain removed %s field %s", full.Name(), name)
 		}
 	}
 }
@@ -204,6 +206,46 @@ func TestDigestStableAndSensitive(t *testing.T) {
 	d3, _ := g2.Digest()
 	if d3 == d1 {
 		t.Fatal("digest did not change when a pinned commit changed")
+	}
+}
+
+func TestExecutionRequirementsChangeFullGraphButNotRecipeIdentity(t *testing.T) {
+	base := sample()
+	baseDigest, err := base.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseBytes, err := base.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	requested := sample()
+	requested.Nodes[0].Requirements = &execution.Requirements{
+		Resources: &execution.ResourceRequest{
+			CPUMillis: 2000, MemoryMiB: 4096, EphemeralStorageMiB: 8192,
+		},
+		AllowedHostPlatforms: []execution.HostPlatform{
+			execution.HostPlatformLinuxAMD64, execution.HostPlatformLinuxARM64,
+		},
+		Capabilities: []execution.CapabilityRequirement{{
+			Name: execution.CapabilityKVM, Policy: execution.CapabilityPreferred,
+		}},
+		TimeoutSeconds: 7200,
+	}
+	requestedDigest, err := requested.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestedBytes, err := requested.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requestedDigest != baseDigest {
+		t.Fatalf("execution request changed recipe identity: %s != %s", requestedDigest, baseDigest)
+	}
+	if string(requestedBytes) == string(baseBytes) {
+		t.Fatal("execution request was omitted from the full executable graph")
 	}
 }
 

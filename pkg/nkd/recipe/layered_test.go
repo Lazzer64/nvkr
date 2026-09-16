@@ -10,6 +10,8 @@ import (
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/catalog"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/compose"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/criteria"
+	nkderr "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/execution"
 )
 
 // ADR-12 assigns category to recipe selection and role to SKU composition. Keep the
@@ -81,6 +83,39 @@ func TestLayeredCategoryInferenceRequiresExactlyOneDeclaredCategory(t *testing.T
 	}, nil)
 	if code(err) != "NKD-E-AMBIGUOUS" {
 		t.Fatalf("omitted category in multi-category catalog did not fail ambiguous: %v", err)
+	}
+}
+
+func TestResolveLayeredValidatesVMHostRouteAfterComposition(t *testing.T) {
+	component := testVMImageComponent(
+		[]execution.HostPlatform{execution.HostPlatformLinuxAMD64},
+		execution.CapabilityPreferred,
+	)
+	makeCatalog := func(policy execution.CapabilityPolicy) *catalog.Catalog {
+		base := &compose.RecipeMetadata{Kind: compose.RecipeMetadataKind, APIVersion: compose.APIVersion}
+		base.Metadata.Name = "base"
+		base.Spec.ComponentRefs = []compose.ComponentRef{{Name: "image"}}
+		overlay := &compose.RecipeMetadata{Kind: compose.RecipeMetadataKind, APIVersion: compose.APIVersion}
+		overlay.Metadata.Name = "os-arm64"
+		overlay.Spec.Criteria = &criteria.Criteria{Category: "os", OS: "ubuntu", Arch: "arm64"}
+		overlay.Spec.ComponentRefs = []compose.ComponentRef{{
+			Name: "image", Overrides: map[string]any{
+				"buildRequirements": map[string]any{
+					"capabilities": []any{map[string]any{"name": "kvm", "policy": string(policy)}},
+				},
+			},
+		}}
+		return &catalog.Catalog{
+			Layers:     &compose.Store{Base: base, Overlays: map[string]*compose.RecipeMetadata{"os-arm64": overlay}},
+			Components: map[string]catalog.Component{"image": component},
+		}
+	}
+	query := criteria.Criteria{Category: "os", OS: "ubuntu", Arch: "arm64"}
+	if resolved, err := Resolve(makeCatalog(execution.CapabilityRequired), query, nil); code(err) != nkderr.CodeInvalidCatalog || resolved != nil {
+		t.Fatalf("layered required-KVM route = %#v, %v; want no result and %s", resolved, err, nkderr.CodeInvalidCatalog)
+	}
+	if resolved, err := Resolve(makeCatalog(execution.CapabilityPreferred), query, nil); err != nil || resolved == nil {
+		t.Fatalf("layered preferred KVM must retain the cross-architecture TCG route: %#v, %v", resolved, err)
 	}
 }
 

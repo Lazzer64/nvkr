@@ -10,6 +10,7 @@ import (
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/aicr"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/compose"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/criteria"
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/execution"
 )
 
 // From-source builder types (ADR-10). Executable builders mirror ir.Builder*;
@@ -57,11 +58,10 @@ type Source struct {
 	TagPrefix          string `json:"tagPrefix,omitempty"`
 	ToolchainImage     string `json:"toolchainImage,omitempty"`     // explicit digest pin (arch-agnostic or single-arch)
 	ToolchainBaseImage string `json:"toolchainBaseImage,omitempty"` // resolve <base>:<.go-version> digest on pin
-	// ToolchainImagesByArch pins a NATIVE toolchain per target arch (arch -> digest).
-	// It is the multi-arch, model-(B) form: the build for arch X uses the X-native
-	// toolchain image and runs on an X platform, so compilation is native (no
-	// cross-compilation). When set, it takes precedence over ToolchainImage for arches
-	// it lists (NKD-NFR-093 typed-axis extension).
+	// ToolchainImagesByArch pins a toolchain per execution-host architecture. For
+	// ordinary builders execution and target architecture are the same. A vm-image
+	// builder may target a different guest architecture under its declared KVM/TCG
+	// policy. When set, this map takes precedence over ToolchainImage for listed arches.
 	ToolchainImagesByArch map[string]string `json:"toolchainImagesByArch,omitempty"`
 	VendorCommand         []string          `json:"vendorCommand,omitempty"` // run in the fetch step (network) to vendor deps for a non-vendored repo
 }
@@ -175,6 +175,10 @@ type Component struct {
 	// BuilderType selects the from-source build substrate (ADR-10). It is a
 	// build-semantic input and flows into recipeDigest.
 	BuilderType string `json:"builderType,omitempty"`
+	// BuildRequirements declares the generic runner contract for this component's
+	// build step. It is operational metadata, not builder-specific behavior or proof
+	// that a selected runner satisfies the request.
+	BuildRequirements *execution.Requirements `json:"buildRequirements,omitempty"`
 	// Flake pins a nix builder's locked flake (set only when BuilderType==nix).
 	Flake *FlakePin `json:"flake,omitempty"`
 
@@ -185,8 +189,9 @@ type Component struct {
 	TreeHash       string  `json:"treeHash,omitempty"` // expected source tree hash
 	Patches        []Patch `json:"patches,omitempty"`
 	ToolchainImage string  `json:"toolchainImage,omitempty"` // must be @sha256: digest
-	// ToolchainImages is the resolved per-arch native toolchain set (arch -> digest);
-	// Compile selects the entry for the recipe's arch, falling back to ToolchainImage.
+	// ToolchainImages is the resolved per-execution-arch toolchain set. Ordinary
+	// compilation selects the Recipe arch. Future VM admission selects one eligible
+	// host platform independently from the guest/output arch.
 	ToolchainImages map[string]string `json:"toolchainImages,omitempty"`
 	CGO             bool              `json:"cgo,omitempty"`
 	OutputType      string            `json:"outputType,omitempty"`

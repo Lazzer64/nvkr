@@ -108,6 +108,24 @@ exact source-owned argument vector, and artifact path. NKD does not infer Packer
 workflow. These fields are Recipe inputs once disk lowering is admitted; the schema-only contract mints no
 Recipe identity for a disk.
 
+Runner capacity is not part of `vm-image`. A from-source component may declare generic `buildRequirements`
+using ADR-18's per-step execution contract. A `vm-image` producer must use that same generic type to declare a
+complete profile: positive CPU, memory and ephemeral storage, at least one eligible runner-host platform, an
+explicit KVM policy, and a positive executor timeout. That request is reusable by every builder type, changes
+catalog and Plan identity, and never proves that the selected runner satisfies it. The request can constrain minimum CPU,
+memory and ephemeral storage, an OR-set of eligible runner-host platforms, typed host capabilities, and the
+executor wall-time budget. Runner-host platform is distinct from Recipe criteria and the IR target/toolchain
+platform. For `vm-image`, per-architecture toolchain pins name execution-host platforms rather than the guest
+architecture. Every allowed host route needs an exact toolchain pin or the scalar fallback. `kvm` is the first
+typed capability: `required` must be exposed and requires an allowed host platform matching the resolved guest
+architecture, `forbidden` must be withheld, and `preferred` retains the cross-architecture TCG route. A future
+Plan binds KVM or the fallback before work rather than choosing opportunistically at runtime. Build network
+remains the existing IR semantic and is not duplicated here.
+
+NKE host CPU, memory, storage, platform, KVM policy, and timeout values remain unauthored until supported routes
+are measured. Guest vCPU, guest memory, and logical disk size are not host requests. Produced-artifact size is
+an artifact and transport concern rather than a runner-capacity field.
+
 For the [NKE Makefile at commit `6df693a`](https://github.com/NVIDIA/nke/blob/6df693a9748a78aafdf96e1f2d03772530783487/os-image/packer/Makefile#L148-L185),
 a future catalog entry binds two source-owned Make targets. Plain and FDE are separate selectable components,
 not a public boolean or variant. The existing typed architecture token is resolved from Recipe criteria:
