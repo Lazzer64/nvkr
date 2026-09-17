@@ -12,6 +12,7 @@ import (
 	"strings"
 	"text/template"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/canonical"
@@ -75,6 +76,7 @@ type rawComponent struct {
 	CGO             bool               `json:"cgo,omitempty"`
 	OutputType      string             `json:"outputType,omitempty"`
 	Disk            *DiskSpec          `json:"disk,omitempty"`
+	Packer          *PackerConfig      `json:"packer,omitempty"`
 	BuildCommand    []string           `json:"buildCommand,omitempty"`
 	ArtifactPath    string             `json:"artifactPath,omitempty"`
 	WriteDir        string             `json:"writeDir,omitempty"`
@@ -416,6 +418,7 @@ func resolveComponent(name string, raw rawComponent, sources map[string]Source, 
 		CGO:             raw.CGO,
 		OutputType:      raw.OutputType,
 		Disk:            raw.Disk,
+		Packer:          raw.Packer,
 		BuildCommand:    raw.BuildCommand,
 		ArtifactPath:    raw.ArtifactPath,
 		WriteDir:        raw.WriteDir,
@@ -521,7 +524,11 @@ func resolvePatches(p DataProvider, component string, c *Component, decls []patc
 }
 
 func validPatchPath(name string) bool {
-	return name != "." && fs.ValidPath(name) && !strings.Contains(name, `\`)
+	return name != "." && validSourceRelativePath(name)
+}
+
+func validSourceRelativePath(name string) bool {
+	return fs.ValidPath(name) && !strings.Contains(name, `\`)
 }
 
 // resolvePrebuilt resolves a no-compile component: it takes the version pin from the
@@ -853,6 +860,57 @@ func validateVMImageBuildRequirements(name string, requirements *execution.Requi
 	return nil
 }
 
+const (
+	maxPackerProjectPathBytes  = 4096
+	maxPackerArtifactPathBytes = 4096
+	maxPackerBuildNameBytes    = 256
+	maxPackerVariableNameBytes = 128
+)
+
+func validatePackerConfig(name string, config *PackerConfig) error {
+	if !validPackerTransportValue(config.ProjectPath, maxPackerProjectPathBytes) ||
+		!validSourceRelativePath(config.ProjectPath) || strings.ContainsAny(config.ProjectPath, "{}") {
+		return e.New(e.CodeInvalidCatalog,
+			"component %q: packer.projectPath %q is not a clean source-relative path", name, config.ProjectPath)
+	}
+	if !validPackerTransportValue(config.BuildName, maxPackerBuildNameBytes) ||
+		strings.ContainsAny(config.BuildName, ",*?[]\\") {
+		return e.New(e.CodeInvalidCatalog,
+			"component %q: packer.buildName %q must be a bounded exact Packer build name without list or glob syntax",
+			name, config.BuildName)
+	}
+	variables := []struct {
+		field string
+		value string
+	}{
+		{field: "architectureVariable", value: config.ArchitectureVariable},
+		{field: "materialManifestVariable", value: config.MaterialManifestVariable},
+		{field: "outputDirectoryVariable", value: config.OutputDirectoryVariable},
+	}
+	for _, variable := range variables {
+		if !validPackerTransportValue(variable.value, maxPackerVariableNameBytes) {
+			return e.New(e.CodeInvalidCatalog,
+				"component %q: packer.%s %q must be a bounded, control-free Packer variable name",
+				name, variable.field, variable.value)
+		}
+	}
+	if config.ArchitectureVariable == config.MaterialManifestVariable ||
+		config.ArchitectureVariable == config.OutputDirectoryVariable ||
+		config.MaterialManifestVariable == config.OutputDirectoryVariable {
+		return e.New(e.CodeInvalidCatalog,
+			"component %q: Packer architecture, material manifest, and output directory variables must be distinct", name)
+	}
+	return nil
+}
+
+// validPackerTransportValue enforces only transport-safety properties NKD owns. The
+// pinned Packer subprocess remains authoritative for project, build-name, and
+// variable semantics; catalog loading deliberately does not reimplement HCL.
+func validPackerTransportValue(value string, maxBytes int) bool {
+	return value != "" && len(value) <= maxBytes && utf8.ValidString(value) &&
+		strings.IndexFunc(value, unicode.IsControl) == -1
+}
+
 // ValidateVMImageHostRoute closes the guest/host relationship only after Recipe
 // criteria supplies a concrete guest architecture. KVM acceleration cannot cross
 // architectures; preferred and forbidden policies retain their declared TCG route.
@@ -929,6 +987,10 @@ func validateComponent(name string, c Component) error {
 	} else if c.Disk != nil {
 		return e.New(e.CodeInvalidCatalog, "component %q: disk settings require outputType disk-image", name)
 	}
+	if c.Packer != nil && c.BuilderType != BuilderVMImage {
+		return e.New(e.CodeInvalidCatalog,
+			"component %q: packer producer requires builderType vm-image", name)
+	}
 	if c.BuilderType == BuilderVMImage && !c.FromSource {
 		return e.New(e.CodeInvalidCatalog, "component %q: vm-image builder requires a from-source component", name)
 	}
@@ -984,6 +1046,17 @@ func validateComponent(name string, c Component) error {
 		if c.CGO || c.WriteDir != "" {
 			return e.New(e.CodeInvalidCatalog,
 				"component %q: vm-image builder may not declare CGO or a container writeDir", name)
+		}
+		commandProducer := len(c.BuildCommand) != 0
+		packerProducer := c.Packer != nil
+		if commandProducer == packerProducer {
+			return e.New(e.CodeInvalidCatalog,
+				"component %q: vm-image requires exactly one producer, buildCommand or packer", name)
+		}
+		if packerProducer {
+			if err := validatePackerConfig(name, c.Packer); err != nil {
+				return err
+			}
 		}
 	default:
 		return e.New(e.CodeInvalidCatalog,
@@ -1052,7 +1125,7 @@ func validateComponent(name string, c Component) error {
 			}
 		}
 	}
-	if len(c.BuildCommand) == 0 {
+	if len(c.BuildCommand) == 0 && c.Packer == nil {
 		return e.New(e.CodeInvalidCatalog, "component %q: empty buildCommand", name)
 	}
 	for _, s := range c.BuildCommand {
@@ -1065,6 +1138,12 @@ func validateComponent(name string, c Component) error {
 	}
 	if err := checkArchTokens(name, "artifactPath", c.ArtifactPath); err != nil {
 		return err
+	}
+	if c.Packer != nil && (!validPackerTransportValue(c.ArtifactPath, maxPackerArtifactPathBytes) ||
+		c.ArtifactPath == "." || !validSourceRelativePath(c.ArtifactPath)) {
+		return e.New(e.CodeInvalidCatalog,
+			"component %q: direct Packer artifactPath %q is not a clean path relative to the private output directory",
+			name, c.ArtifactPath)
 	}
 	// outputType is a required pin field: it selects the delivery form (and its
 	// packager) and CGO lane, so a missing one is fail-closed rather than defaulted

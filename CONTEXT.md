@@ -172,8 +172,13 @@ The compiler-selected exact execution class and resolved preferred-capability ch
 Plan validation recomputes the selection from the Environment inventory; the binding remains outside Recipe identity.
 _Avoid_: Runtime proof, authored requirement, mutable runner label
 
+**VM-image producer form**:
+The catalog-selected invocation contract within a VM-image component: either an exact command argument vector or
+a direct-Packer project, build name, and variable bindings.
+_Avoid_: Builder type, output format, evidence lane
+
 **VM-image builder**:
-A from-source builder capability for a disk-image output. The catalog binds its exact source-owned entrypoint
-and artifact path. Generic build requirements use the shared execution contract; typed VM lowering and
-execution remain separately admitted capabilities.
+A from-source builder capability for a disk-image output. The catalog binds one VM-image producer form and its
+artifact path. Generic build requirements use the shared execution contract; typed VM lowering and execution
+remain separately admitted capabilities.
 _Avoid_: Disk format, public output format, virtual machine artifact
