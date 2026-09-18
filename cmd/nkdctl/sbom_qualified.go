@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/buildgraph"
 	e "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/pipeline"
-	"github.com/NVIDIA/nke-recipes/pkg/nkd/recipe"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/sbom"
 	"golang.org/x/sys/unix"
 )
@@ -21,8 +21,8 @@ const (
 )
 
 // commandEvidenceReader is a transport adapter only. It returns bytes; the SBOM
-// module verifies those bytes against the catalog's exact digest before issuing an
-// ExternalEvidenceReceipt. It cannot return a success assertion or a digest claim.
+// module verifies those bytes and their artifact subject against the catalog's
+// exact bindings. The reader cannot return a success assertion or a digest claim.
 type commandEvidenceReader struct {
 	client *http.Client
 }
@@ -142,19 +142,19 @@ func (reader evidenceContextReader) Read(buffer []byte) (int, error) {
 	return reader.source.Read(buffer)
 }
 
-func buildVerifiedSBOM(ctx context.Context, resolved *recipe.Resolved, recipeDigest string,
+func buildVerifiedSBOM(ctx context.Context, resolved *buildgraph.Resolved, buildDigest string,
 	artifactHashes map[string]string,
 ) (*sbom.VerifiedSet, error) {
-	return sbom.BuildVerified(ctx, resolved, recipeDigest, artifactHashes, commandEvidenceReader{})
+	return sbom.BuildVerified(ctx, resolved, buildDigest, artifactHashes, commandEvidenceReader{})
 }
 
-func buildDiagnosticSelectedSBOM(ctx context.Context, resolved *recipe.Resolved, recipeDigest string,
+func buildDiagnosticSelectedSBOM(ctx context.Context, resolved *buildgraph.Resolved, buildDigest string,
 	artifactHashes map[string]string,
 ) (*sbom.VerifiedSet, error) {
-	return sbom.BuildDiagnosticSelected(ctx, resolved, recipeDigest, artifactHashes, commandEvidenceReader{})
+	return sbom.BuildDiagnosticSelected(ctx, resolved, buildDigest, artifactHashes, commandEvidenceReader{})
 }
 
-func buildVerifiedSBOMFromReport(ctx context.Context, resolved *recipe.Resolved,
+func buildVerifiedSBOMFromReport(ctx context.Context, resolved *buildgraph.Resolved,
 	report *pipeline.Report,
 ) (*sbom.VerifiedSet, error) {
 	return sbom.BuildVerifiedFromReport(ctx, resolved, report, commandEvidenceReader{})

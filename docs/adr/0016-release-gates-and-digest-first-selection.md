@@ -8,11 +8,13 @@
 - **Deciders:** [INPUT NEEDED — author + reviewers]
 - **Index:** ADR-16 in the consolidated NKD ADR set.
 - **Relates to:** ADR-05 (ReleaseSet / Inventory), ADR-06 (status / selection), ADR-04 (verify / signing),
-  ADR-19 (ClusterDefinition / consumer).
+  ADR-19 (deployment-scope boundary).
 - **Satisfies:** FR-18 (atomic promotion), FR-24 (incremental validation), SEC-08 (independent gates), SEC-13
   (registry integrity), SEC-17 (downstream verification). Advances UC-05/08/10/14/15/16.
 
-- **Scope:** Sections 1–4 govern qualified release; §5 governs evidence tiers and deferred v1 full-release acceptance.
+- **Scope:** Sections 1–4 specify deferred qualified release authorization. Current implementation retains
+  strict Inventory, ReleaseSet and PromotionPolicy documents, required-member/artifact completeness, and
+  authenticated ReleaseSet/policy diagnostics. Section 5 governs evidence tiers and deferred v1 full-release acceptance.
 
 ## Context
 
@@ -37,21 +39,25 @@ requirements and, per evidence type, to a closed allow-list of waivable gap reas
 exact compatibility and conformance policy digests and carries an effective/expiry interval. A raw policy digest
 or a decoded policy value is not a capability. An `evidence:none` declaration is absence, not satisfaction: it
 passes only where the authenticated policy does not require that evidence type, or explicitly permits that exact
-gap reason and ADR-13's authenticated waiver receipt binds the artifact, recipe, profile, status checkpoint, and
+gap reason and ADR-13's authenticated waiver receipt binds the artifact, build, profile, status checkpoint, and
 promotion-policy digest.
 
-### 2. Authenticated typed inputs + two independent gates (SEC-08)
+### 2. Authenticated typed inputs + two independent gates (SEC-08) — deferred
 
 Reproduction and runtime conformance are **two independent, mandatory gates**; neither substitutes for the other.
 
-Promotion accepts typed, authenticated receipts rather than caller-supplied booleans:
+The unused authorization evaluator, reproduction/compatibility/conformance receipts, evidence waivers,
+clearance authentication and publication-manifest implementation have been removed. No current operation
+issues or consumes release clearance. The following is the required future protocol, not a list of shipped APIs.
+
+Qualified promotion must accept typed, authenticated receipts rather than caller-supplied booleans:
 
 - one **`ReleaseSetReceipt`**, narrowed from the exact canonical ReleaseSet document authenticated under the
   dedicated release-set role; a parsed structure plus a generic signature callback cannot mint it;
 - one **`PromotionPolicyReceipt`**, narrowed from an authenticated canonical document under the dedicated
   promotion-policy role and rechecked for exact bytes, digest, effective time, artifact-kind coverage, evidence,
   waiver, compatibility, and conformance policy bindings;
-- a **`ReproductionReceipt` per release member**, binding the exact recipe, ValidationVector, builder-profile,
+- a **`ReproductionReceipt` per release member**, binding the exact build, ValidationVector, builder-profile,
   resolved-input-manifest, and sorted artifact digests to a reproduction verdict;
 - the **`EvidenceReceipt` set** from ADR-13, binding every policy-required evidence type to the exact artifact
   and evidence bytes, or to an exact policy-authorized waiver;
@@ -63,7 +69,7 @@ Promotion accepts typed, authenticated receipts rather than caller-supplied bool
 Every receipt that crosses a persistence, process, or organization boundary is canonical, digest-addressed under
 its own registered family kind, detached-signed, schema- and version-checked, and authorized against the trust
 role for that receipt type before its verdict is read. A same-process evidence input may instead be ADR-13's
-opaque qualified capability, but only while it remains in that process and only when `Authorize` revalidates its
+opaque qualified capability, but only while it remains in that process and only when the owning release gate revalidates its
 private state; it cannot be serialized or reconstructed from public fields. A filename, transport URL, mutable
 reference, untyped `verified` or `complete` flag, decoded report, or receipt or capability for a different
 artifact, evidence document, or policy is rejected.
@@ -85,6 +91,13 @@ artifact, evidence document, or policy is rejected.
   `PublicationManifest`. Downstream consumers authenticate and rehydrate this exact object rather than
   reconstructing success from flags or trusting a same-process capability.
 
+The removed implementation used `nkd.dev/reproduction-result/v3`, `nkd.dev/evidence-waiver/v3` and
+`nkd.dev/release-authorization/v9`. Their canonical families, along with compatibility, conformance and
+publication-manifest families, remain reserved and nonminting. No current issuer or reader supplies these
+qualified operations. A future implementation must explicitly define schema admission and retain exact
+component, build, artifact, platform, policy and signer bindings without deployment metadata.
+Inventory/ReleaseSet v4 and PromotionPolicy v1 remain implemented with unchanged canonical document schemas.
+
 The `PublicationManifest` is exhaustive. For each OCI subject it lists the cleared artifact and every required
 referrer, with both its NKD semantic identity (domain-separated canonical digest) and its raw OCI blob digest and
 media type. Publication rejects a missing, extra, type-confused, or substituted attachment; transport
@@ -102,8 +115,12 @@ verification: consumers always select by immutable digest and reject a lifecycle
 minimum or high-water mark.
 
 For a ReleaseSet, the status target is
-`publicationIdentity = Digest("publication", exact canonical ReleaseSet bytes)`, not the raw `releaseSetDigest`.
-Both identities are bound by the authenticated ReleaseSet receipt and cannot be caller-selected.
+`publicationIdentity = Digest("nkd.publication", exact canonical ReleaseSet bytes)`, not the raw `releaseSetDigest`.
+A future qualified clearance protocol must bind both identities; they cannot be caller-selected.
+The current ReleaseSet authentication operation checks signed document bytes and grants no clearance.
+
+The maintained artifact-publication consumer requires a digest-pinned reference at admission. Qualified
+ReleaseSet selection and tag resolution remain deferred; no standalone selector helper is shipped.
 
 ### 4. Incremental validation, rollback, and clearance — produce, don't operate
 
@@ -111,15 +128,17 @@ Both identities are bound by the authenticated ReleaseSet receipt and cannot be 
   candidate**, but equality of public member fields is not evidence authority. Skipping producer work requires an
   authenticated prior clearance plus the exact prior typed receipts, all rebound to the current release member
   and still acceptable under the current promotion, evidence, compatibility, and conformance policies. Status and
-  trusted-time checks are always fresh. Until that authenticated cache protocol exists, NKD re-runs `Authorize`;
-  `IncrementalPlan` is diagnostic only and cannot mint or reuse evidence.
-- **Rollback (UC-15).** `rollback --to <releaseSetDigest>` makes a **previously verified set re-selectable and
-  re-verifiable by immutable digest** and re-runs the clearance path at the as-of epoch from a fresh opaque
+  trusted-time checks are always fresh. That authenticated cache protocol is not implemented, and the unused
+  declaration-diff helper is removed. Equal Build Digests across named
+  outputs likewise grant no execution/evidence reuse: every frozen output use must independently complete.
+- **Rollback (UC-15, deferred).** A future rollback adapter must make a **previously verified set re-selectable
+  and re-verifiable by immutable digest** and re-run the clearance path using a fresh opaque
   `CheckpointReceipt`. The checkpoint must target the exact candidate and must already have passed current
   signer-policy, completeness, freshness, and monotonic high-water validation under ADR-06; raw declarations or a
   caller-selected signer policy cannot bypass that path. NKD performs **no infrastructure rollback** and is
-  idempotent: re-running to the same digest is a no-op.
-- **Downstream clearance (SEC-17).** NKD **emits a consumable, digest-addressable clearance result** — asserting
+  idempotent: re-running to the same digest is a no-op. The standalone command currently rejects this operation;
+  the unused same-process rollback helper is removed.
+- **Downstream clearance (SEC-17, deferred).** A future qualified publisher must emit a consumable, digest-addressable clearance result — asserting
   that identity, signature, provenance, completeness, and compatibility all passed — which a downstream consumer
   checks **before** mutating infrastructure. NKD does **not** gate or authorize the mutation itself.
 
@@ -138,11 +157,11 @@ dry-run stays static-unqualified. Pipeline-attested never satisfies qualified re
 Inventory, ReleaseSet, clearance, or stage-two receipt. The hosted design targets SLSA Build L2; that is an
 acceptance target, not a certification established by local tests.
 
-V1 full-release acceptance is a **deferred** recipe/evidence qualification gate and versioned release manifest.
+V1 full-release acceptance is a **deferred** build/evidence qualification gate and versioned release manifest.
 Qualification checks schema, pins (including embedded-component consistency), signatures, production attestations,
 and a tooling smoke test in a network-disabled container. Every subject receives one pass/fail/waived verdict;
 a waiver binds component, reason and approver. Failing evidence is never attested. This gate is neither runtime
-conformance nor ADR-19 cluster qualification.
+conformance nor deployment qualification.
 
 The separate qualification workflow signs `nkd.qualification-evidence/v1`; the build workflow cannot sign in
 that role. A versioned `nkd.release-manifest/v1` lists every selected artifact from one default-branch Run with
@@ -159,12 +178,12 @@ does not establish full-release acceptance. M3/M4 remain unimplemented.
 ### 6. Passive external qualification handoff — deferred producer protocol
 
 The external suite owns execution, provisioning, process context and lifecycle. NKD never initiates or
-supervises it. NKD authenticates an already-produced independently signed observation containing pinned suite,
+supervises it. A future qualification adapter must authenticate an already-produced independently signed observation containing pinned suite,
 suite policy, harness and environment identities, exact raw result bytes, subject and signature. It recomputes
 `resultsDigest`, checks role and subject, and applies coverage policy before issuing a receipt. Unsigned input,
 unpinned identities, caller-provided pass booleans, wrong roles, expired evidence or mismatched subjects fail
-closed with coded errors and no partial output. Release-set conformance remains exhaustive; post-clearance
-cluster qualification has the separate ADR-19 subject and cannot authorize promotion.
+closed with coded errors and no partial output. Release-set conformance remains exhaustive. Cluster topology and post-clearance deployment qualification
+are deferred outside the current artifact model (ADR-19); they cannot authorize promotion.
 
 ## Consequences
 
@@ -198,19 +217,17 @@ cluster qualification has the separate ADR-19 subject and cannot authorize promo
 - **ADR-05:** the ReleaseSet and Inventory the gates read, and the ValidationVector evidence the conformance
   result populates.
 - **ADR-06:** status referrers consulted during selection.
-- **ADR-19:** generated cluster realization binds exact intent to accepted Release contents; the legacy
-  ClusterDefinition wire references a cleared ReleaseSet by digest.
+- **ADR-19:** deployment topology and cluster qualification are outside the current artifact model.
 - **ADR-13:** owns typed evidence and waiver receipts; promotion consumes but does not reinterpret them.
 
 ## Acceptance evidence
 
 Current module evidence in `pkg/nkd/release/*_test.go`, `pkg/nkd/status/checkpoint_test.go`, and
-`pkg/nkd/trust/document_test.go` covers exact authenticated ReleaseSet and promotion documents, opaque
-reproduction, compatibility, and conformance capabilities, same-process qualified evidence, distinct digest
-families, exact artifact-kind policy dispatch, policy-derived evidence and waiver behavior, role and policy
-substitution, expiry, mutation isolation, status-checkpoint rollback, completeness, digest-first selection, and
-race-enabled deterministic authorization. This is module/contract evidence: it does **not** prove a real
-Sigstore, scanner, or registry publication and downstream-consumer round trip.
+`pkg/nkd/trust/document_test.go` covers exact authenticated ReleaseSet and promotion-policy documents, strict
+schemas and artifact-kind rules, canonical ordering, required-member/artifact completeness, role rejection,
+cancellation and diagnostic checkpoint rollback rejection. Command tests separately cover durable status
+high-water CAS. These tests do not establish release authorization, evidence-waiver evaluation, trusted-time
+freshness, qualified receipt issuance or a downstream clearance round trip.
 
 Acceptance additionally requires a full fixture that starts with exact artifact bytes and canonical evidence,
 authenticates all typed receipts under distinct trust roles, promotes one complete compatible set, and verifies

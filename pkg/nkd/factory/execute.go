@@ -17,10 +17,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NVIDIA/nke-recipes/internal/transportarchive"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/aicr"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/assemble"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/canonical"
-	"github.com/NVIDIA/nke-recipes/pkg/nkd/cluster"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/delivery"
 	e "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/internal/heldfile"
@@ -40,12 +40,12 @@ func LoadPlanContext(ctx context.Context, path string) (*Plan, error) {
 	if ctx == nil {
 		return nil, e.New(e.CodeUsage, "factory plan load requires a context")
 	}
-	held, err := heldfile.OpenContext(ctx, path, heldfile.Options{Label: "run-plan", MaxBytes: MaxDefinitionBytes})
+	held, err := heldfile.OpenContext(ctx, path, heldfile.Options{Label: "run-plan", MaxBytes: MaxPlanBytes})
 	if err != nil {
 		return nil, classifyContext(ctx, e.Wrap(e.CodePipelineDrift, err, "opening factory plan"))
 	}
 	defer func() { _ = held.Close() }()
-	raw, err := held.ReadAllContext(ctx, MaxDefinitionBytes)
+	raw, err := held.ReadAllContext(ctx, MaxPlanBytes)
 	if err != nil {
 		return nil, classifyContext(ctx, e.Wrap(e.CodePipelineDrift, err, "reading factory plan"))
 	}
@@ -59,9 +59,9 @@ func LoadPlanContext(ctx context.Context, path string) (*Plan, error) {
 	return &plan, nil
 }
 
-// ExecuteNode executes a non-IR artifact-graph node. Fetch/build/pull nodes keep
-// using exec-node over the exact recipe graph; this function owns factory tooling,
-// unqualified terminal observation, packaging, and delivery representation.
+// ExecuteNode validates and executes one operation from the complete Plan.
+// Producer instructions remain owned by the embedded build IR; all callers use
+// the same dispatch for acquisition, builds, observation, packaging and publication.
 func ExecuteNode(ctx context.Context, plan *Plan, nodeID string, stdout, stderr io.Writer) error {
 	if ctx == nil {
 		return e.New(e.CodeUsage, "factory node execution requires a context")
@@ -83,14 +83,14 @@ func ExecuteNode(ctx context.Context, plan *Plan, nodeID string, stdout, stderr 
 	if !ok {
 		return e.New(e.CodeInvalidCatalog, "factory plan has no node %q", nodeID)
 	}
-	if node.IRNode != "" {
-		return e.New(e.CodeUsage, "IR node %q must execute through exec-node", nodeID)
-	}
 	if stdout == nil {
 		stdout = io.Discard
 	}
 	if stderr == nil {
 		stderr = io.Discard
+	}
+	if node.IRNode != "" {
+		return executeProducer(ctx, plan, node, plan.Environment.RuntimeBinary(), 1, stdout, stderr, (pipeline.Local{}).ExecNode)
 	}
 	switch node.Kind {
 	case NodeAcquire:
@@ -105,8 +105,6 @@ func ExecuteNode(ctx context.Context, plan *Plan, nodeID string, stdout, stderr 
 		return executePackage(ctx, plan, node, artifacts, stdout)
 	case NodePublish:
 		return executePublish(ctx, plan, node, artifacts, stdout)
-	case NodeComposition:
-		return executeComposition(ctx, plan, node, artifacts)
 	case NodeAttestEvidence:
 		return executeAttestEvidence(ctx, plan, node, artifacts, productionOCISigner, stdout)
 	case NodeSign:
@@ -243,53 +241,26 @@ func executeToolAcquire(ctx context.Context, node Node, output Artifact, stdout 
 	return nil
 }
 
-func executeComposition(ctx context.Context, plan *Plan, node Node, artifacts map[string]Artifact) error {
-	name := strings.TrimPrefix(node.ID, "composition/")
-	for _, composition := range plan.Compositions {
-		if composition.Name != name {
-			continue
-		}
-		raw, err := composition.Composition.Marshal()
-		if err != nil {
-			return err
-		}
-		return writeFactoryFile(ctx, artifacts[node.Outputs[0]].Path, append(raw, '\n'), 0o644)
-	}
-	return e.New(e.CodePipelineDrift, "composition node %q has no exact plan object", node.ID)
-}
-
 func executeAICR(ctx context.Context, plan *Plan, node Node, artifacts map[string]Artifact, stdout, stderr io.Writer) error {
-	var recipePlan *RecipePlan
-	for index := range plan.Recipes {
-		if plan.Recipes[index].Name == node.RecipeTarget {
-			recipePlan = &plan.Recipes[index]
+	var buildPlan *BuildPlan
+	for index := range plan.Builds {
+		if plan.Builds[index].Name == node.BuildTarget {
+			buildPlan = &plan.Builds[index]
 			break
 		}
 	}
-	if recipePlan == nil || recipePlan.Graph.AICR == nil || len(node.Inputs) != 1 {
-		return e.New(e.CodePipelineDrift, "AICR node %q lacks recipe activation or generator input", node.ID)
+	if buildPlan == nil || buildPlan.Graph == nil || buildPlan.Graph.AICR == nil || len(node.Inputs) != 1 || len(node.Outputs) != 1 {
+		return e.New(e.CodePipelineDrift, "AICR node %q lacks build activation or generator input", node.ID)
 	}
-	activation := recipePlan.Graph.AICR
-	profile := aicr.Profile{Identity: recipePlan.AICRProfileIdentity,
-		Digest: activation.RecipeDigest, GeneratorDigest: activation.GeneratorDigest,
+	activation := buildPlan.Graph.AICR
+	if err := activation.Validate(); err != nil {
+		return err
+	}
+	profile := aicr.Profile{Identity: buildPlan.AICRProfileIdentity,
+		Digest: activation.ProfileDigest, GeneratorDigest: activation.GeneratorDigest,
 		Service: activation.Service, Accelerator: activation.Accelerator, OS: activation.OS,
 		Intent: activation.Intent, Platform: activation.Platform}
-	options := aicr.Options{OutputDir: artifacts[node.Outputs[0]].Path}
-	if bundle := aicrBundleForRecipe(plan, recipePlan.RecipeDigest); bundle != nil {
-		options.Deployer = bundle.Deployer
-		if bundle.StorageClass != "" {
-			options.ExtraBundleArgs = append(options.ExtraBundleArgs, "--storage-class", bundle.StorageClass)
-		}
-		for _, value := range bundle.AcceleratedNodeSelectors {
-			options.ExtraBundleArgs = append(options.ExtraBundleArgs, "--accelerated-node-selector", value)
-		}
-		for _, value := range bundle.AcceleratedNodeTolerations {
-			options.ExtraBundleArgs = append(options.ExtraBundleArgs, "--accelerated-node-toleration", value)
-		}
-		for _, value := range bundle.WorkloadSelectors {
-			options.ExtraBundleArgs = append(options.ExtraBundleArgs, "--workload-selector", value)
-		}
-	}
+	options := aicrBundleOptions(activation.Bundle, artifacts[node.Outputs[0]].Path)
 	bundler := aicr.CLIBundler{Binary: artifacts[node.Inputs[0]].Path}
 	qualified, err := bundler.BundleQualified(ctx, profile, options, stdout, stderr)
 	if err != nil {
@@ -299,21 +270,28 @@ func executeAICR(ctx context.Context, plan *Plan, node Node, artifacts map[strin
 	return err
 }
 
-func aicrBundleForRecipe(plan *Plan, digest string) *cluster.AICRBundleInputs {
-	for index := range plan.Compositions {
-		for _, binding := range plan.Compositions[index].Composition.Recipes {
-			if binding.RecipeDigest == digest && binding.AICRBundle != nil {
-				return binding.AICRBundle
-			}
-		}
+func aicrBundleOptions(bundle aicr.BundleInputs, outputPath string) aicr.Options {
+	options := aicr.Options{OutputDir: outputPath, Deployer: bundle.Deployer}
+	if bundle.StorageClass != "" {
+		options.ExtraBundleArgs = append(options.ExtraBundleArgs, "--storage-class", bundle.StorageClass)
 	}
-	return nil
+	for _, value := range bundle.AcceleratedNodeSelectors {
+		options.ExtraBundleArgs = append(options.ExtraBundleArgs, "--accelerated-node-selector", value)
+	}
+	for _, value := range bundle.AcceleratedNodeTolerations {
+		options.ExtraBundleArgs = append(options.ExtraBundleArgs, "--accelerated-node-toleration", value)
+	}
+	for _, value := range bundle.WorkloadSelectors {
+		options.ExtraBundleArgs = append(options.ExtraBundleArgs, "--workload-selector", value)
+	}
+	return options
 }
 
 type factoryObservation struct {
 	SchemaVersion string                 `json:"schemaVersion"`
 	Qualification EvidenceTier           `json:"qualification"`
-	RecipeDigest  string                 `json:"recipeDigest"`
+	BuildDigest   string                 `json:"buildDigest"`
+	BuildTarget   string                 `json:"buildTarget"`
 	Inputs        []factoryObservedInput `json:"inputs"`
 }
 
@@ -324,10 +302,24 @@ type factoryObservedInput struct {
 }
 
 func executeObservation(ctx context.Context, plan *Plan, node Node, artifacts map[string]Artifact) error {
-	observation := factoryObservation{SchemaVersion: "nkd.dev/factory-observation/v1", Qualification: TierStaticUnqualified}
-	for _, recipePlan := range plan.Recipes {
-		if recipePlan.Name == node.RecipeTarget {
-			observation.RecipeDigest = recipePlan.RecipeDigest
+	observation := factoryObservation{SchemaVersion: "nkd.dev/factory-observation/v2", Qualification: TierStaticUnqualified, BuildTarget: node.BuildTarget}
+	for _, buildPlan := range plan.Builds {
+		if buildPlan.Name == node.BuildTarget {
+			observation.BuildDigest = buildPlan.BuildDigest
+			visible := make(map[string]Artifact, len(node.Inputs))
+			for _, id := range node.Inputs {
+				visible[id] = artifacts[id]
+			}
+			for _, component := range buildPlan.Components {
+				id := "artifact/" + buildPlan.Name + "/" + component
+				input, ok := visible[id]
+				if !ok || input.BuildTarget != buildPlan.Name || input.Component != component {
+					return e.New(e.CodeVerifyFailed, "terminal output %q omits its exact producer bytes for %q", buildPlan.Name, component)
+				}
+				if _, err := observeProducerPayload(ctx, plan, input, visible); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	for _, input := range node.Inputs {
@@ -338,8 +330,8 @@ func executeObservation(ctx context.Context, plan *Plan, node Node, artifacts ma
 		}
 		observation.Inputs = append(observation.Inputs, factoryObservedInput{ArtifactID: input, Kind: artifact.Kind, Digest: digest})
 	}
-	if observation.RecipeDigest == "" {
-		return e.New(e.CodePipelineDrift, "terminal node %q has no recipe digest", node.ID)
+	if observation.BuildDigest == "" {
+		return e.New(e.CodePipelineDrift, "terminal node %q has no build digest", node.ID)
 	}
 	raw, err := canonical.Marshal(observation)
 	if err != nil {
@@ -367,7 +359,7 @@ func executePackage(ctx context.Context, plan *Plan, node Node, artifacts map[st
 		}
 		artifact, ok := artifacts[id]
 		if !ok || artifact.ID != planned.ID || artifact.Kind != planned.Kind || artifact.Name != planned.Name ||
-			artifact.RecipeTarget != planned.RecipeTarget || artifact.Component != planned.Component {
+			artifact.BuildTarget != planned.BuildTarget || artifact.Component != planned.Component {
 			return e.New(e.CodeReleaseIncomplete, "package node %q has no exact declared input %q", node.ID, id)
 		}
 		inputs = append(inputs, artifact)
@@ -432,7 +424,7 @@ func executePackage(ctx context.Context, plan *Plan, node Node, artifacts map[st
 			for _, input := range inputs {
 				ids = append(ids, input.ID)
 			}
-			if err := validatePackageInputs(PackageSpec{Kind: PackageHelm, HelmImage: node.HelmImage}, ids, artifacts); err != nil {
+			if err := validatePackageInputs(packageSpec{Kind: PackageHelm, HelmImage: node.HelmImage}, ids, artifacts); err != nil {
 				return err
 			}
 			image, err := inspectFactoryImage(ctx, plan, artifacts[node.HelmImage.Image])
@@ -473,7 +465,7 @@ func executePackage(ctx context.Context, plan *Plan, node Node, artifacts map[st
 		if inputs[0].Kind == "tarball" {
 			archive = filepath.Join(root, "bundle.tar")
 		}
-		if err := pipeline.PackTransport(ctx, archive, root, []string{relative}); err != nil {
+		if err := transportarchive.Pack(ctx, archive, root, []string{relative}); err != nil {
 			return err
 		}
 		digest, err := digestFactoryPath(ctx, archive)
@@ -519,7 +511,7 @@ func executePackage(ctx context.Context, plan *Plan, node Node, artifacts map[st
 			}
 		}()
 		for _, input := range inputs {
-			if input.RecipeTarget != "" {
+			if input.BuildTarget != "" {
 				continue
 			}
 			object := delivery.ObjectInput{Name: input.Name, Kind: input.Kind, Path: input.Path,
@@ -567,7 +559,7 @@ func executePackage(ctx context.Context, plan *Plan, node Node, artifacts map[st
 				if err := removeFactoryCarrier(archive); err != nil {
 					return err
 				}
-				if err := pipeline.PackTransport(ctx, archive, ".", []string{input.Path}); err != nil {
+				if err := transportarchive.Pack(ctx, archive, ".", []string{input.Path}); err != nil {
 					return err
 				}
 				temporaryArchives = append(temporaryArchives, archive)
@@ -578,48 +570,42 @@ func executePackage(ctx context.Context, plan *Plan, node Node, artifacts map[st
 				object.Path, object.LayerMediaType = archive, "application/vnd.nkd.apt-repository.v1.tar"
 				object.SemanticDigest, object.BlobDigest = repository.Digest, digest
 			default:
-				object.SemanticDigest, _ = compositionDigestForPath(plan, input.Path)
-				if object.SemanticDigest == "" {
-					object.SemanticDigest, _ = digestFactoryPath(ctx, input.Path)
-				}
+				object.SemanticDigest, _ = digestFactoryPath(ctx, input.Path)
 			}
 			objects = append(objects, object)
 		}
 		var metadata *delivery.ReleaseMetadata
 		if len(plan.LifecycleOutputs) > 0 {
-			binding, err := lifecyclePublicationBinding(ctx, plan, node, artifacts)
+			outputs, err := lifecyclePublicationOutputs(ctx, plan, node, artifacts)
 			if err != nil {
 				return err
 			}
-			metadata = &delivery.ReleaseMetadata{DefinitionDigest: binding.DefinitionDigest, EnvironmentDigest: binding.EnvironmentDigest, ContentSubject: binding.ContentSubject, Clusters: binding.Clusters}
+			contentSubject, err := delivery.ContentDigest(outputs)
+			if err != nil {
+				return err
+			}
+			metadata = &delivery.ReleaseMetadata{DefinitionDigest: plan.DefinitionDigest, EnvironmentDigest: plan.EnvironmentDigest, ContentSubject: contentSubject}
+			outputByName := make(map[string]delivery.Output, len(outputs))
+			transportPaths := make(map[string]string, len(outputs))
+			for _, output := range outputs {
+				outputByName[output.Name] = output
+			}
+			for _, expected := range plan.LifecycleOutputs {
+				transportPaths[expected.Name] = artifacts[expected.ArtifactID].Path
+			}
 			for i := range objects {
-				for _, output := range binding.Outputs {
-					if objects[i].Name == output.Name {
-						objects[i].Output = &delivery.OutputBinding{Repository: output.Name, Format: output.Kind, RecipeDigest: output.RecipeDigest, Components: output.Components, TransportPath: output.TransportPath}
-						for _, component := range output.Components {
-							for _, inputID := range node.Inputs {
-								input := artifacts[inputID]
-								if input.Kind != "producer-result" || input.Component != component {
-									continue
-								}
-								matchingRecipe := false
-								for _, recipe := range plan.Recipes {
-									if recipe.Name == input.RecipeTarget && recipe.RecipeDigest == output.RecipeDigest {
-										matchingRecipe = true
-									}
-								}
-								if !matchingRecipe {
-									continue
-								}
-								result, err := readProducerResult(ctx, input.Path)
-								if err != nil {
-									return err
-								}
-								objects[i].Output.BuildSubjects = append(objects[i].Output.BuildSubjects, delivery.BuildSubject{Component: component, Digest: result.SHA256})
-							}
-						}
-
-					}
+				output, found := outputByName[objects[i].Name]
+				if !found {
+					continue
+				}
+				subjects, err := publicationBuildSubjects(ctx, output, node.Inputs, artifacts)
+				if err != nil {
+					return err
+				}
+				objects[i].Output = &delivery.OutputBinding{Repository: output.Name, Format: output.Kind,
+					BuildDigest: output.BuildDigest, Components: output.Components, BuildSubjects: subjects}
+				if output.Kind == PackageAPT {
+					objects[i].Output.TransportPath = transportPaths[output.Name]
 				}
 			}
 		}
@@ -628,6 +614,43 @@ func executePackage(ctx context.Context, plan *Plan, node Node, artifacts map[st
 	default:
 		return e.New(e.CodeEngineCapability, "factory package kind %q has no adapter", node.PackageKind)
 	}
+}
+
+// The exact Plan-to-observation join is complete before this projection. Bind
+// each published output to its own declared producer records, even for equal
+// build identities; a sibling's record cannot fill a missing component slot.
+func publicationBuildSubjects(ctx context.Context, output delivery.Output, inputs []string, artifacts map[string]Artifact) ([]delivery.BuildSubject, error) {
+	wanted := make(map[string]bool, len(output.Components))
+	for _, component := range output.Components {
+		wanted[component] = true
+	}
+	observed := make(map[string]string, len(wanted))
+	for _, id := range inputs {
+		input := artifacts[id]
+		if input.Kind != "producer-result" || input.BuildTarget != output.Name || !wanted[input.Component] {
+			continue
+		}
+		if _, exists := observed[input.Component]; exists {
+			return nil, e.New(e.CodeVerifyFailed, "publication output %q has duplicate producer records", output.Name)
+		}
+		result, err := readProducerResult(ctx, input.Path)
+		if err != nil {
+			return nil, err
+		}
+		if result.Component != input.Component || !canonical.IsDigest(result.SHA256) {
+			return nil, e.New(e.CodeVerifyFailed, "publication producer record differs from its exact component")
+		}
+		observed[input.Component] = result.SHA256
+	}
+	subjects := make([]delivery.BuildSubject, 0, len(output.Components))
+	for _, component := range output.Components {
+		digest, found := observed[component]
+		if !found {
+			return nil, e.New(e.CodeReleaseIncomplete, "publication output %q omits producer evidence for %q", output.Name, component)
+		}
+		subjects = append(subjects, delivery.BuildSubject{Component: component, Digest: digest})
+	}
+	return subjects, nil
 }
 
 func lifecycleTransportMember(plan *Plan, observed Artifact) (string, string, error) {
@@ -675,11 +698,11 @@ func removeFactoryCarrier(path string) error {
 }
 
 func packageInputMetadata(plan *Plan, artifact Artifact) (string, int64, string, error) {
-	for _, recipePlan := range plan.Recipes {
-		if recipePlan.Name != artifact.RecipeTarget || recipePlan.Graph == nil {
+	for _, buildPlan := range plan.Builds {
+		if buildPlan.Name != artifact.BuildTarget || buildPlan.Graph == nil {
 			continue
 		}
-		for _, node := range recipePlan.Graph.Nodes {
+		for _, node := range buildPlan.Graph.Nodes {
 			if node.Component != artifact.Component || (node.Kind != ir.KindBuild && node.Kind != ir.KindPull) {
 				continue
 			}
@@ -702,14 +725,14 @@ func packageInputMetadata(plan *Plan, artifact Artifact) (string, int64, string,
 			return version, epoch, arch, nil
 		}
 	}
-	return "", 0, "", e.New(e.CodePipelineDrift, "artifact %s has no producing recipe node", artifact.ID)
+	return "", 0, "", e.New(e.CodePipelineDrift, "artifact %s has no producing build node", artifact.ID)
 }
 
 func executePublish(ctx context.Context, plan *Plan, node Node, artifacts map[string]Artifact, stdout io.Writer) error {
 	if len(node.Inputs) != 1 || len(node.Outputs) != 1 {
 		return e.New(e.CodePipelineDrift, "publish node %q is not unary", node.ID)
 	}
-	target := plan.ExecutionSettings.Targets[node.Target]
+	target := plan.Targets[node.Target]
 	if target.Kind != TargetOCI {
 		return e.New(e.CodeEngineCapability, "factory publication target kind %q has no remote adapter", target.Kind)
 	}
@@ -718,7 +741,7 @@ func executePublish(ctx context.Context, plan *Plan, node Node, artifacts map[st
 		return e.New(e.CodeTrustPolicyMissing,
 			"factory publication target %q requires its configured username and credential", node.Target)
 	}
-	if plan.ExecutionSettings.Signing != nil && plan.ExecutionSettings.Signing.Mode == SigningModeCosign && len(plan.LifecycleOutputs) > 0 {
+	if plan.Environment.Signing != nil && plan.Environment.Signing.Mode == SigningModeCosign && len(plan.LifecycleOutputs) > 0 {
 		inspection, err := delivery.Inspect(ctx, artifacts[node.Inputs[0]].Path)
 		if err != nil {
 			return err
@@ -743,22 +766,13 @@ func executePublish(ctx context.Context, plan *Plan, node Node, artifacts map[st
 
 func packageArch(plan *Plan, inputs []Artifact) string {
 	for _, input := range inputs {
-		for _, recipePlan := range plan.Recipes {
-			if recipePlan.Name == input.RecipeTarget {
-				return recipePlan.Criteria.Arch
+		for _, buildPlan := range plan.Builds {
+			if buildPlan.Name == input.BuildTarget {
+				return strings.TrimPrefix(buildPlan.Platform, "linux/")
 			}
 		}
 	}
 	return "amd64"
-}
-
-func compositionDigestForPath(plan *Plan, path string) (string, bool) {
-	for _, composition := range plan.Compositions {
-		if filepath.ToSlash(filepath.Join(".nkd", "factory", "compositions", composition.Name+".json")) == path {
-			return composition.Digest, true
-		}
-	}
-	return "", false
 }
 
 type factoryTreeRow struct {

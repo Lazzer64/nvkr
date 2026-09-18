@@ -22,10 +22,8 @@ import (
 // PreparedRun is the opaque prepared lifecycle input. Callers can inspect Run;
 // the generated compiler plan remains owned by this module.
 type PreparedRun struct {
-	definition  Definition
-	environment Environment
-	plan        *factory.Plan
-	run         *Run
+	plan *factory.Plan
+	run  *Run
 }
 
 type LocalOptions struct {
@@ -57,7 +55,7 @@ func PrepareFiles(ctx context.Context, definitionPath, environmentPath, generato
 	if err != nil {
 		return nil, err
 	}
-	return &PreparedRun{definition: definition, environment: environment, plan: plan, run: run}, nil
+	return &PreparedRun{plan: plan, run: run}, nil
 }
 
 // FinalizeGenerated re-admits the authored inputs and committed plan, then
@@ -122,7 +120,7 @@ func FinalizeGenerated(ctx context.Context, definitionPath, environmentPath, pla
 	if err != nil {
 		return recordHostedFailure(ctx, outputPath, run, err)
 	}
-	bound, err = bindClusterRealizations(definition, plan, bound)
+	bound, err = bindReleaseContent(plan, bound)
 	if err != nil {
 		return recordHostedFailure(ctx, outputPath, run, err)
 	}
@@ -147,14 +145,14 @@ func recordHostedFailure(ctx context.Context, outputPath string, run *Run, cause
 }
 
 func observeHostedPipelineEvidence(ctx context.Context, workspace string, plan *factory.Plan, artifacts map[string]factory.Artifact, observed []Artifact) error {
-	if plan.ExecutionSettings.Signing == nil || len(plan.ExecutionSettings.Routes) == 0 {
+	if plan.Environment.Signing == nil || len(plan.Routes) == 0 {
 		return e.New(e.CodeProvenanceMissing, "pipeline-attested Run has no planned signing and verification closure")
 	}
 	outputs := map[string]Artifact{}
 	for _, artifact := range observed {
 		outputs[artifact.Name] = artifact
 	}
-	for _, route := range plan.ExecutionSettings.Routes {
+	for _, route := range plan.Routes {
 		artifact, ok := artifacts["verification/"+route.Name]
 		if !ok {
 			return e.New(e.CodeReleaseIncomplete, "pipeline-attested Run omits verification result for %q", route.Name)
@@ -179,7 +177,7 @@ func observeHostedPipelineEvidence(ctx context.Context, workspace string, plan *
 		if err := record.Validate(); err != nil {
 			return err
 		}
-		target := plan.ExecutionSettings.Targets[route.Target]
+		target := plan.Targets[route.Target]
 		routed, routedFound := artifacts[route.Input]
 		if !routedFound || routed.Kind != factory.PackageOCI {
 			return e.New(e.CodeReleaseIncomplete, "pipeline route %q has no exact publication envelope", route.Name)
@@ -188,32 +186,36 @@ func observeHostedPipelineEvidence(ctx context.Context, workspace string, plan *
 		if pathErr != nil {
 			return pathErr
 		}
-		envelope, inspectErr := delivery.Inspect(ctx, routedPath)
-		if inspectErr != nil {
-			return inspectErr
+		if record.Ref != targetRepository(target.Ref)+"@"+record.Digest {
+			return e.New(e.CodeVerifyFailed, "publication verification for %q does not bind the routed repository", route.Name)
 		}
-		if record.Digest != envelope.RootDigest || record.Ref != targetRepository(target.Ref)+"@"+envelope.RootDigest {
-			return e.New(e.CodeVerifyFailed, "publication verification for %q does not bind the exact routed output", route.Name)
-		}
-		bound, _, _, err := artifactsFromBinding(ctx, routedPath, envelope)
+		publication, err := delivery.OpenPublication(ctx, routedPath, record.Digest)
 		if err != nil {
 			return err
+		}
+		bound, _, err := publication.Artifacts(record.Ref)
+		closeErr = publication.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return e.Wrap(e.CodeVerifyFailed, closeErr, "closing checked publication")
 		}
 		if len(bound) != len(outputs) {
 			return e.New(e.CodeVerifyFailed, "publication does not cover every observed output")
 		}
 		for _, member := range bound {
 			observed, ok := outputs[member.Name]
-			if !ok || observed.Kind != member.Kind || observed.Digest != member.Digest || observed.RecipeDigest != member.RecipeDigest || !equalStrings(observed.Components, member.Components) {
+			if !ok || observed.Kind != member.Kind || observed.Digest != member.Digest || observed.BuildDigest != member.BuildDigest || !equalStrings(observed.Components, member.Components) {
 				return e.New(e.CodeVerifyFailed, "publication substitutes observed output %q", member.Name)
 			}
 		}
-		identity, regexErr := regexp.Compile(plan.ExecutionSettings.Signing.Identity)
+		identity, regexErr := regexp.Compile(plan.Environment.Signing.Identity)
 		if regexErr != nil {
 			return e.Wrap(e.CodeTrustPolicyMissing, regexErr, "compiling planned signing identity")
 		}
-		if record.DryRun || !record.SignatureVerified || !record.AttestationVerified || record.Identity != plan.ExecutionSettings.Signing.Identity || record.Issuer != plan.ExecutionSettings.Signing.Issuer ||
-			!identity.MatchString(record.ObservedIdentity) || record.ObservedIssuer != plan.ExecutionSettings.Signing.Issuer {
+		if record.DryRun || !record.SignatureVerified || !record.AttestationVerified || record.Identity != plan.Environment.Signing.Identity || record.Issuer != plan.Environment.Signing.Issuer ||
+			!identity.MatchString(record.ObservedIdentity) || record.ObservedIssuer != plan.Environment.Signing.Issuer {
 			return e.New(e.CodeSignatureInvalid, "publication verification for %q does not prove the planned signer and provenance", route.Name)
 		}
 	}
@@ -238,7 +240,6 @@ func (prepared *PreparedRun) Description() Run {
 	copyRun := *prepared.run
 	copyRun.Expected = cloneRequired(prepared.run.Expected)
 	copyRun.Observed = cloneArtifacts(prepared.run.Observed)
-	copyRun.Clusters = cloneClusterRealizations(prepared.run.Clusters)
 	if prepared.run.Failure != nil {
 		failure := *prepared.run.Failure
 		copyRun.Failure = &failure
@@ -305,7 +306,7 @@ func ExecuteLocal(ctx context.Context, prepared *PreparedRun, options LocalOptio
 	if err != nil {
 		return recordFailedAttempt(ctx, workspace, &runForObservation, err)
 	}
-	bound, err = bindClusterRealizations(prepared.definition, prepared.plan, bound)
+	bound, err = bindReleaseContent(prepared.plan, bound)
 	if err != nil {
 		return recordFailedAttempt(ctx, workspace, &runForObservation, err)
 	}
@@ -343,7 +344,7 @@ func observeOutput(ctx context.Context, workspace string, slot requiredOutput, a
 			localized[id] = copyArtifact
 		}
 		expected := factory.LifecycleOutputPlan{Name: slot.Name, Kind: slot.Kind, ArtifactID: slot.MemberArtifactID,
-			RecipeDigest: slot.RecipeDigest, Components: append([]string(nil), slot.Components...)}
+			BuildDigest: slot.BuildDigest, Components: append([]string(nil), slot.Components...)}
 		return factory.ObserveLifecyclePayload(ctx, plan, expected, localized)
 	}
 	verifyProducer := func(index int, name, observedDigest string, observedSize int64) error {
@@ -394,7 +395,7 @@ func observeOutput(ctx context.Context, workspace string, slot requiredOutput, a
 			resultArtifact := artifacts[slot.ComponentResults[index]]
 			var producerArtifact factory.Artifact
 			for _, candidate := range artifacts {
-				if candidate.Kind != "producer-result" && candidate.RecipeTarget == resultArtifact.RecipeTarget && candidate.Component == component {
+				if candidate.Kind != "producer-result" && candidate.BuildTarget == resultArtifact.BuildTarget && candidate.Component == component {
 					producerArtifact = candidate
 					break
 				}
@@ -466,7 +467,7 @@ func observeOutput(ctx context.Context, workspace string, slot requiredOutput, a
 			return Artifact{}, e.New(e.CodeReleaseIncomplete, "output %q publication root does not contain its exact planned binary member", slot.Name)
 		}
 	}
-	return Artifact{Name: slot.Name, Kind: slot.Kind, Digest: digest, RecipeDigest: slot.RecipeDigest,
+	return Artifact{Name: slot.Name, Kind: slot.Kind, Digest: digest, BuildDigest: slot.BuildDigest,
 		Components: components}, nil
 }
 
@@ -518,18 +519,6 @@ func cloneArtifacts(source []Artifact) []Artifact {
 	for index, artifact := range source {
 		clone[index] = artifact
 		clone[index].Components = append([]string(nil), artifact.Components...)
-	}
-	return clone
-}
-
-func cloneClusterRealizations(source []clusterRealization) []clusterRealization {
-	clone := make([]clusterRealization, len(source))
-	for index, realization := range source {
-		clone[index] = realization
-		clone[index].Members = append([]clusterRealizedMember(nil), realization.Members...)
-		for member := range clone[index].Members {
-			clone[index].Members[member].Components = append([]string(nil), realization.Members[member].Components...)
-		}
 	}
 	return clone
 }

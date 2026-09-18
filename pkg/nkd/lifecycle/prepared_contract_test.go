@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/catalog"
 	e "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 )
 
@@ -70,5 +71,47 @@ func TestPrepareFilesRejectsInputsWithoutIssuingCapability(t *testing.T) {
 	for _, prepared := range []*PreparedRun{nil, {}} {
 		_, err := ExecuteLocal(t.Context(), prepared, LocalOptions{DryRun: true})
 		assertCode(t, err, e.CodeUsage)
+	}
+}
+
+func TestFinalizeRejectsForgedCatalogDescriptionWithRecomputedDescriptions(t *testing.T) {
+	t.Chdir(t.TempDir())
+	definition, environment := testDefinition(t), testEnvironment()
+	environment.Publication = nil
+	writeCanonicalTestFile(t, "definition.json", definition)
+	writeCanonicalTestFile(t, "environment.json", environment)
+	plan, err := CompileFiles(t.Context(), "definition.json", "environment.json", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := plan.Builds[0].BuildDigest
+	build := &plan.Builds[0]
+	producer := build.CatalogSnapshot.Components["kubectl"]
+	producer.Platforms = []string{"linux/amd64"}
+	build.CatalogSnapshot.Components["kubectl"] = producer
+	build.ResolvedComponents[0].Platforms = []string{"linux/amd64"}
+	build.CatalogDigest, err = build.CatalogSnapshot.SnapshotDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := catalog.ApplyStack(build.CatalogSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.CatalogSnapshot, plan.CatalogDigest = base.Catalog, base.Digest
+	if _, err := plan.Digest(); err != nil {
+		t.Fatalf("forged description is not internally consistent: %v", err)
+	}
+	if build.BuildDigest != before {
+		t.Fatal("catalog description changed output-affecting identity")
+	}
+	writeCanonicalTestFile(t, "plan.json", plan)
+	run, err := FinalizeGenerated(t.Context(), "definition.json", "environment.json", "plan.json", "test", "attempt", "workspace", "run.json")
+	assertCode(t, err, e.CodePipelineDrift)
+	if run != nil {
+		t.Fatal("forged catalog description acquired a Run")
+	}
+	if _, err := os.Stat("run.json"); !os.IsNotExist(err) {
+		t.Fatalf("forged catalog description wrote output: %v", err)
 	}
 }

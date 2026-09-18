@@ -14,6 +14,7 @@ import (
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/delivery"
 	nkderr "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/factory"
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/ir"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/pipeline"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/provenance"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/sign"
@@ -48,19 +49,13 @@ func TestFinalizeGeneratedRecordsFailedAttemptWhenPlannedEvidenceIsMissing(t *te
 	}
 	// This fixture isolates missing CLI signing evidence; other product outputs
 	// would fail earlier on their deliberately absent payloads.
-	var cliRecipes []RecipeSelection
-	for _, recipe := range definition.Recipes {
-		if recipe.Name == "nke-cli" {
-			cliRecipes = append(cliRecipes, recipe)
-		}
-	}
 	var cliOutputs []DefinitionOutput
 	for _, output := range definition.Outputs {
 		if output.Name == "nkectl" {
 			cliOutputs = append(cliOutputs, output)
 		}
 	}
-	definition.Recipes, definition.Outputs = cliRecipes, cliOutputs
+	definition.Outputs = cliOutputs
 	definition.Catalog.Base = filepath.Join(repo, "definitions", "nke-v1", "catalog")
 	definitionPath = filepath.ToSlash(filepath.Join(caseRoot, "definition.json"))
 	writeCanonicalTestFile(t, definitionPath, definition)
@@ -79,7 +74,7 @@ func TestFinalizeGeneratedRecordsFailedAttemptWhenPlannedEvidenceIsMissing(t *te
 	for _, artifact := range plan.Graph.Artifacts {
 		artifacts[artifact.ID] = artifact
 	}
-	member, outer, result := artifacts["package/nkectl"], artifacts["package/release"], artifacts["result/nke-cli/nkectl"]
+	member, outer, result := artifacts["package/nkectl"], artifacts["package/release"], artifacts["result/nkectl/nkectl"]
 	payloadPath := filepath.Join(caseRoot, "nkectl")
 	payload := []byte("synthetic hosted output")
 	if err := os.MkdirAll(filepath.Dir(payloadPath), 0o700); err != nil {
@@ -97,12 +92,12 @@ func TestFinalizeGeneratedRecordsFailedAttemptWhenPlannedEvidenceIsMissing(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := testReleaseRequest(t, []Artifact{{Name: member.Name, Kind: OutputExecutable, Digest: descriptor.Digest, RecipeDigest: "sha256:" + repeat("5", 64), Components: []string{"nkectl"}}}, []delivery.ObjectInput{{Name: member.Name, Kind: member.Kind, Path: local(member.Path), Layout: true, ArtifactType: member.MediaType, SemanticDigest: bundle.SemanticDigest, BlobDigest: bundle.RootDigest}}, map[string]string{"nkectl": pipeline.FileDigest(payload)})
+	request := testReleaseRequest(t, []Artifact{{Name: member.Name, Kind: OutputExecutable, Digest: descriptor.Digest, BuildDigest: "sha256:" + repeat("5", 64), Components: []string{"nkectl"}}}, []delivery.ObjectInput{{Name: member.Name, Kind: member.Kind, Path: local(member.Path), Layout: true, ArtifactType: member.MediaType, SemanticDigest: bundle.SemanticDigest, BlobDigest: bundle.RootDigest}}, map[string]string{"nkectl": pipeline.FileDigest(payload)})
 	_, err = delivery.BuildPublicationRoot(ctx, local(outer.Path), request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeCanonicalTestFile(t, local(result.Path), pipeline.ArtifactResult{Component: "nkectl", SHA256: pipeline.FileDigest(payload), Size: int64(len(payload))})
+	writeCanonicalTestFile(t, local(result.Path), fixtureProducerResult(t, plan, result, payloadPath))
 	other := "sha256:" + strings.Repeat("9", 64)
 	verification := artifacts["verification/release"]
 	writeCanonicalTestFile(t, local(verification.Path), sign.VerificationRecord{SchemaVersion: sign.VerificationRecordSchemaVersion,
@@ -127,7 +122,6 @@ func TestFinalizeGeneratedRequiresExactStaticHostedEvidenceClosure(t *testing.T)
 			ctx := context.Background()
 			t.Chdir(t.TempDir())
 			definition, environment := testDefinition(t), testEnvironment()
-			definition.Clusters = nil
 			environment.Publication, environment.Signing = nil, nil
 			writeCanonicalTestFile(t, "definition.json", definition)
 			writeCanonicalTestFile(t, "environment.json", environment)
@@ -149,8 +143,8 @@ func TestFinalizeGeneratedRequiresExactStaticHostedEvidenceClosure(t *testing.T)
 					artifact := artifacts[id]
 					payload := []byte("synthetic producer payload for " + artifact.Component)
 					if artifact.Kind == "producer-result" {
-						writeCanonicalTestFile(t, artifact.Path, pipeline.ArtifactResult{Component: artifact.Component, OutputType: "binary",
-							Path: artifact.Component, SHA256: pipeline.FileDigest(payload), Size: int64(len(payload))})
+						input := artifacts["artifact/"+artifact.BuildTarget+"/"+artifact.Component]
+						writeCanonicalTestFile(t, artifact.Path, fixtureProducerResult(t, plan, artifact, input.Path))
 					} else {
 						if err := os.MkdirAll(filepath.Dir(artifact.Path), 0o700); err != nil {
 							t.Fatal(err)
@@ -191,7 +185,8 @@ func TestFinalizeGeneratedRequiresExactStaticHostedEvidenceClosure(t *testing.T)
 				var observation struct {
 					SchemaVersion string               `json:"schemaVersion"`
 					Qualification factory.EvidenceTier `json:"qualification"`
-					RecipeDigest  string               `json:"recipeDigest"`
+					BuildDigest   string               `json:"buildDigest"`
+					BuildTarget   string               `json:"buildTarget"`
 					Inputs        []struct {
 						ArtifactID string `json:"artifactId"`
 						Kind       string `json:"kind"`
@@ -237,7 +232,6 @@ func TestFinalizeGeneratedCompletesPipelineRunFromExactHostedClosure(t *testing.
 	ctx := context.Background()
 	t.Chdir(t.TempDir())
 	definition, environment := testDefinition(t), testEnvironment()
-	definition.Clusters = nil
 	environment.Signing = &Signing{Mode: factory.SigningModeCosign, Identity: "^builder$", Issuer: "issuer"}
 	addTestSigningTool(t, &definition)
 	writeCanonicalTestFile(t, "definition.json", definition)
@@ -267,9 +261,8 @@ func TestFinalizeGeneratedCompletesPipelineRunFromExactHostedClosure(t *testing.
 			if err := os.WriteFile(artifact.Path, payload, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			result := artifacts["result/"+artifact.RecipeTarget+"/"+artifact.Component]
-			writeCanonicalTestFile(t, result.Path, pipeline.ArtifactResult{Component: artifact.Component,
-				OutputType: "binary", Path: artifact.Component, SHA256: pipeline.FileDigest(payload), Size: int64(len(payload))})
+			result := artifacts["result/"+artifact.BuildTarget+"/"+artifact.Component]
+			writeCanonicalTestFile(t, result.Path, fixtureProducerResult(t, plan, artifact, artifact.Path))
 		}
 	}
 	for _, kind := range []string{factory.NodeVerify, factory.NodeSBOM} {
@@ -360,6 +353,42 @@ func (r hostedTestRun) StartedOn() time.Time  { return r.started }
 func (r hostedTestRun) FinishedOn() time.Time { return r.finished }
 
 var _ provenance.RunContext = hostedTestRun{}
+
+// fixtureProducerResult describes bytes materialized by a test for one exact
+// planned producer. These fixture records grant no execution qualification.
+func fixtureProducerResult(t *testing.T, plan *factory.Plan, artifact factory.Artifact, payloadPath string) pipeline.ArtifactResult {
+	t.Helper()
+	var producer ir.Node
+	matches := 0
+	for _, build := range plan.Builds {
+		if build.Name != artifact.BuildTarget {
+			continue
+		}
+		for _, node := range build.Graph.Nodes {
+			if build.Name+"/"+node.ID == artifact.Producer && node.Component == artifact.Component && (node.Kind == ir.KindBuild || node.Kind == ir.KindPull) {
+				producer = node
+				matches++
+			}
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("fixture artifact %q has %d exact producers", artifact.ID, matches)
+	}
+	raw, err := os.ReadFile(payloadPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := pipeline.ArtifactResult{Component: producer.Component, OutputType: producer.OutputType,
+		Qualification: pipeline.ArtifactUnqualified, Toolchain: producer.Toolchain, BuilderType: producer.BuilderType,
+		Path: producer.ArtifactPath, SHA256: pipeline.FileDigest(raw), Size: int64(len(raw))}
+	if producer.Kind == ir.KindPull {
+		if result.SHA256 != producer.Digest {
+			t.Fatalf("fixture payload for %q does not match its pinned acquisition", artifact.ID)
+		}
+		result.EngineClass = ir.EnginePrebuiltAcquire
+	}
+	return result
+}
 
 func writeHostedRestoreOutcomes(t *testing.T, workspace string, plan *factory.Plan) {
 	t.Helper()

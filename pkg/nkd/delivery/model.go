@@ -1,7 +1,8 @@
-// Package delivery turns exact NKD objects and artifacts into operator-consumable
-// OCI and APT layouts. It owns representation and transport, never release
-// authorization: a diagnostic root stays diagnostic, while a qualified root must
-// be constructed from the independently authenticated release publication seam.
+// Package delivery owns publication bytes, output membership, and content identity.
+// BuildPublicationRoot assembles exact artifacts into an OCI layout; OpenPublication
+// and PullPublication check and hold its closure for consumption. Close each returned
+// Publication after use. ContentDigest gives producers and consumers one canonical
+// output identity. Consumer policy and release authorization remain separate checks.
 package delivery
 
 import (
@@ -15,7 +16,7 @@ import (
 
 const (
 	BinaryBundleSchemaVersion  = "nkd.dev/binary-bundle/v1"
-	PublicationRootSchema      = "nkd.dev/publication-root/v1"
+	PublicationRootSchema      = "nkd.dev/publication-root/v3"
 	ObjectConfigSchema         = "nkd.dev/delivery-object/v1"
 	QualificationDiagnostic    = "diagnostic"
 	QualificationQualified     = "qualified"
@@ -24,10 +25,12 @@ const (
 	MediaBinaryBundle          = "application/vnd.nkd.binary-bundle.v1"
 	MediaBinaryBundleConfig    = "application/vnd.nkd.binary-bundle.config.v1+json"
 	MediaBinaryBundleLayer     = "application/vnd.nkd.binary-bundle.layer.v1.tar+gzip"
-	MediaPublicationRoot       = "application/vnd.nkd.publication-root.v1"
-	MediaPublicationRootConfig = "application/vnd.nkd.publication-root.config.v1+json"
+	MediaPublicationRoot       = "application/vnd.nkd.publication-root.v3"
+	MediaPublicationRootConfig = "application/vnd.nkd.publication-root.config.v3+json"
 	MediaDeliveryObject        = "application/vnd.nkd.delivery-object.v1"
 	MediaDeliveryObjectConfig  = "application/vnd.nkd.delivery-object.config.v1+json"
+	MediaReleaseSet            = "application/vnd.nkd.release-set.v4+json"
+	MediaInventory             = "application/vnd.nkd.inventory.v4+json"
 	MediaOctetStream           = "application/octet-stream"
 )
 
@@ -110,16 +113,15 @@ type PublishedObject struct {
 // PublicationRoot is the canonical config behind the immutable OCI index that an
 // operator pins. A tag may discover the index; it is never part of this identity.
 type PublicationRoot struct {
-	Release                 *ReleaseMetadata  `json:"release,omitempty"`
-	SchemaVersion           string            `json:"schemaVersion"`
-	Qualification           string            `json:"qualification"`
-	PublicationIdentity     string            `json:"publicationIdentity,omitempty"`
-	PublicationManifest     string            `json:"publicationManifestDigest,omitempty"`
-	ReleaseSetDigest        string            `json:"releaseSetDigest,omitempty"`
-	InventoryDigest         string            `json:"inventoryDigest,omitempty"`
-	ClusterDefinitionDigest string            `json:"clusterDefinitionDigest,omitempty"`
-	ClearanceDigest         string            `json:"clearanceDigest,omitempty"`
-	Objects                 []PublishedObject `json:"objects"`
+	Release             *ReleaseMetadata  `json:"release,omitempty"`
+	SchemaVersion       string            `json:"schemaVersion"`
+	Qualification       string            `json:"qualification"`
+	PublicationIdentity string            `json:"publicationIdentity,omitempty"`
+	PublicationManifest string            `json:"publicationManifestDigest,omitempty"`
+	ReleaseSetDigest    string            `json:"releaseSetDigest,omitempty"`
+	InventoryDigest     string            `json:"inventoryDigest,omitempty"`
+	ClearanceDigest     string            `json:"clearanceDigest,omitempty"`
+	Objects             []PublishedObject `json:"objects"`
 }
 
 func (root PublicationRoot) Validate() error {
@@ -149,7 +151,6 @@ func (root PublicationRoot) Validate() error {
 	}
 	for field, value := range map[string]string{
 		"releaseSetDigest": root.ReleaseSetDigest, "inventoryDigest": root.InventoryDigest,
-		"clusterDefinitionDigest": root.ClusterDefinitionDigest,
 	} {
 		if value != "" && !isDigest(value) {
 			return e.New(e.CodeUnverifiedRef, "publication root %s is not an exact digest", field)

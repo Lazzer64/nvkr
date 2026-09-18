@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -24,39 +23,28 @@ import (
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/aicr"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/assemble"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/attest"
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/buildgraph"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/canonical"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/catalog"
-	"github.com/NVIDIA/nke-recipes/pkg/nkd/criteria"
 	e "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/ir"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/pipeline"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/profile"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/provenance"
-	"github.com/NVIDIA/nke-recipes/pkg/nkd/recipe"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/sbom"
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/target"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/trust"
 	"github.com/urfave/cli/v2"
-	"golang.org/x/sys/unix"
 )
 
 // ── shared flags ─────────────────────────────────────────────────────────────
 
-func queryFlags() []cli.Flag {
+func selectionFlags() []cli.Flag {
 	return []cli.Flag{
-		&cli.StringFlag{Name: "data", Usage: "explicit catalog directory (required for recipe resolution)"},
-		&cli.StringFlag{Name: "category", Usage: "recipe category: os | kubernetes | core-runtime | accelerated-runtime | operations | platform-services (ADR-12)"},
-		&cli.StringFlag{Name: "role", Usage: "control-plane | worker | gpu-worker (composition/SKU filter, not a recipe axis)"},
-		&cli.StringFlag{Name: "k8s", Usage: "Kubernetes version (semver, e.g. 1.32.0)"},
-		&cli.StringFlag{Name: "os", Usage: "target OS (operator-choosable; default ubuntu)"},
-		&cli.StringFlag{Name: "arch", Value: "amd64", Usage: "target arch: amd64 | arm64 (native per-arch, model B)"},
-		&cli.StringFlag{Name: "cluster-type", Usage: "operator | tenant (management vs workload cluster; layered catalogs)"},
-		// reserved axes — any non-empty value fails closed (NKD-FR-RC-012).
-		&cli.StringFlag{Name: "accelerator", Hidden: true},
-		&cli.StringFlag{Name: "service", Hidden: true},
-		&cli.StringFlag{Name: "intent", Hidden: true},
-		&cli.StringFlag{Name: "platform", Hidden: true},
-		&cli.StringFlag{Name: "tier", Hidden: true},
-		&cli.StringFlag{Name: "compliance", Hidden: true},
+		&cli.StringFlag{Name: "data", Usage: "explicit catalog directory"},
+		&cli.StringSliceFlag{Name: "component", Usage: "exact component ID to build (repeatable)"},
+		&cli.StringFlag{Name: "platform", Usage: "target platform: linux/amd64 | linux/arm64"},
+		&cli.StringFlag{Name: "aicr-profile", Usage: "exact catalog AICR profile, instead of components"},
 	}
 }
 
@@ -67,62 +55,28 @@ func providerFor(c *cli.Context) catalog.DataProvider {
 	return nil
 }
 
-// extensionSurface classifies the resolution's extension surface (ADR-11 §3) for the
-// deterministic selection record: fork/declared-overlay/published-tuple by whether a
-// supplied catalog composes layers.
-func extensionSurface(c *cli.Context) string {
-	layered := false
-	if cat, err := catalog.LoadContext(c.Context, providerFor(c)); err == nil {
-		layered = cat.Layers != nil
-	}
-	return recipe.ClassifyExtension(true, layered)
-}
-
-func queryFrom(c *cli.Context) (criteria.Criteria, map[string]string) {
-	q := criteria.Criteria{
-		Category:    c.String("category"),
-		Role:        c.String("role"),
-		K8sVersion:  c.String("k8s"),
-		OS:          c.String("os"),
-		Arch:        c.String("arch"),
-		ClusterType: c.String("cluster-type"),
-	}
-	reserved := map[string]string{}
-	for _, a := range criteria.ReservedAxes {
-		if v := c.String(a); v != "" {
-			reserved[a] = v
-		}
-	}
-	return q, reserved
-}
-
-// resolveRecipe loads + validates the catalog and resolves the query to a single
-// recipe with its recipeDigest.
-func resolveRecipe(c *cli.Context) (*recipe.Resolved, string, error) {
+// resolveBuild selects exact catalog producers and compiles their pinned graph.
+func resolveBuild(c *cli.Context) (*buildgraph.Resolved, string, error) {
 	if c.String("data") == "" {
-		return nil, "", e.New(e.CodeUsage, "recipe resolution requires --data <catalog-directory>")
+		return nil, "", e.New(e.CodeUsage, "build resolution requires --data <catalog-directory>")
 	}
-	// Delegate resolution to the client/v1 SDK facade (ADR-17 §1): the CLI is a thin
-	// adapter over the embeddable orchestration surface, never a second implementation.
-	q, reserved := queryFrom(c)
-	resolution, err := client.New(client.WithProvider(providerFor(c))).ResolveRecipe(c.Context, client.ResolveRequest{
-		Criteria: q,
-		Reserved: reserved,
+	resolution, err := client.New(client.WithProvider(providerFor(c))).ResolveBuild(c.Context, client.ResolveRequest{
+		Components: c.StringSlice("component"), Platform: c.String("platform"), AICRProfile: c.String("aicr-profile"),
 	})
 	if err != nil {
 		return nil, "", err
 	}
-	return resolution.Resolved, resolution.RecipeDigest, nil
+	return resolution.Resolved, resolution.BuildDigest, nil
 }
 
 // resolveGraph is the shared front half of every command: load + validate the
-// catalog, resolve the query, compile the IR, and compute recipeDigest.
+// catalog, select producers, compile the IR, and compute buildDigest.
 func resolveGraph(c *cli.Context) (*ir.Graph, string, error) {
-	res, _, err := resolveRecipe(c)
+	res, _, err := resolveBuild(c)
 	if err != nil {
 		return nil, "", err
 	}
-	g, err := recipe.Compile(res)
+	g, err := buildgraph.Compile(res)
 	if err != nil {
 		return nil, "", err
 	}
@@ -133,14 +87,13 @@ func resolveGraph(c *cli.Context) (*ir.Graph, string, error) {
 	return g, digest, nil
 }
 
-// ── recipe ───────────────────────────────────────────────────────────────────
+// ── resolve ───────────────────────────────────────────────────────────────────
 
-func cmdRecipe() *cli.Command {
+func cmdResolve() *cli.Command {
 	return &cli.Command{
-		Name:    "resolve",
-		Aliases: []string{"recipe"},
-		Usage:   "resolve criteria against the catalog and print the pinned IR",
-		Flags: append(queryFlags(),
+		Name:  "resolve",
+		Usage: "resolve selected producers and print the pinned build graph",
+		Flags: append(selectionFlags(),
 			&cli.StringFlag{Name: "output", Aliases: []string{"o"}, Value: "ir",
 				Usage: "ir | canonical | nodes | digest | components"},
 		),
@@ -169,7 +122,7 @@ func cmdRecipe() *cli.Command {
 			case "nodes":
 				// Full canonical execution graph consumed by `diff --against` and
 				// provider runners. Unlike `canonical`, this intentionally retains
-				// transport locators and composition criteria and is not recipeDigest
+				// transport locators and execution requirements and is not buildDigest
 				// identity material.
 				b, err := g.CanonicalJSON()
 				if err != nil {
@@ -185,7 +138,7 @@ func cmdRecipe() *cli.Command {
 					}
 				}
 				sort.Strings(comps)
-				fmt.Printf("recipe: %s\nrecipeDigest: %s\n\n", g.RecipeID, digest)
+				fmt.Printf("buildDigest: %s\n\n", digest)
 				for _, l := range comps {
 					fmt.Println(l)
 				}
@@ -195,343 +148,11 @@ func cmdRecipe() *cli.Command {
 					return err
 				}
 				os.Stdout.Write(b)
-				fmt.Printf("\n# recipeDigest: %s\n", digest)
-				fmt.Printf("# extensionSurface: %s\n", extensionSurface(c))
+				fmt.Printf("\n# buildDigest: %s\n", digest)
 			}
 			return nil
 		},
 	}
-}
-
-// ── bundle ───────────────────────────────────────────────────────────────────
-
-func cmdBundle() *cli.Command {
-	return cmdBundleWithProfileVerifier(nil)
-}
-
-// cmdBundleWithProfileVerifier keeps the production verifier fixed while allowing
-// adversarial tests to exercise the same profile-authentication admission boundary.
-func cmdBundleWithProfileVerifier(profileVerifier trust.DocumentVerifier) *cli.Command {
-	return &cli.Command{
-		Name:  "bundle",
-		Usage: "emit the build pipeline for a CI engine (no build)",
-		Flags: append(queryFlags(),
-			&cli.StringFlag{Name: "engine", Value: "local", Usage: "local | gitlab (github, tekton, and argo are currently unavailable)"},
-			&cli.StringFlag{Name: "out", Usage: "write the emitted pipeline here (default: stdout)"},
-			&cli.BoolFlag{Name: "check", Usage: "fail closed if the committed --out pipeline has drifted from the IR (ADR-21)"},
-			&cli.BoolFlag{Name: "json", Usage: "with --check, classify the drift (stale-pins vs hand-edit) as JSON"},
-			&cli.BoolFlag{Name: "airgap", Usage: "relocate the IR to a mirror (no upstream URLs); recipeDigest is unchanged (ADR-15)"},
-			&cli.StringFlag{Name: "mirror-ref", Value: "mirror.local", Usage: "mirror reference base for --airgap"},
-			&cli.BoolFlag{Name: "emit-callable", Usage: "emit the pipeline as a reusable unit an operator's outer workflow can invoke (ADR-21 §4)"},
-			&cli.StringFlag{Name: "extensions", Usage: "operator hook-point overlay (YAML: preBuild/postVerify lines) merged into the pipeline (ADR-21 §4)"},
-			&cli.BoolFlag{Name: "meta-lint", Usage: "emit the meta-CI lint workflow that runs `bundle --check` against the committed pipeline (ADR-21 §2)"},
-			&cli.StringFlag{Name: "cosign", Usage: "committed workspace-relative cosign verifier executable used by terminal verify"},
-			&cli.StringFlag{Name: "cosign-digest", Usage: "exact lowercase sha256 digest of the terminal cosign verifier executable"},
-			&cli.StringFlag{Name: "expected-digests", Usage: "committed canonical signed validation vector used by terminal verify"},
-			&cli.StringFlag{Name: "signature", Usage: "detached validation-vector signature (optional when the bundle contains it)"},
-			&cli.StringFlag{Name: "certificate", Usage: "validation-vector signing certificate"},
-			&cli.StringFlag{Name: "bundle", Usage: "offline validation-vector Sigstore bundle"},
-			&cli.StringFlag{Name: "trusted-root", Usage: "explicit offline validation-vector trusted root"},
-			&cli.StringFlag{Name: "trusted-root-digest", Usage: "exact lowercase sha256 digest of the validation-vector trusted root"},
-			&cli.StringFlag{Name: "identity", Usage: "pinned validation-vector signer identity"},
-			&cli.StringFlag{Name: "issuer", Usage: "pinned validation-vector OIDC issuer"},
-			&cli.StringFlag{Name: "trust-store", Usage: "optional role-separated signer trust store"},
-			&cli.StringFlag{Name: "profile", Usage: "signed canonical builder profile containing the runner pin"},
-			&cli.StringFlag{Name: "profile-signature", Usage: "detached builder-profile signature"},
-			&cli.StringFlag{Name: "profile-certificate", Usage: "builder-profile signing certificate"},
-			&cli.StringFlag{Name: "profile-bundle", Usage: "offline builder-profile Sigstore bundle"},
-			&cli.StringFlag{Name: "profile-trusted-root", Usage: "explicit offline builder-profile trusted root"},
-			&cli.StringFlag{Name: "profile-trusted-root-digest", Usage: "exact lowercase sha256 digest of the builder-profile trusted root"},
-			&cli.StringFlag{Name: "profile-identity", Usage: "pinned builder-profile signer identity"},
-			&cli.StringFlag{Name: "profile-issuer", Usage: "pinned builder-profile OIDC issuer"},
-		),
-		Action: func(c *cli.Context) error {
-			eng := c.String("engine")
-			switch eng {
-			case "local", "gitlab":
-			case "github", "tekton", "argo":
-				return e.New(e.CodeEngineCapability,
-					"bundle --engine %s is unavailable until that provider can transport and authenticate every declared input, output, verifier input, and execution receipt", eng)
-			default:
-				return e.New(e.CodeUnsupported,
-					"unknown engine %q (local, github, gitlab, tekton, argo)", eng)
-			}
-			if c.Bool("meta-lint") {
-				return e.New(e.CodeEngineCapability,
-					"bundle --meta-lint is unavailable until a provider adapter can transport the exact nkdctl, catalog, profile, signer, and committed bundle inputs")
-			}
-			if c.String("extensions") != "" {
-				return e.New(e.CodeEngineCapability,
-					"bundle --extensions is unavailable until the selected provider has a typed authenticated extension adapter")
-			}
-			if c.Bool("airgap") {
-				return e.New(e.CodeUnsupported,
-					"bundle --airgap requires an opaque verified active mirror generation; raw CLI paths cannot construct that authority")
-			}
-			if c.Bool("check") && strings.TrimSpace(c.String("out")) == "" {
-				return e.New(e.CodeUsage, "bundle --check requires the committed --out pipeline path")
-			}
-			if eng == "local" && (c.Bool("check") || c.Bool("emit-callable")) {
-				return e.New(e.CodeUnsupported,
-					"local bundle rendering has no generated provider file to check or emit as callable")
-			}
-			var (
-				verify       pipeline.VerificationConfig
-				runnerDigest string
-			)
-			if eng != "local" {
-				if err := pipeline.ValidateEmitterDataPath(c.String("data")); err != nil {
-					return err
-				}
-				verify = emittedVerificationConfig(c)
-				if err := verify.ValidateStatic(); err != nil {
-					return err
-				}
-				// The generated runner interprets nodes.json, acquires artifacts, and
-				// executes terminal verification even for a profile-free prebuilt graph.
-				// Authenticate its pin before catalog/graph I/O; authored profile bytes
-				// can never select this authority.
-				var err error
-				runnerDigest, err = authenticateBundleRunnerDigest(c, profileVerifier)
-				if err != nil {
-					return err
-				}
-			}
-			g, digest, err := resolveGraph(c)
-			if err != nil {
-				return err
-			}
-			if eng == "local" {
-				// Dry-run the local runner to show the concrete execution plan.
-				report, err := pipeline.Local{}.Run(g, digest, pipeline.RunOptions{
-					Ctx: c.Context, DryRun: true, Stdout: os.Stdout, Stderr: os.Stderr,
-				})
-				if report != nil {
-					defer func() { _ = report.Close() }()
-				}
-				return err
-			}
-			// Thread --data so the emitted terminal verify job resolves the SAME
-			// operator catalog the pipeline was emitted for.
-			data := c.String("data")
-			// Inject only the runner digest derived from the authenticated profile
-			// receipt above. The graph's prebuilt artifact identity remains profile-free.
-			var actions map[string]catalog.ActionPin
-			if eng == "github" {
-				cat, err := catalog.LoadContext(c.Context, providerFor(c))
-				if err != nil {
-					return err
-				}
-				actions = cat.Actions
-			}
-			emitters := map[string]pipeline.Emitter{
-				"github": pipeline.GitHub{Actions: actions, Data: data, RunnerDigest: runnerDigest, Verify: verify},
-				"gitlab": pipeline.GitLab{Data: data, RunnerDigest: runnerDigest, Verify: verify},
-				"tekton": pipeline.Tekton{Data: data, RunnerDigest: runnerDigest, Verify: verify},
-				"argo":   pipeline.Argo{Data: data, RunnerDigest: runnerDigest, Verify: verify},
-			}
-			em := emitters[eng]
-			emitted, err := em.Render(c.Context, g, digest)
-			if err != nil {
-				return err
-			}
-			if c.Bool("emit-callable") {
-				// ADR-21 §4: emit the generated pipeline as a REUSABLE unit an operator's
-				// own outer workflow invokes and wraps with org logic, leaving the pristine
-				// generated file untouched. For GitHub that is a workflow_call trigger; the
-				// other engines are natively composable (gitlab include:, tekton/argo refs).
-				if eng == "github" {
-					emitted = bytes.Replace(emitted, []byte("on: [workflow_dispatch]\n"),
-						[]byte("on:\n  workflow_dispatch: {}\n  workflow_call: {}\n"), 1)
-				}
-			}
-			// The emitted pipeline runs `nkd-exec exec-node` over a committed nodes.json
-			// (the pinned IR data, ADR-18 §2). Write it alongside the pipeline so the two
-			// travel together; on stdout, note where it must live.
-			nodes, err := pipeline.NodesJSON(g)
-			if err != nil {
-				return err
-			}
-			transportPlan, err := pipeline.TransportPlanJSON(g)
-			if err != nil {
-				return err
-			}
-			if c.Bool("check") {
-				return bundleCheck(c.Context, c.String("out"), eng, g.RecipeID, digest, emitted, nodes, transportPlan, c.Bool("json"))
-			}
-			if out := c.String("out"); out != "" {
-				manifest, err := pipeline.ManifestJSON(eng, g.RecipeID, digest, out, emitted, nodes, transportPlan)
-				if err != nil {
-					return err
-				}
-				if err := writeExecutionBundle(c.Context, out, emitted, nodes, transportPlan, manifest); err != nil {
-					return err
-				}
-				fmt.Fprintf(os.Stderr, "wrote content-bound, transactionally committed execution bundle %s, %s, %s, %s (UNQUALIFIED until its runtime inputs and producer evidence are authenticated)\n", out, filepath.Join(filepath.Dir(out), pipeline.NodesFile), filepath.Join(filepath.Dir(out), pipeline.TransportPlanFile), bundleManifestPath(out))
-				return nil
-			}
-			_, err = os.Stdout.Write(emitted)
-			if err == nil {
-				fmt.Fprintf(os.Stderr, "\n# commit %s alongside this pipeline (nkd-exec reads it):\n", pipeline.NodesFile)
-				os.Stderr.Write(nodes)
-			}
-			return err
-		},
-	}
-}
-
-func emittedVerificationConfig(c *cli.Context) pipeline.VerificationConfig {
-	return pipeline.VerificationConfig{
-		Cosign: c.String("cosign"), CosignDigest: c.String("cosign-digest"),
-		ExpectedDigests: c.String("expected-digests"), Signature: c.String("signature"),
-		Certificate: c.String("certificate"), Bundle: c.String("bundle"), TrustedRoot: c.String("trusted-root"),
-		TrustedRootDigest: c.String("trusted-root-digest"),
-		Identity:          c.String("identity"), Issuer: c.String("issuer"), TrustStore: c.String("trust-store"),
-		Profile: c.String("profile"), ProfileSignature: c.String("profile-signature"),
-		ProfileCertificate: c.String("profile-certificate"), ProfileBundle: c.String("profile-bundle"),
-		ProfileTrustedRoot: c.String("profile-trusted-root"), ProfileTrustedRootDigest: c.String("profile-trusted-root-digest"),
-		ProfileIdentity: c.String("profile-identity"),
-		ProfileIssuer:   c.String("profile-issuer"),
-	}
-}
-
-// bundleCheck is the ADR-21 §2 fail-closed drift gate: it compares the freshly
-// re-emitted pipeline (fresh) to the committed file at path and, on any divergence,
-// fails closed with CodePipelineDrift, classifying the cause — stale-pins (the
-// committed recipeDigest no longer matches the resolved one; remedy: catalog bump then
-// bundle) vs hand-edit (recipeDigest matches but bytes differ; remedy: bundle to
-// regenerate). Emission is deterministic, so an unchanged input reproduces byte-for-byte.
-func bundleCheck(ctx context.Context, path, engine, recipeID, recipeDigest string, fresh, nodes, transportPlan []byte, asJSON bool) error {
-	if err := executionBundleContextError(ctx, "checking execution-bundle drift"); err != nil {
-		return err
-	}
-	if path == "" {
-		return e.New(e.CodeUsage, "bundle --check requires --out <committed pipeline file>")
-	}
-	freshManifest, freshManifestErr := pipeline.ManifestJSON(engine, recipeID, recipeDigest, path, fresh, nodes, transportPlan)
-	if freshManifestErr != nil {
-		return freshManifestErr
-	}
-	committed, err := readExecutionBundleMember(ctx, path, int64(len(fresh)))
-	if err != nil {
-		return e.Wrap(e.CodePipelineDrift, err, "reading committed pipeline %s", path)
-	}
-	committedNodes, nodesErr := readExecutionBundleMember(ctx,
-		filepath.Join(filepath.Dir(path), pipeline.NodesFile), int64(len(nodes)))
-	committedTransport, transportErr := readExecutionBundleMember(ctx,
-		filepath.Join(filepath.Dir(path), pipeline.TransportPlanFile), int64(len(transportPlan)))
-	committedManifest, manifestErr := readExecutionBundleMember(ctx,
-		bundleManifestPath(path), int64(len(freshManifest)))
-	if bytes.Equal(committed, fresh) && nodesErr == nil && bytes.Equal(committedNodes, nodes) &&
-		transportErr == nil && bytes.Equal(committedTransport, transportPlan) &&
-		manifestErr == nil && bytes.Equal(committedManifest, freshManifest) &&
-		pipeline.VerifyManifest(committedManifest, engine, recipeID, recipeDigest, path, committed, committedNodes, committedTransport) == nil {
-		fmt.Fprintf(os.Stderr, "%s is up to date (recipeDigest %s)\n", path, recipeDigest)
-		return nil
-	}
-	class := "hand-edit"
-	remedy := "run: nkdctl bundle --out " + path
-	if committedDigest := headerRecipeDigest(committed); committedDigest != "" && committedDigest != recipeDigest {
-		class = "stale-pins"
-		remedy = "run: nkdctl catalog bump, then nkdctl bundle --out " + path
-	} else if nodesErr != nil || transportErr != nil || manifestErr != nil || !bytes.Equal(committedNodes, nodes) || !bytes.Equal(committedTransport, transportPlan) || !bytes.Equal(committedManifest, freshManifest) {
-		class = "incomplete-bundle"
-	}
-	if asJSON {
-		fmt.Printf("{\"drift\":true,\"file\":%q,\"class\":%q,\"committedRecipeDigest\":%q,\"resolvedRecipeDigest\":%q}\n",
-			path, class, headerRecipeDigest(committed), recipeDigest)
-	}
-	return e.New(e.CodePipelineDrift,
-		"%s has drifted from the IR (%s); %s", path, class, remedy)
-}
-
-func bundleManifestPath(pipelinePath string) string { return pipelinePath + ".bundle.json" }
-
-const maxExecutionBundleMemberBytes int64 = 64 << 20
-
-func readExecutionBundleMember(ctx context.Context, path string, maximum int64) ([]byte, error) {
-	if err := executionBundleContextError(ctx, "reading execution-bundle member"); err != nil {
-		return nil, err
-	}
-	if maximum < 0 || maximum > maxExecutionBundleMemberBytes {
-		return nil, e.New(e.CodePipelineDrift,
-			"execution-bundle member %s exceeds the supported size limit", path)
-	}
-	file, held, err := openExecutionBundleRegular(path, e.CodePipelineDrift)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = file.Close() }()
-	if held.Size() > maximum {
-		return nil, e.New(e.CodePipelineDrift,
-			"execution-bundle member %s is not a bounded regular file", path)
-	}
-	raw := make([]byte, 0, held.Size())
-	buffer := make([]byte, 128<<10)
-	for {
-		if err := executionBundleContextError(ctx, "reading execution-bundle member"); err != nil {
-			return nil, err
-		}
-		n, readErr := file.Read(buffer)
-		if n > 0 {
-			if int64(len(raw)+n) > maximum {
-				return nil, e.New(e.CodePipelineDrift,
-					"execution-bundle member %s grew beyond its expected size", path)
-			}
-			raw = append(raw, buffer[:n]...)
-		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			return nil, readErr
-		}
-	}
-	afterHeld, heldErr := file.Stat()
-	afterPath, pathErr := os.Lstat(path)
-	if heldErr != nil || pathErr != nil || !os.SameFile(held, afterHeld) ||
-		!os.SameFile(held, afterPath) || afterHeld.Size() != int64(len(raw)) ||
-		afterPath.Size() != int64(len(raw)) || afterHeld.Mode() != held.Mode() ||
-		!afterHeld.ModTime().Equal(held.ModTime()) {
-		return nil, e.New(e.CodePipelineDrift,
-			"execution-bundle member %s changed while reading", path)
-	}
-	return raw, nil
-}
-
-func openExecutionBundleRegular(path string, code e.Code) (*os.File, os.FileInfo, error) {
-	fd, err := unix.Open(path,
-		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
-	if err != nil {
-		return nil, nil, e.Wrap(code, err,
-			"opening execution-bundle member %s without following links", path)
-	}
-	file := os.NewFile(uintptr(fd), path)
-	if file == nil {
-		_ = unix.Close(fd)
-		return nil, nil, e.New(code,
-			"holding execution-bundle member %s", path)
-	}
-	held, err := file.Stat()
-	pathInfo, pathErr := os.Lstat(path)
-	if err != nil || pathErr != nil || !held.Mode().IsRegular() ||
-		!pathInfo.Mode().IsRegular() || !os.SameFile(held, pathInfo) {
-		_ = file.Close()
-		return nil, nil, e.New(code,
-			"execution-bundle member %s is not a stable regular file", path)
-	}
-	return file, held, nil
-}
-
-// headerRecipeDigest extracts the recipeDigest from a generated pipeline's provenance
-// header ("# recipeDigest: <d>"), or "" if absent.
-func headerRecipeDigest(b []byte) string {
-	for _, line := range strings.Split(string(b), "\n") {
-		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "# recipeDigest:"); ok {
-			return strings.TrimSpace(rest)
-		}
-	}
-	return ""
 }
 
 // writeAtomic writes and syncs data in the target directory, checks cancellation
@@ -600,197 +221,6 @@ func writeAtomic(ctx context.Context, path string, data []byte, perm os.FileMode
 	return nil
 }
 
-// writeExecutionBundle stages every member in one directory, syncs each, then
-// publishes the manifest last as the commit record. A crash can leave new member
-// bytes with an old/missing manifest, but that state is deliberately unverifiable:
-// bundle --check and the nodesDigest runner guard fail closed instead of executing a
-// mixed generation.
-func writeExecutionBundle(ctx context.Context, pipelinePath string, emitted, nodes, transportPlan, manifest []byte) error {
-	if err := executionBundleContextError(ctx, "writing execution bundle"); err != nil {
-		return err
-	}
-	dir := filepath.Dir(pipelinePath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return e.Wrap(e.CodeInternal, err, "creating execution bundle directory")
-	}
-	type stagedFile struct {
-		path string
-		data []byte
-		temp string
-	}
-	files := []stagedFile{
-		{path: filepath.Join(dir, pipeline.NodesFile), data: nodes},
-		{path: filepath.Join(dir, pipeline.TransportPlanFile), data: transportPlan},
-		{path: pipelinePath, data: emitted},
-		{path: bundleManifestPath(pipelinePath), data: manifest}, // commit record: always last
-	}
-	for _, file := range files {
-		if int64(len(file.data)) > maxExecutionBundleMemberBytes {
-			return e.New(e.CodeEngineCapability,
-				"execution-bundle member %s exceeds the supported size limit", file.path)
-		}
-	}
-	expected := make(map[string]string, len(files))
-	for _, file := range files {
-		if err := executionBundleContextError(ctx, "snapshotting execution bundle"); err != nil {
-			return err
-		}
-		state, err := bundleFileState(ctx, file.path)
-		if err != nil {
-			return err
-		}
-		expected[file.path] = state
-	}
-	cleanup := func() {
-		for _, file := range files {
-			if file.temp != "" {
-				_ = os.Remove(file.temp)
-			}
-		}
-	}
-	defer cleanup()
-	for i := range files {
-		if err := executionBundleContextError(ctx, "staging execution bundle"); err != nil {
-			return err
-		}
-		tmp, err := os.CreateTemp(dir, ".nkd-bundle-*.tmp")
-		if err != nil {
-			return e.Wrap(e.CodeInternal, err, "staging execution bundle member %s", files[i].path)
-		}
-		files[i].temp = tmp.Name()
-		if err := tmp.Chmod(0o644); err != nil {
-			tmp.Close()
-			return e.Wrap(e.CodeInternal, err, "setting execution bundle member mode")
-		}
-		for offset := 0; offset < len(files[i].data); {
-			if err := executionBundleContextError(ctx, "staging execution bundle member"); err != nil {
-				_ = tmp.Close()
-				return err
-			}
-			end := min(offset+(128<<10), len(files[i].data))
-			written, err := tmp.Write(files[i].data[offset:end])
-			if err != nil {
-				_ = tmp.Close()
-				return e.Wrap(e.CodeInternal, err, "writing execution bundle member %s", files[i].path)
-			}
-			if written == 0 {
-				_ = tmp.Close()
-				return e.Wrap(e.CodeInternal, io.ErrShortWrite, "writing execution bundle member %s", files[i].path)
-			}
-			offset += written
-		}
-		if err := executionBundleContextError(ctx, "syncing execution bundle member"); err != nil {
-			_ = tmp.Close()
-			return err
-		}
-		if err := tmp.Sync(); err != nil {
-			tmp.Close()
-			return e.Wrap(e.CodeInternal, err, "syncing execution bundle member %s", files[i].path)
-		}
-		if err := tmp.Close(); err != nil {
-			return e.Wrap(e.CodeInternal, err, "closing execution bundle member %s", files[i].path)
-		}
-	}
-	leasePath := pipelinePath + ".lease"
-	releaseLease, err := acquireExecutionBundleLock(ctx, leasePath)
-	if err != nil {
-		return err
-	}
-	defer releaseLease()
-	if err := executionBundleContextError(ctx, "committing execution bundle"); err != nil {
-		return err
-	}
-	for _, file := range files {
-		if err := executionBundleContextError(ctx, "checking execution bundle commit state"); err != nil {
-			return err
-		}
-		current, err := bundleFileState(ctx, file.path)
-		if err != nil {
-			return err
-		}
-		if current != expected[file.path] {
-			return e.New(e.CodeWriteConflict, "execution bundle member %s changed while regeneration was staged", file.path)
-		}
-	}
-	// Cancellation is honored until this final linearization check. Once the first
-	// payload rename starts, complete the manifest-last commit and directory fsync
-	// so voluntary cancellation cannot strand a partially published generation.
-	if err := executionBundleContextError(ctx, "committing execution bundle"); err != nil {
-		return err
-	}
-	for i := range files {
-		if err := os.Rename(files[i].temp, files[i].path); err != nil {
-			return e.Wrap(e.CodeInternal, err, "publishing execution bundle member %s", files[i].path)
-		}
-		files[i].temp = ""
-	}
-	directory, err := os.Open(dir)
-	if err != nil {
-		return e.Wrap(e.CodeInternal, err, "opening execution bundle directory for sync")
-	}
-	syncErr := directory.Sync()
-	closeErr := directory.Close()
-	if syncErr != nil {
-		return e.Wrap(e.CodeInternal, syncErr, "syncing execution bundle transaction")
-	}
-	if closeErr != nil {
-		return e.Wrap(e.CodeInternal, closeErr, "closing execution bundle directory")
-	}
-	return nil
-}
-
-func bundleFileState(ctx context.Context, path string) (string, error) {
-	if err := executionBundleContextError(ctx, "hashing execution-bundle member"); err != nil {
-		return "", err
-	}
-	file, held, err := openExecutionBundleRegular(path, e.CodeWriteConflict)
-	if errors.Is(err, os.ErrNotExist) {
-		return "absent", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = file.Close() }()
-	if held.Size() > maxExecutionBundleMemberBytes {
-		return "", e.New(e.CodeWriteConflict,
-			"execution bundle member %s exceeds the supported size limit", path)
-	}
-	hash := sha256.New()
-	buffer := make([]byte, 128<<10)
-	var total int64
-	for {
-		if err := executionBundleContextError(ctx, "hashing execution-bundle member"); err != nil {
-			return "", err
-		}
-		n, readErr := file.Read(buffer)
-		if n > 0 {
-			total += int64(n)
-			if total > maxExecutionBundleMemberBytes {
-				return "", e.New(e.CodeWriteConflict,
-					"execution bundle member %s grew beyond the supported size limit", path)
-			}
-			_, _ = hash.Write(buffer[:n])
-		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			return "", e.Wrap(e.CodeInternal, readErr,
-				"hashing execution bundle member %s", path)
-		}
-	}
-	afterHeld, heldErr := file.Stat()
-	afterPath, pathErr := os.Lstat(path)
-	if heldErr != nil || pathErr != nil || !os.SameFile(held, afterHeld) ||
-		!os.SameFile(held, afterPath) || afterHeld.Size() != total ||
-		afterPath.Size() != total || afterHeld.Mode() != held.Mode() ||
-		!afterHeld.ModTime().Equal(held.ModTime()) {
-		return "", e.New(e.CodeWriteConflict,
-			"execution bundle member %s changed while hashing", path)
-	}
-	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
-}
-
 // ── build ────────────────────────────────────────────────────────────────────
 
 // buildFlags are the execution flags shared by build / attest / verify.
@@ -857,7 +287,7 @@ func preflightGate(c *cli.Context, arch string) (profile.BuilderProfile, string,
 
 type qualifiedLocalBuild struct {
 	Report             *pipeline.Report
-	Resolved           *recipe.Resolved
+	Resolved           *buildgraph.Resolved
 	Profile            *profile.BuilderProfile
 	ProfileDigest      string
 	ProfileDivergences []profile.Divergence
@@ -949,11 +379,11 @@ func runQualifiedLocalBuild(c *cli.Context, sourceRoot string) (*qualifiedLocalB
 			return nil, err
 		}
 	}
-	res, _, err := resolveRecipe(c)
+	res, _, err := resolveBuild(c)
 	if err != nil {
 		return nil, err
 	}
-	graph, err := recipe.Compile(res)
+	graph, err := buildgraph.Compile(res)
 	if err != nil {
 		return nil, err
 	}
@@ -962,22 +392,19 @@ func runQualifiedLocalBuild(c *cli.Context, sourceRoot string) (*qualifiedLocalB
 		return nil, err
 	}
 	result := &qualifiedLocalBuild{Resolved: res}
-	only, err := skuComponents(c, res)
-	if err != nil {
-		return nil, err
-	}
+	only := selectedComponents(c)
 	options := pipeline.RunOptions{
 		Ctx: c.Context, SourceRoot: sourceRoot, Only: only, Jobs: c.Int("jobs"),
 		KeepGoing: c.Bool("keep-going"), Package: c.Bool("package"), Runtime: c.String("runtime"),
 		Stdout: os.Stdout, Stderr: os.Stderr,
 	}
-	if recipeHasSource(res) {
+	if buildHasSource(res) {
 		if authenticatedProfile == nil {
 			return result, e.New(e.CodeUntrustedProfile,
 				"qualified from-source output requires a separately authenticated builder profile with runner, runtime, toolchain, and sandbox execution identities")
 		}
 		builderProfile := authenticatedProfile.Profile
-		if err := builderProfile.RequireBuilders(recipe.RequiredBuilders(res)); err != nil {
+		if err := builderProfile.RequireBuilders(buildgraph.RequiredBuilders(res)); err != nil {
 			return nil, err
 		}
 		result.Profile = &builderProfile
@@ -1019,12 +446,12 @@ func rejectQualifiedPackaging(c *cli.Context) error {
 	return nil
 }
 
-// recipeHasSource reports whether any resolved component is built from source. It
+// buildHasSource reports whether any resolved component is built from source. It
 // gates the builder-profile host preflight and manifest profile-binding: the no-compile
 // (prebuilt) lane is host-independent — a content-addressed download reproduces the same
-// bytes anywhere — so an all-prebuilt recipe is NOT bounded to a builder profile, and
+// bytes anywhere — so an all-prebuilt graph is NOT bounded to a builder profile, and
 // running the build-host preflight against it would be a spurious fail-closed.
-func recipeHasSource(res *recipe.Resolved) bool {
+func buildHasSource(res *buildgraph.Resolved) bool {
 	for _, nc := range res.Components {
 		if nc.FromSource {
 			return true
@@ -1033,26 +460,9 @@ func recipeHasSource(res *recipe.Resolved) bool {
 	return false
 }
 
-// runLocalBuild resolves the query, compiles the IR, runs the fail-closed host
-// preflight against the selected builder profile (only when a from-source component is
-// present), and runs the local engine.
-// skuComponents is the build/delivery component set: an explicit --only wins; else
-// --role selects the node-SKU subset via each component's `roles` affinity (ADR-12 §3,
-// ADR-14 §4). It NEVER changes the recipe identity — the digest is over the full
-// category recipe; role only bounds which components this build produces.
-func skuComponents(c *cli.Context, res *recipe.Resolved) ([]string, error) {
-	if only := c.StringSlice("only"); len(only) > 0 {
-		return only, nil
-	}
-	role := c.String("role")
-	if role == "" {
-		return nil, nil
-	}
-	sku, err := recipe.FilterByRole(res, role)
-	if err != nil {
-		return nil, err
-	}
-	return sku.ComponentNames(), nil
+// selectedComponents optionally narrows an unqualified diagnostic execution.
+func selectedComponents(c *cli.Context) []string {
+	return c.StringSlice("only")
 }
 
 func runLocalBuild(c *cli.Context) (*pipeline.Report, error) {
@@ -1065,11 +475,11 @@ func runLocalBuild(c *cli.Context) (*pipeline.Report, error) {
 // implementation. Its Report is deliberately unqualified and cannot feed
 // attest/release authority.
 func runLocalBuildAt(c *cli.Context, sourceRoot string) (*pipeline.Report, error) {
-	res, _, err := resolveRecipe(c)
+	res, _, err := resolveBuild(c)
 	if err != nil {
 		return nil, err
 	}
-	g, err := recipe.Compile(res)
+	g, err := buildgraph.Compile(res)
 	if err != nil {
 		return nil, err
 	}
@@ -1077,24 +487,21 @@ func runLocalBuildAt(c *cli.Context, sourceRoot string) (*pipeline.Report, error
 	if err != nil {
 		return nil, err
 	}
-	if recipeHasSource(res) {
-		prof, _, _, err := preflightGate(c, res.Criteria.Arch)
+	if buildHasSource(res) {
+		prof, _, _, err := preflightGate(c, target.Arch(res.Platform))
 		if err != nil {
 			return nil, err
 		}
-		// ADR-07 §5 capability match: the profile must provide every builder the recipe
+		// ADR-07 §5 capability match: the profile must provide every builder the selected graph
 		// requires (e.g. a nix component needs a nix-providing profile), else fail closed.
-		if err := prof.RequireBuilders(recipe.RequiredBuilders(res)); err != nil {
+		if err := prof.RequireBuilders(buildgraph.RequiredBuilders(res)); err != nil {
 			return nil, err
 		}
 	}
 	if !c.Bool("dry-run") {
 		fmt.Fprintf(os.Stderr, "building with up to %d parallel job(s)\n", c.Int("jobs"))
 	}
-	only, err := skuComponents(c, res)
-	if err != nil {
-		return nil, err
-	}
+	only := selectedComponents(c)
 	return pipeline.Local{}.Run(g, digest, pipeline.RunOptions{
 		Ctx:        c.Context,
 		SourceRoot: sourceRoot,
@@ -1113,7 +520,7 @@ func cmdBuild() *cli.Command {
 	return &cli.Command{
 		Name:  "build",
 		Usage: "run an unqualified local development build (cannot mint validation/release evidence)",
-		Flags: append(append(append(append(queryFlags(), buildFlags()...),
+		Flags: append(append(append(append(selectionFlags(), buildFlags()...),
 			&cli.BoolFlag{Name: "dry-run", Usage: "print the docker invocations without executing"}),
 			&cli.BoolFlag{Name: "bake-off", Usage: "run an UNQUALIFIED same-host byte comparison; use --emit/--compare for diagnostic records"},
 			&cli.StringFlag{Name: "emit", Usage: "emit this single build's UNQUALIFIED observed-digests record here"},
@@ -1137,17 +544,17 @@ func cmdBuild() *cli.Command {
 }
 
 // cmdFetch is the no-compile lane's entry point (NKD-FR-BLD-050): it acquires the
-// pinned, content-addressed prebuilt artifacts a recipe declares — downloading each and
+// pinned, content-addressed prebuilt artifacts the selected graph declares — downloading each and
 // verifying it against the pinned digest (fail closed), never compiling. It runs only
 // the prebuilt components (a from-source component is left to `nkdctl build`), so on a
-// mixed recipe `fetch` + `build` cover the whole set. No builder-profile preflight
+// mixed graph `fetch` + `build` cover the whole set. No builder-profile preflight
 // applies: acquisition is host-independent.
 func cmdFetch() *cli.Command {
 	return &cli.Command{
 		Name:   "fetch",
 		Hidden: true, // retained for legacy compatibility
 		Usage:  "acquire pinned prebuilt artifacts (no compile): download + verify against the pinned digest",
-		Flags: append(queryFlags(),
+		Flags: append(selectionFlags(),
 			&cli.StringSliceFlag{Name: "only", Usage: "acquire only these components (repeatable)"},
 			&cli.IntFlag{Name: "jobs", Aliases: []string{"j"}, Value: 4, Usage: "max concurrent acquisitions"},
 			&cli.StringFlag{Name: "source-root", Value: ".nkd/work/src", Usage: "work root (artifacts land alongside, in ../fetch)"},
@@ -1157,11 +564,11 @@ func cmdFetch() *cli.Command {
 			&cli.BoolFlag{Name: "dry-run", Usage: "print the acquisition plan without downloading"},
 		),
 		Action: func(c *cli.Context) error {
-			res, _, err := resolveRecipe(c)
+			res, _, err := resolveBuild(c)
 			if err != nil {
 				return err
 			}
-			g, err := recipe.Compile(res)
+			g, err := buildgraph.Compile(res)
 			if err != nil {
 				return err
 			}
@@ -1196,7 +603,7 @@ func cmdFetch() *cli.Command {
 			}
 			if len(only) == 0 {
 				return e.New(e.CodeUnsupported,
-					"recipe %q has no prebuilt components — use `nkdctl build` for the from-source lane", res.RecipeID)
+					"selected build has no prebuilt components — use `nkdctl build` for the from-source lane")
 			}
 			rep, err := pipeline.Local{}.Run(g, digest, pipeline.RunOptions{
 				Ctx:        c.Context,
@@ -1287,7 +694,7 @@ func cmdBakeOff() *cli.Command {
 // bakeOffFlags are the bake-off-specific flags, shared by the hidden `bake-off` command
 // and the legacy-compatible `build --bake-off` entry point.
 func bakeOffFlags() []cli.Flag {
-	return append(append(append(queryFlags(), buildFlags()...),
+	return append(append(append(selectionFlags(), buildFlags()...),
 		&cli.StringFlag{Name: "emit", Usage: "emit THIS environment's UNQUALIFIED observed-digests record here"},
 		&cli.StringSliceFlag{Name: "compare", Usage: "diagnostically compare two observed-digests records: --compare A.json --compare B.json"},
 	), qualifiedDocumentVerifierFlags()...)
@@ -1370,7 +777,7 @@ func runBakeOffWithBuild(c *cli.Context, build diagnosticBuildFunc) error {
 			fmt.Fprintf(tw, "%s\t%s\tyes\n", comp.Name, comp.SHA256)
 		}
 		tw.Flush()
-		fmt.Printf("\nUNQUALIFIED LOCAL DIAGNOSTIC: BIT-IDENTICAL across two same-host work paths (%d component(s)); recipeDigest %s\n", len(ma.Components), a.RecipeDigest)
+		fmt.Printf("\nUNQUALIFIED LOCAL DIAGNOSTIC: BIT-IDENTICAL across two same-host work paths (%d component(s)); buildDigest %s\n", len(ma.Components), a.BuildDigest)
 		fmt.Println("(not a reproduction receipt; an authenticated two-independent-machine observation remains required)")
 		return nil
 	}
@@ -1409,7 +816,7 @@ func emitDiagnosticBuild(c *cli.Context, build diagnosticBuildFunc) error {
 	if err := writeAtomic(c.Context, out, b, 0o644); err != nil {
 		return err
 	}
-	fmt.Printf("UNQUALIFIED DIAGNOSTIC: emitted one local observed-digests record → %s (recipeDigest %s); it is not a validation vector or reproduction receipt\n", out, report.RecipeDigest)
+	fmt.Printf("UNQUALIFIED DIAGNOSTIC: emitted one local observed-digests record → %s (buildDigest %s); it is not a validation vector or reproduction receipt\n", out, report.BuildDigest)
 	return nil
 }
 
@@ -1469,7 +876,7 @@ func diagnosticManifestFromReport(c *cli.Context, report *pipeline.Report) (*att
 		}
 	}
 	if hasSource {
-		selected, digest, err := resolveProfile(c, c.String("arch"))
+		selected, digest, err := resolveProfile(c, target.Arch(c.String("platform")))
 		if err != nil {
 			return nil, err
 		}
@@ -1488,7 +895,7 @@ func diagnosticManifestFromReport(c *cli.Context, report *pipeline.Report) (*att
 // diagnostic comparison and cannot itself authorize validation evidence.
 func bakeoffCompare(ctx context.Context, pathA, pathB string) error {
 	load := func(p string) (*attest.Manifest, error) {
-		raw, err := readExecutionBundleMember(ctx, p, trust.MaxAuthenticatedDocumentBytes)
+		raw, err := readBoundedRegularInput(ctx, p, trust.MaxAuthenticatedDocumentBytes)
 		if err != nil {
 			return nil, e.Wrap(e.CodeVerifyFailed, err, "reading record %s", p)
 		}
@@ -1506,7 +913,7 @@ func bakeoffCompare(ctx context.Context, pathA, pathB string) error {
 		fmt.Printf("NOT bit-identical across environments (%s vs %s):\n", pathA, pathB)
 		return err
 	}
-	fmt.Printf("UNQUALIFIED DIAGNOSTIC: record bytes are bit-identical across the two environments (%d component(s)); recipeDigest %s\n", len(a.Components), a.RecipeDigest)
+	fmt.Printf("UNQUALIFIED DIAGNOSTIC: record bytes are bit-identical across the two environments (%d component(s)); buildDigest %s\n", len(a.Components), a.BuildDigest)
 	fmt.Println("(no execution receipt was authenticated from disk; this comparison is not validation evidence)")
 	return nil
 }
@@ -1516,7 +923,7 @@ func cmdSBOM() *cli.Command {
 		Name:   "sbom",
 		Hidden: true, // retained as legacy compatibility for attest --sbom
 		Usage:  "emit an UNQUALIFIED diagnostic CycloneDX SBOM from a caller-supplied manifest",
-		Flags: append(queryFlags(),
+		Flags: append(selectionFlags(),
 			&cli.StringFlag{Name: "out", Aliases: []string{"o"}, Value: "sbom.cdx.json", Usage: "SBOM output path (or output dir with --per-artifact)"},
 			&cli.BoolFlag{Name: "per-artifact", Usage: "emit one SBOM per built artifact + an aggregate index (ADR-13 §1)"},
 			&cli.BoolFlag{Name: "diagnostic", Usage: "accept an UNQUALIFIED bake-off observed-digests record instead of a publishable validation vector"},
@@ -1524,11 +931,11 @@ func cmdSBOM() *cli.Command {
 				Usage: "canonical vector, or with --diagnostic an observed-digests record supplying the selected exact artifact digest(s)"},
 		),
 		Action: func(c *cli.Context) error {
-			res, digest, err := resolveRecipe(c)
+			res, digest, err := resolveBuild(c)
 			if err != nil {
 				return err
 			}
-			raw, err := readExecutionBundleMember(c.Context, c.String("expected-digests"), trust.MaxAuthenticatedDocumentBytes)
+			raw, err := readBoundedRegularInput(c.Context, c.String("expected-digests"), trust.MaxAuthenticatedDocumentBytes)
 			if err != nil {
 				return e.Wrap(e.CodeVerifyFailed, err, "reading manifest")
 			}
@@ -1536,9 +943,9 @@ func cmdSBOM() *cli.Command {
 			if err != nil {
 				return err
 			}
-			if m.RecipeDigest != digest {
+			if m.BuildDigest != digest {
 				return e.New(e.CodeVerifyFailed,
-					"expected-digests recipeDigest %s does not match the resolved recipe %s", m.RecipeDigest, digest)
+					"expected-digests buildDigest %s does not match the resolved build %s", m.BuildDigest, digest)
 			}
 			hashes := make(map[string]string, len(m.Components))
 			for _, comp := range m.Components {
@@ -1614,7 +1021,7 @@ func cmdAttest() *cli.Command {
 	return &cli.Command{
 		Name:  "attest",
 		Usage: "build, then emit the expected-digests manifest (the publisher's zero-binary artifact)",
-		Flags: append(append(append(queryFlags(), buildFlags()...),
+		Flags: append(append(append(selectionFlags(), buildFlags()...),
 			&cli.StringFlag{Name: "out", Aliases: []string{"o"}, Value: "expected-digests.json",
 				Usage: "manifest output path"},
 			&cli.StringFlag{Name: "conformance", Usage: "reserved legacy field; qualified publisher vectors reject caller-authored conformance claims"},
@@ -1623,7 +1030,7 @@ func cmdAttest() *cli.Command {
 			&cli.BoolFlag{Name: "aicr-bundle", Usage: "reserved; publisher-attestation AICR bundling is unavailable in this release"},
 			&cli.StringFlag{Name: "aicr-out", Value: ".nkd/work/aicr-bundle", Usage: "reserved output path for --aicr-bundle"},
 			&cli.BoolFlag{Name: "vuln", Usage: "scan the deterministic SBOM with a shelled scanner and fold the report digest into the vector (ADR-13 §3)"},
-			&cli.StringFlag{Name: "vuln-artifact", Usage: "with --vuln: exact component whose per-artifact SBOM is scanned (required for a multi-artifact recipe)"},
+			&cli.StringFlag{Name: "vuln-artifact", Usage: "with --vuln: exact component whose per-artifact SBOM is scanned (required for a multi-artifact build)"},
 			&cli.StringFlag{Name: "vuln-scanner", Value: "grype", Usage: "with --vuln: qualified scanner kind (grype|trivy)"},
 			&cli.StringFlag{Name: "vuln-scanner-digest", Usage: "with --vuln: exact observed scanner sha256 identity"},
 			&cli.StringFlag{Name: "vuln-db", Usage: "with --vuln: exact observed scanner database sha256 identity"},
@@ -1680,7 +1087,7 @@ func cmdAttest() *cli.Command {
 			if err != nil {
 				return err
 			}
-			g, err := recipe.Compile(res)
+			g, err := buildgraph.Compile(res)
 			if err != nil {
 				return err
 			}
@@ -1758,13 +1165,13 @@ func cmdAttest() *cli.Command {
 // receipt. Neither decoded manifests nor caller-provided digest strings can enter
 // this authority boundary.
 func verifyEvidenceDigests(ctx context.Context, vectorDocument trust.DocumentReceipt,
-	res *recipe.Resolved, report *pipeline.Report,
+	res *buildgraph.Resolved, report *pipeline.Report,
 ) error {
 	published, err := attest.VerifyPublishedVectorReceipt(ctx, vectorDocument)
 	if err != nil {
 		return err
 	}
-	g, err := recipe.Compile(res)
+	g, err := buildgraph.Compile(res)
 	if err != nil {
 		return err
 	}
@@ -1787,100 +1194,12 @@ func verifyEvidenceDigests(ctx context.Context, vectorDocument trust.DocumentRec
 	return nil
 }
 
-// authenticateBundleRunnerDigest authenticates the exact canonical builder profile
-// under RoleBuilderProfile and returns only its runner pin. This is generator-runner
-// authority: it controls the executable that interprets the emitted graph and runs
-// terminal verification, but it does not profile-bind a prebuilt artifact.
-//
-// Every caller-controlled capability is admitted before trusted-root, profile,
-// catalog, or graph I/O. Offline bundle verification is mandatory because the same
-// material must remain usable when the generated pipeline is checked in an air gap.
-func authenticateBundleRunnerDigest(c *cli.Context, injected trust.DocumentVerifier) (string, error) {
-	if c == nil || c.Context == nil {
-		return "", e.New(e.CodeUsage,
-			"bundle runner-profile authentication requires a command context")
-	}
-	ctx := c.Context
-	if err := ctx.Err(); err != nil {
-		return "", e.Wrap(e.CodeTimeout, err,
-			"bundle runner-profile authentication canceled")
-	}
-	profilePath := strings.TrimSpace(c.String("profile"))
-	if profilePath == "" {
-		return "", e.New(e.CodeUntrustedProfile,
-			"provider bundle emission requires an exact signed --profile containing the runner pin")
-	}
-	identity := strings.TrimSpace(c.String("profile-identity"))
-	issuer := strings.TrimSpace(c.String("profile-issuer"))
-	if identity == "" || issuer == "" {
-		return "", e.New(e.CodeTrustPolicyMissing,
-			"provider bundle emission requires explicit --profile-identity and --profile-issuer runner authority")
-	}
-	material := trust.SignatureMaterial{
-		SignaturePath:   strings.TrimSpace(c.String("profile-signature")),
-		CertificatePath: strings.TrimSpace(c.String("profile-certificate")),
-		BundlePath:      strings.TrimSpace(c.String("profile-bundle")),
-		TrustedRootPath: strings.TrimSpace(c.String("profile-trusted-root")),
-	}
-	if err := validateQualifiedMaterial("bundle runner profile", material, true); err != nil {
-		return "", err
-	}
-	rootDigest := strings.TrimSpace(c.String("profile-trusted-root-digest"))
-	if !exactSHA256Pin(rootDigest) {
-		return "", e.New(e.CodeUnpinnedInput,
-			"provider bundle emission requires an exact lowercase --profile-trusted-root-digest")
-	}
-	verifier, err := resolveQualifiedDocumentVerifier(c, injected)
-	if err != nil {
-		return "", err
-	}
-	policy, err := trust.NewRolePolicy(trust.RoleBuilderProfile, trust.Store{
-		CLIIdentities: []string{identity},
-	}, issuer)
-	if err != nil {
-		return "", err
-	}
-	policy, err = qualifiedPolicyWithTrustedRoot(policy, material.TrustedRootPath, rootDigest, true)
-	if err != nil {
-		return "", err
-	}
-	authenticator, err := trust.NewDocumentAuthenticator(verifier,
-		trust.JSONSchema[profile.BuilderProfile](profile.SchemaVersion))
-	if err != nil {
-		return "", err
-	}
-	receipt, err := authenticator.Authenticate(ctx, trust.AuthenticateRequest{
-		SourcePath: profilePath, Signature: material, Offline: true,
-		Role: trust.RoleBuilderProfile, Policy: policy,
-	})
-	if err != nil {
-		return "", err
-	}
-	authenticatedProfile, ok := receipt.Decoded().(profile.BuilderProfile)
-	if !ok {
-		return "", e.New(e.CodeInternal,
-			"authenticated bundle runner-profile decoder returned %T", receipt.Decoded())
-	}
-	if err := authenticatedProfile.Validate(); err != nil {
-		return "", err
-	}
-	for _, f := range authenticatedProfile.Fields {
-		if f.Name == profile.FieldRunnerDigest {
-			if !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(f.Value) {
-				return "", e.New(e.CodeUntrustedProfile, "builder profile runner digest %q is not canonical sha256", f.Value)
-			}
-			return f.Value, nil
-		}
-	}
-	return "", e.New(e.CodeUntrustedProfile, "emitted pipeline requires builder profile field %s", profile.FieldRunnerDigest)
-}
-
 func printReport(rep *pipeline.Report) {
 	if rep == nil {
 		return
 	}
 	fmt.Printf("\n──────── nkdctl build report ────────\n")
-	fmt.Printf("recipe:        %s\nrecipeDigest:  %s\n\n", rep.RecipeID, rep.RecipeDigest)
+	fmt.Printf("buildDigest:  %s\n\n", rep.BuildDigest)
 	if rep.Qualified() {
 		fmt.Printf("authority:     qualified execution (%s)\n\n", orNone(rep.QualificationProfileDigest()))
 	} else {
@@ -2065,16 +1384,16 @@ func profileFromActivation(label *catalog.AICRProfile, activation *ir.AICRActiva
 	}
 	if label.Service != activation.Service || label.Accelerator != activation.Accelerator ||
 		label.OS != activation.OS || label.Intent != activation.Intent ||
-		label.Platform != activation.Platform || label.Digest != activation.RecipeDigest ||
+		label.Platform != activation.Platform || label.Digest != activation.ProfileDigest ||
 		label.GeneratorDigest != activation.GeneratorDigest {
 		return aicr.Profile{}, e.New(e.CodePipelineDrift,
-			"AICR catalog declaration changed after recipe identity was compiled")
+			"AICR catalog declaration changed after build identity was compiled")
 	}
 	p := aicr.Profile{
 		Identity: label.Identity, Repo: label.Repo,
 		Service: activation.Service, Accelerator: activation.Accelerator,
 		OS: activation.OS, Intent: activation.Intent, Platform: activation.Platform,
-		Digest: activation.RecipeDigest, GeneratorDigest: activation.GeneratorDigest,
+		Digest: activation.ProfileDigest, GeneratorDigest: activation.GeneratorDigest,
 	}
 	if err := p.Validate(); err != nil {
 		return aicr.Profile{}, err
@@ -2084,21 +1403,20 @@ func profileFromActivation(label *catalog.AICRProfile, activation *ir.AICRActiva
 
 // ── aicr ─────────────────────────────────────────────────────────────────────
 
-// cmdAICR leverages AICR (github.com/NVIDIA/aicr) to render the accelerated-runtime
-// bundle for a recipe that declares a digest-pinned AICR profile (NKD-FR-RC-013a). It
-// shells out to the `aicr` binary — nkdctl does not import AICR (keeping its linked
-// deps minimal); an operator embedding nkdctl's SDK can instead inject an SDK-backed
-// aicr.UnqualifiedBundler.
+// cmdAICR invokes AICR (github.com/NVIDIA/aicr) to render the accelerated-runtime
+// bundle from an explicitly selected digest-pinned AICR profile (NKD-FR-RC-013a). It
+// shells out to the pinned `aicr` binary through the same runner used by factory
+// execution; nkdctl does not link the upstream AICR implementation.
 func cmdAICR() *cli.Command {
 	return &cli.Command{
 		Name:   "aicr",
 		Hidden: true, // retained for legacy compatibility
-		Usage:  "leverage AICR to render the accelerated-runtime bundle for an AICR-enabled recipe",
+		Usage:  "render an accelerated-runtime bundle from an exact AICR profile",
 		Subcommands: []*cli.Command{
 			{
 				Name:  "bundle",
 				Usage: "render and locally verify an AICR deployment tree (external output remains unqualified)",
-				Flags: append(queryFlags(),
+				Flags: append(selectionFlags(),
 					&cli.StringFlag{Name: "out", Aliases: []string{"o"}, Value: ".nkd/work/aicr-bundle", Usage: "bundle output dir"},
 					&cli.StringFlag{Name: "deployer", Usage: "helm | argocd | flux | helmfile (default: aicr's default, helm)"},
 					&cli.BoolFlag{Name: "attest", Usage: "have aicr sign the bundle with build provenance"},
@@ -2106,15 +1424,15 @@ func cmdAICR() *cli.Command {
 					&cli.StringFlag{Name: "aicr", Value: aicr.DefaultBinary, Usage: "aicr binary name/path"},
 				),
 				Action: func(c *cli.Context) error {
-					res, digest, err := resolveRecipe(c)
+					res, digest, err := resolveBuild(c)
 					if err != nil {
 						return err
 					}
 					if res.AICRProfile == nil {
 						return e.New(e.CodeUnsupported,
-							"resolved recipe %q declares no aicrProfile — the AICR-governed axes are inactive for it (see testdata/examples/operator-catalog)", res.RecipeID)
+							"selected build declares no AICR profile; select one with --aicr-profile")
 					}
-					g, err := recipe.Compile(res)
+					g, err := buildgraph.Compile(res)
 					if err != nil {
 						return err
 					}
@@ -2123,7 +1441,7 @@ func cmdAICR() *cli.Command {
 						return err
 					}
 					if compiledDigest != digest {
-						return e.New(e.CodePipelineDrift, "resolved recipe identity changed before AICR bundling: got %s want %s", compiledDigest, digest)
+						return e.New(e.CodePipelineDrift, "resolved build identity changed before AICR bundling: got %s want %s", compiledDigest, digest)
 					}
 					p, err := profileFromActivation(res.AICRProfile, g.AICR)
 					if err != nil {
@@ -2194,73 +1512,13 @@ func cmdCatalog() *cli.Command {
 					if err != nil {
 						return err
 					}
-					if cat.Layers != nil {
-						fmt.Printf("ok: %s — layered catalog: %d category recipe pattern(s), 1 base, %d overlay(s), %d mixin(s), %d component(s)\n",
-							cat.Metadata.Name, len(cat.Layers.Categories()), len(cat.Layers.Overlays),
-							len(cat.Layers.Mixins), len(cat.Components))
-					} else {
-						fmt.Printf("ok: %s — %d flat recipe(s), %d component(s)\n",
-							cat.Metadata.Name, len(cat.Recipes), len(cat.Components))
-					}
+					fmt.Printf("ok: %s — %d component(s), %d AICR profile(s)\n", cat.Metadata.Name, len(cat.Components), len(cat.AICRProfiles))
 					return nil
 				},
 			},
 			{
-				Name:  "recipes",
-				Usage: "enumerate every concrete resolved recipe in an explicit resolution frame",
-				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "data", Required: true, Usage: "path to the catalog directory"},
-					&cli.StringFlag{Name: "k8s", Required: true, Usage: "concrete Kubernetes version bounding the enumeration frame"},
-					&cli.StringFlag{Name: "os", Value: criteria.DefaultOS, Usage: "concrete target OS bounding the enumeration frame"},
-					&cli.StringFlag{Name: "arch", Value: criteria.DefaultArch, Usage: "concrete target architecture bounding the enumeration frame"},
-					&cli.StringFlag{Name: "category", Usage: "optionally enumerate only this category"},
-					&cli.StringFlag{Name: "service", Usage: "AICR service for accelerated-runtime enumeration (for example eks)"},
-					&cli.StringFlag{Name: "accelerator", Usage: "AICR accelerator for accelerated-runtime enumeration (for example h100)"},
-					&cli.StringFlag{Name: "intent", Usage: "AICR intent for accelerated-runtime enumeration (training | inference)"},
-					&cli.StringFlag{Name: "platform", Usage: "optional AICR workload platform"},
-					&cli.BoolFlag{Name: "json", Usage: "emit the deterministic enumeration as canonical JSON"},
-				},
-				Action: func(c *cli.Context) error {
-					cat, err := catalog.LoadContext(c.Context, providerFor(c))
-					if err != nil {
-						return err
-					}
-					resolved, err := recipe.Enumerate(cat, criteria.Criteria{
-						Category: c.String("category"), K8sVersion: c.String("k8s"),
-						OS: c.String("os"), Arch: c.String("arch"),
-					}, map[string]string{
-						"service": c.String("service"), "accelerator": c.String("accelerator"),
-						"intent": c.String("intent"), "platform": c.String("platform"),
-					})
-					if err != nil {
-						return err
-					}
-					if c.Bool("json") {
-						raw, err := canonical.Marshal(resolved)
-						if err != nil {
-							return err
-						}
-						_, err = os.Stdout.Write(append(raw, '\n'))
-						return err
-					}
-					fmt.Printf("resolvable recipes for k8s=%s os=%s arch=%s (role-independent):\n\n",
-						c.String("k8s"), c.String("os"), c.String("arch"))
-					tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-					fmt.Fprintln(tw, "RECIPE\tCATEGORY\tCONTENTS\tAICR PROFILE\tRECIPE DIGEST")
-					for _, item := range resolved {
-						contents := fmt.Sprintf("%d component(s)", len(item.Components))
-						if item.AICR != nil && len(item.Components) == 0 {
-							contents = "AICR activation closure"
-						}
-						fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", item.RecipeID,
-							item.Criteria.Category, contents, item.AICRProfileIdentity, item.RecipeDigest)
-					}
-					return tw.Flush()
-				},
-			},
-			{
 				Name:  "list",
-				Usage: "list recipes and components",
+				Usage: "list components and AICR profiles",
 				Flags: []cli.Flag{&cli.StringFlag{Name: "data", Required: true, Usage: "path to the catalog directory"}},
 				Action: func(c *cli.Context) error {
 					cat, err := catalog.LoadContext(c.Context, providerFor(c))
@@ -2268,46 +1526,16 @@ func cmdCatalog() *cli.Command {
 						return err
 					}
 					fmt.Printf("catalog: %s\n\n", cat.Metadata.Name)
-					if cat.Layers != nil {
-						// Layered (base/overlays/mixins) catalog: show the composition graph.
-						fmt.Printf("overlays (layered — recipes are composed):\n")
-						ov := make([]string, 0, len(cat.Layers.Overlays))
-						for n := range cat.Layers.Overlays {
-							ov = append(ov, n)
-						}
-						sort.Strings(ov)
-						ltw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-						fmt.Fprintf(ltw, "  base\t(root)\t%d componentRefs\n", len(cat.Layers.Base.Spec.ComponentRefs))
-						for _, n := range ov {
-							o := cat.Layers.Overlays[n]
-							crit := ""
-							if o.Spec.Criteria != nil {
-								crit = fmt.Sprintf("category=%s k8s=%s os=%s arch=%s",
-									orAny(o.Spec.Criteria.Category), orAny(o.Spec.Criteria.K8sVersion),
-									orAny(o.Spec.Criteria.OS), orAny(o.Spec.Criteria.Arch))
-							}
-							if o.Spec.AICRProfile != nil {
-								crit += " aicr=" + o.Spec.AICRProfile.Identity
-							}
-							fmt.Fprintf(ltw, "  %s\tbase=%s\t%d componentRefs\t%s\n", n, orNone(o.Spec.Base), len(o.Spec.ComponentRefs), crit)
-						}
-						ltw.Flush()
-						if len(cat.Layers.Mixins) > 0 {
-							mx := make([]string, 0, len(cat.Layers.Mixins))
-							for n := range cat.Layers.Mixins {
-								mx = append(mx, n)
-							}
-							sort.Strings(mx)
-							fmt.Printf("\nmixins: %s\n", strings.Join(mx, ", "))
-						}
-					} else {
-						fmt.Printf("recipes:\n")
-						for _, r := range cat.Recipes {
-							fmt.Printf("  %-26s role=%s k8s=%s os=%s arch=%s  (%d components)\n",
-								r.ID, orAny(r.Criteria.Role), orAny(r.Criteria.K8sVersion),
-								orAny(r.Criteria.OS), orAny(r.Criteria.Arch), len(r.Components))
-						}
+					profiles := make([]string, 0, len(cat.AICRProfiles))
+					for name := range cat.AICRProfiles {
+						profiles = append(profiles, name)
 					}
+					sort.Strings(profiles)
+					fmt.Println("AICR profiles:")
+					for _, name := range profiles {
+						fmt.Printf("  %s\t%s\n", name, cat.AICRProfiles[name].Digest)
+					}
+
 					fmt.Printf("\ncomponents:\n")
 					names := make([]string, 0, len(cat.Components))
 					for n := range cat.Components {
@@ -2351,7 +1579,7 @@ func cmdCatalog() *cli.Command {
 				ArgsUsage: "[component...]",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "all", Usage: "pin every prebuilt component"},
-					&cli.StringSliceFlag{Name: "arch", Value: cli.NewStringSlice("amd64", "arm64"), Usage: "arches to pin"},
+					&cli.StringSliceFlag{Name: "arch", Usage: "optional exact declared architecture set to pin"},
 					&cli.StringFlag{Name: "dir", Required: true, Usage: "on-disk catalog directory to update"},
 					&cli.StringFlag{Name: "runtime", Aliases: []string{"docker"}, Value: "docker", Usage: "container runtime for image manifest inspection"},
 					&cli.DurationFlag{Name: "timeout", Value: 5 * time.Minute, Usage: "maximum duration for artifact digest resolution"},
@@ -2472,12 +1700,40 @@ func pinArtifacts(c *cli.Context) error {
 	}
 	want := map[string]bool{}
 	for _, a := range c.Args().Slice() {
+		if want[a] {
+			return e.New(e.CodeUsage, "pin-artifacts: component %q is selected more than once", a)
+		}
 		want[a] = true
 	}
 	if !c.Bool("all") && len(want) == 0 {
 		return e.New(e.CodeUnsupported, "pin-artifacts: name a component or pass --all")
 	}
-	arches := c.StringSlice("arch")
+	available := make(map[string]bool, len(targets))
+	for _, selected := range targets {
+		available[selected.Name] = true
+	}
+	for _, name := range c.Args().Slice() {
+		if !available[name] {
+			return e.New(e.CodeInvalidCatalog, "pin-artifacts: unknown prebuilt component %q", name)
+		}
+	}
+	requestedArches := c.StringSlice("arch")
+	for _, selected := range targets {
+		if !c.Bool("all") && !want[selected.Name] {
+			continue
+		}
+		if len(requestedArches) > 0 {
+			declared := make([]string, 0, len(selected.Platforms))
+			for _, platform := range selected.Platforms {
+				declared = append(declared, target.Arch(platform))
+			}
+			requested := append([]string(nil), requestedArches...)
+			sort.Strings(requested)
+			if !reflect.DeepEqual(requested, declared) {
+				return e.New(e.CodeUsage, "component %q requires exact declared architectures %v", selected.Name, declared)
+			}
+		}
+	}
 	lock, err := catalog.LoadLockContext(ctx, dir)
 	if err != nil {
 		return err
@@ -2489,6 +1745,10 @@ func pinArtifacts(c *cli.Context) error {
 	for _, t := range targets {
 		if !c.Bool("all") && !want[t.Name] {
 			continue
+		}
+		arches := make([]string, 0, len(t.Platforms))
+		for _, platform := range t.Platforms {
+			arches = append(arches, target.Arch(platform))
 		}
 		digests := map[string]string{}
 		if t.Image != "" {
@@ -2669,13 +1929,6 @@ func catalogHTTPResponse(ctx context.Context, url string) (*http.Response, error
 func orNone(s string) string {
 	if s == "" {
 		return "(none)"
-	}
-	return s
-}
-
-func orAny(s string) string {
-	if criteria.IsWildcard(s) {
-		return "any"
 	}
 	return s
 }

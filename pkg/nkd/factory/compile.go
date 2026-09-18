@@ -7,48 +7,46 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/buildgraph"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/catalog"
-	"github.com/NVIDIA/nke-recipes/pkg/nkd/cluster"
+	authored "github.com/NVIDIA/nke-recipes/pkg/nkd/definition"
 	e "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
-	"github.com/NVIDIA/nke-recipes/pkg/nkd/execution"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/ir"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/pipeline"
-	"github.com/NVIDIA/nke-recipes/pkg/nkd/recipe"
 )
 
-// CompileDocuments compiles lifecycle-owned handoff values while resolving catalog
-// paths against the public Definition that selected them.
-func CompileDocuments(ctx context.Context, definitionPath string, definition CompileSpec,
-	environmentPath string, delivery ExecutionSettings, generatorVersion string,
+// CompileDocuments resolves authored catalog paths and returns the complete Run
+// plan, including required outputs, environment routes, and production evidence.
+func CompileDocuments(ctx context.Context, definitionPath string, definition authored.Definition,
+	environmentPath string, delivery authored.Environment, generatorVersion string,
 ) (*Plan, error) {
 	if ctx == nil {
 		return nil, e.New(e.CodeUsage, "definition compilation requires a context")
+	}
+	if err := admitInputs(definition, delivery); err != nil {
+		return nil, err
 	}
 	stack, err := loadFactoryCatalogStack(ctx, definitionPath, definition.Catalog)
 	if err != nil {
 		return nil, err
 	}
 	targetStacks := make(map[string]*catalog.Stack)
-	for _, target := range definition.Recipes {
+	for _, target := range definition.Outputs {
 		if target.Catalog == nil {
 			continue
 		}
 		targetStack, err := loadFactoryCatalogStack(ctx, definitionPath, *target.Catalog)
 		if err != nil {
-			return nil, e.Wrap(e.CodeInvalidCatalog, err, "loading catalog stack for recipe %q", target.Name)
+			return nil, e.Wrap(e.CodeInvalidCatalog, err, "loading catalog stack for build %q", target.Name)
 		}
 		targetStacks[target.Name] = targetStack
 	}
-	plan, err := compileWithTargetStacks(ctx, definition, delivery, stack, targetStacks, generatorVersion)
-	if err != nil {
-		return nil, err
-	}
-	plan.DefinitionPath = filepath.ToSlash(filepath.Clean(definitionPath))
-	plan.EnvironmentPath = filepath.ToSlash(filepath.Clean(environmentPath))
-	return plan, nil
+	return compileWithTargetStacks(ctx, definition, delivery, stack, targetStacks, generatorVersion,
+		filepath.ToSlash(filepath.Clean(definitionPath)), filepath.ToSlash(filepath.Clean(environmentPath)))
+
 }
 
-func loadFactoryCatalogStack(ctx context.Context, definitionPath string, catalogSpec CatalogStack) (*catalog.Stack, error) {
+func loadFactoryCatalogStack(ctx context.Context, definitionPath string, catalogSpec authored.Catalog) (*catalog.Stack, error) {
 	basePath := catalogSpec.Base
 	if !filepath.IsAbs(basePath) {
 		basePath = filepath.Join(filepath.Dir(definitionPath), basePath)
@@ -76,7 +74,6 @@ func loadFactoryCatalogStack(ctx context.Context, definitionPath string, catalog
 	return stack, nil
 }
 
-// Compile is the deep pure-ish compiler once external files have been admitted.
 // toolchainMaterializedPrefix names operator-materialized toolchain images. The catalog pins
 // them registry-agnostically (bare `nkd-toolchain-*@sha256:…`) so the default catalog carries no
 // operator's registry; the delivery's toolchainRegistry supplies WHERE the operator published
@@ -85,7 +82,7 @@ const toolchainMaterializedPrefix = "nkd-toolchain-"
 
 // relocateToolchainRegistry rewrites each build node's operator-materialized toolchain ref into
 // the delivery-supplied registry, preserving the @sha256 digest (mirroring airgap.Relocate, so
-// recipeDigest — which strips the prefix — is unchanged). When no registry is configured the
+// buildDigest — which strips the prefix — is unchanged). When no registry is configured the
 // operator toolchains are left registry-agnostic (they will not pull at runtime until an
 // operator names their registry); public toolchains are always left untouched.
 func relocateToolchainRegistry(graph *ir.Graph, registry string) {
@@ -111,18 +108,20 @@ func relocateToolchainRegistry(graph *ir.Graph, registry string) {
 	}
 }
 
-func Compile(ctx context.Context, definition CompileSpec, delivery ExecutionSettings, stack *catalog.Stack, generatorVersion string) (*Plan, error) {
-	for _, target := range definition.Recipes {
+// Compile derives the complete Run plan from admitted inputs and a resolved catalog.
+// Catalog overrides require CompileDocuments so each path has an explicit base.
+func Compile(ctx context.Context, definition authored.Definition, delivery authored.Environment, stack *catalog.Stack, generatorVersion string) (*Plan, error) {
+	for _, target := range definition.Outputs {
 		if target.Catalog != nil {
 			return nil, e.New(e.CodeUsage,
-				"factory recipe target %q has a catalog override; compile it through the lifecycle owner", target.Name)
+				"factory build target %q has a catalog override; compile it through CompileDocuments", target.Name)
 		}
 	}
-	return compileWithTargetStacks(ctx, definition, delivery, stack, nil, generatorVersion)
+	return compileWithTargetStacks(ctx, definition, delivery, stack, nil, generatorVersion, "", "")
 }
 
-func compileWithTargetStacks(ctx context.Context, definition CompileSpec, delivery ExecutionSettings, stack *catalog.Stack,
-	targetStacks map[string]*catalog.Stack, generatorVersion string) (*Plan, error) {
+func compileWithTargetStacks(ctx context.Context, definition authored.Definition, delivery authored.Environment, stack *catalog.Stack,
+	targetStacks map[string]*catalog.Stack, generatorVersion, definitionPath, environmentPath string) (*Plan, error) {
 	if ctx == nil {
 		return nil, e.New(e.CodeUsage, "factory compilation requires a context")
 	}
@@ -132,193 +131,173 @@ func compileWithTargetStacks(ctx context.Context, definition CompileSpec, delive
 	if stack == nil || stack.Catalog == nil {
 		return nil, e.New(e.CodeInvalidCatalog, "factory compilation requires a resolved catalog stack")
 	}
-	if len(definition.SelectedTools) > 0 {
-		if definition.Tools == nil {
-			definition.Tools = map[string]Tool{}
-		}
-		for _, name := range definition.SelectedTools {
-			pin, ok := stack.Catalog.Tools[name]
-			if !ok {
-				return nil, e.New(e.CodeUnpinnedSource, "selected catalog tool %q has no pin", name)
-			}
-			if _, duplicate := definition.Tools[name]; duplicate {
-				return nil, e.New(e.CodeInvalidCatalog, "duplicate tool %q", name)
-			}
-			if pin.Platform != definition.UtilityPlatform {
-				return nil, e.New(e.CodeEngineCapability, "tool %q platform %s does not match utility platform %s", name, pin.Platform, definition.UtilityPlatform)
-			}
-			definition.Tools[name] = Tool{Format: pin.Format, URL: pin.URL, ArchiveDigest: pin.ArchiveDigest, ExecutablePath: pin.ExecutablePath, ExecutableDigest: pin.ExecutableDigest}
-		}
-	}
-	// The AUTHORED definition's identity, taken before the runner defaulting below
-	// mutates the document. Production signing binds it into the attestation, so it
-	// is computed here (where the definition object exists) rather than rederived
-	// from a file the executing job may not even have. It is recorded only when the
-	// delivery signs: a plan that mints no attestation must keep its exact bytes.
-	compileSpecDigest := ""
-	if delivery.Signing != nil {
-		digest, err := definition.Digest()
-		if err != nil {
-			return nil, err
-		}
-		compileSpecDigest = digest
-	}
-	// ADR-18 §8: the runner is environment config. A delivery may override the definition's default
-	// runner for its environment (e.g. a GitLab tag); otherwise an unset runsOn falls back to the
-	// generic hosted runner. The effective default propagates to every node's RunsOn below.
-	if r := strings.TrimSpace(delivery.RunsOn); r != "" {
-		definition.RunsOn = r
-	} else if strings.TrimSpace(definition.RunsOn) == "" {
-		definition.RunsOn = DefaultRunsOn
-	}
-	if err := definition.Validate(); err != nil {
+	if err := admitInputs(definition, delivery); err != nil {
 		return nil, err
 	}
-	if err := delivery.Validate(); err != nil {
-		return nil, err
-	}
-	// The Plan owns its class inventory. ExecutionSettings is passed by value, but
-	// both this slice and each class's capability slice would otherwise alias the
-	// caller and permit post-compilation mutation of executable Plan identity.
-	delivery.ExecutionClasses = execution.CloneClasses(delivery.ExecutionClasses)
-	if stack == nil || stack.Catalog == nil {
-		return nil, e.New(e.CodeInvalidCatalog, "factory compilation requires a resolved catalog stack")
-	}
-	executionSettingsDigest, err := delivery.Digest()
+	// Hold independent authored input values so callers cannot change executable identity.
+	definition = definition.Clone()
+	delivery = delivery.Clone()
+	definitionDigest, err := definition.Digest()
 	if err != nil {
 		return nil, err
 	}
-	if delivery.Signing != nil && delivery.Signing.Mode == SigningModeCosign {
-		if _, ok := definition.Tools[delivery.Signing.CosignTool]; !ok {
-			return nil, e.New(e.CodeTrustPolicyMissing,
-				"environment signing cosignTool %q is not a pinned tool in compile spec %q",
-				delivery.Signing.CosignTool, definition.Metadata.Name)
+	environmentDigest, err := delivery.Digest()
+	if err != nil {
+		return nil, err
+	}
+	snapshot, err := catalog.ApplyStack(stack.Catalog)
+	if err != nil {
+		return nil, err
+	}
+	outputCatalogs := make(map[string]*catalog.Catalog, len(targetStacks))
+	for name, selected := range targetStacks {
+		if selected != nil {
+			outputCatalogs[name] = selected.Catalog
 		}
+	}
+	tools, err := selectedTools(definition, delivery, stack.Catalog, outputCatalogs)
+	if err != nil {
+		return nil, err
+	}
+	packageSpecs, targets, routes, err := derivePublication(definition, delivery)
+	if err != nil {
+		return nil, err
 	}
 	plan := &Plan{Actions: cloneActionPins(stack.Catalog.Actions), SchemaVersion: PlanSchemaVersion, Name: definition.Metadata.Name,
 		GeneratorVersion: generatorVersion, Qualification: planTier(delivery.Signing),
-		CompileSpecDigest: compileSpecDigest,
-		CatalogDigest:     stack.Digest, AppliedOverlays: append([]catalog.AppliedOverlay(nil), stack.Applied...),
-		ExecutionSettingsDigest: executionSettingsDigest, ExecutionSettings: delivery,
-		Graph: ArtifactGraph{SchemaVersion: ArtifactGraphSchema}}
-
-	targets := append([]RecipeTarget(nil), definition.Recipes...)
-	sort.Slice(targets, func(i, j int) bool { return targets[i].Name < targets[j].Name })
-	artifacts := map[string]Artifact{}
-	nodes := map[string]Node{}
-	for _, name := range sortedKeys(definition.Tools) {
-		tool := definition.Tools[name]
-		nodeID := "tool/" + name
-		artifactID := "tool/" + name
-		nodes[nodeID] = Node{ID: nodeID, Kind: NodeAcquire, RunsOn: definition.RunsOn,
-			Network: ir.NetworkDefault, URL: tool.URL, Digest: tool.ArchiveDigest,
-			Executable: tool.ExecutablePath, ExecutableDigest: tool.ExecutableDigest, ToolFormat: tool.Format,
-			Outputs: []string{artifactID}}
-		artifacts[artifactID] = Artifact{ID: artifactID, Name: name, Kind: "pipeline-tool",
-			MediaType: "application/vnd.nkd.pipeline-tool.v1", Producer: nodeID,
-			Path: filepath.ToSlash(filepath.Join(".nkd", "factory", "tools", name, tool.ExecutablePath))}
-	}
-	for _, target := range targets {
+		DefinitionDigest: definitionDigest, EnvironmentDigest: environmentDigest, Definition: definition, Environment: delivery,
+		DefinitionPath: definitionPath, EnvironmentPath: environmentPath,
+		CatalogDigest: stack.Digest, CatalogSnapshot: snapshot.Catalog, AppliedOverlays: append([]catalog.AppliedOverlay(nil), stack.Applied...),
+		Targets: targets, Routes: routes, Graph: ArtifactGraph{SchemaVersion: ArtifactGraphSchema}}
+	for _, target := range definition.Outputs {
 		if err := ctx.Err(); err != nil {
 			return nil, e.Wrap(e.CodeTimeout, err, "factory compilation canceled")
-		}
-		if target.RunsOn == "" {
-			target.RunsOn = definition.RunsOn
 		}
 		targetStack := stack
 		if selected := targetStacks[target.Name]; selected != nil {
 			targetStack = selected
 		}
-		resolved, err := recipe.Resolve(targetStack.Catalog, target.Criteria, target.Reserved)
+		resolved, err := buildgraph.Resolve(targetStack.Catalog, buildgraph.Selection{Components: target.Components, Platform: target.Platform, AICRProfile: aicrProfile(target), Bundle: aicrBundle(target)})
 		if err != nil {
-			return nil, e.Wrap(e.CodeNoMatch, err, "factory recipe target %q", target.Name)
+			return nil, e.Wrap(e.CodeNoMatch, err, "factory build target %q", target.Name)
 		}
 		if resolved.AICRProfile != nil {
-			if target.AICRGenerator == "" {
+			if aicrGenerator(target) == "" {
 				return nil, e.New(e.CodeInvalidCatalog,
 					"factory AICR target %q requires an exact pipeline tool in aicrGenerator", target.Name)
 			}
-			tool := definition.Tools[target.AICRGenerator]
+			tool := tools[aicrGenerator(target)]
 			profile := *resolved.AICRProfile
 			// Generator identity is execution-platform specific. The catalog selects
-			// the semantic recipe, while the factory target pins the exact executable
-			// that will reproduce it on this runner. recipe.Compile then binds that
-			// executable digest into recipeDigest.
-			profile.GeneratorDigest = tool.ExecutableDigest
+			// the semantic build, while the factory target pins the exact executable
+			// that will reproduce it on this runner. buildgraph.Compile then binds that
+			// executable digest into buildDigest.
+			if profile.GeneratorDigest != tool.ExecutableDigest {
+				return nil, e.New(e.CodeUnpinnedSource, "output %q generator does not match selected profile pin", target.Name)
+			}
 			resolved.AICRProfile = &profile
-		} else if target.AICRGenerator != "" {
+		} else if aicrGenerator(target) != "" {
 			return nil, e.New(e.CodeInvalidCatalog,
-				"factory recipe target %q names aicrGenerator but resolves no AICR profile", target.Name)
+				"factory build target %q names aicrGenerator but resolves no AICR profile", target.Name)
 		}
-		graph, err := recipe.Compile(resolved)
+		graph, err := compileBuildGraph(resolved, delivery)
 		if err != nil {
 			return nil, err
 		}
-		recipeDigest, err := graph.Digest()
+		buildDigest, err := graph.Digest()
 		if err != nil {
 			return nil, err
 		}
-		// The catalog pins operator-materialized toolchains registry-agnostically
-		// (`nkd-toolchain-*@sha256:…`); resolve them into THIS environment's registry now. Only
-		// the registry prefix changes — the digest is preserved — so recipeDigest (computed
-		// above, and which strips the prefix) is unaffected. Public toolchains are untouched.
-		relocateToolchainRegistry(graph, delivery.Runtime.ToolchainRegistry)
-		selected, err := recipe.FilterByRole(resolved, target.Criteria.Role)
-		if err != nil {
-			return nil, e.Wrap(e.CodeInvalidCatalog, err, "factory recipe target %q", target.Name)
-		}
-		if target.LifecycleComponents != nil {
-			available := make(map[string]catalog.NamedComponent, len(selected.Components))
-			for _, component := range selected.Components {
-				available[component.Name] = component
-			}
-			limited := make([]catalog.NamedComponent, 0, len(target.LifecycleComponents))
-			for _, name := range target.LifecycleComponents {
-				component, ok := available[name]
-				if !ok {
-					return nil, e.New(e.CodeInvalidCatalog,
-						"factory recipe target %q lifecycle output selects unavailable component %q", target.Name, name)
-				}
-				limited = append(limited, component)
-			}
-			selected.Components = limited
-		}
+		selected := resolved
 		selectedNames := make([]string, 0, len(selected.Components))
-		allNames := make([]string, 0, len(resolved.Components))
-		selectedSet := map[string]bool{}
-		for _, component := range resolved.Components {
-			allNames = append(allNames, component.Name)
-		}
-		sort.Strings(allNames)
 		for _, component := range selected.Components {
 			selectedNames = append(selectedNames, component.Name)
-			selectedSet[component.Name] = true
 		}
 		sort.Strings(selectedNames)
-		if err := bindRecipeExecution(graph, selectedSet, delivery.ExecutionClasses); err != nil {
-			return nil, e.Wrap(e.CodeEngineCapability, err,
-				"factory recipe target %q cannot satisfy execution requirements", target.Name)
-		}
 		aicrIdentity := ""
 		if resolved.AICRProfile != nil {
 			aicrIdentity = resolved.AICRProfile.Identity
 		}
-		plan.Recipes = append(plan.Recipes, RecipePlan{Name: target.Name,
-			CatalogDigest: targetStack.Digest, AppliedOverlays: append([]catalog.AppliedOverlay(nil), targetStack.Applied...),
-			RecipeID:     resolved.RecipeID,
-			RecipeDigest: recipeDigest, Criteria: target.Criteria, RunsOn: target.RunsOn,
-			Components: selectedNames, AllComponents: allNames,
-			// The SBOM node bills the SELECTED (built) components: those are exactly the
-			// ones with a producer-result carrying an observed digest (ADR-13).
-			ResolvedComponents:  append([]catalog.NamedComponent(nil), selected.Components...),
-			AICRProfileIdentity: aicrIdentity, Graph: graph})
-		if err := addRecipeDataflow(target, graph, selectedSet, definition.UtilityContainer, definition.UtilityPlatform, nodes, artifacts); err != nil {
+		snapshot, err := catalog.ApplyStack(targetStack.Catalog)
+		if err != nil {
 			return nil, err
 		}
+		plan.Builds = append(plan.Builds, BuildPlan{Name: target.Name,
+			CatalogDigest: targetStack.Digest, AppliedOverlays: append([]catalog.AppliedOverlay(nil), targetStack.Applied...),
+			BuildDigest: buildDigest, Platform: target.Platform, CatalogSnapshot: snapshot.Catalog,
+			Components: selectedNames,
+			// The SBOM node bills the SELECTED (built) components: those are exactly the
+			// ones with a producer-result carrying an observed digest (ADR-13).
+			ResolvedComponents: append([]catalog.NamedComponent(nil), selected.Components...),
+			AICRProfileName:    aicrProfile(target), AICRProfileIdentity: aicrIdentity, Graph: graph})
+		plan.LifecycleOutputs = append(plan.LifecycleOutputs, LifecycleOutputPlan{Name: target.Name, Kind: target.Format, ArtifactID: "package/" + target.Name, BuildDigest: buildDigest, Components: append([]string(nil), target.Components...)})
 	}
-	if delivery.SBOMTool != "" {
-		if _, ok := definition.Tools[delivery.SBOMTool]; !ok {
-			return nil, e.New(e.CodeProvenanceMissing, "SBOM scanner is not a pinned tool")
+	plan.Graph, err = compileArtifactGraph(*plan, tools, packageSpecs)
+	if err != nil {
+		return nil, err
+	}
+	if err := plan.Validate(); err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
+// compileBuildGraph owns the Environment transformations of a catalog-derived
+// producer graph. They change execution bytes without changing Build identity.
+// Validation uses the same derivation before comparing the complete graph.
+func compileBuildGraph(resolved *buildgraph.Resolved, environment authored.Environment) (*ir.Graph, error) {
+	graph, err := buildgraph.Compile(resolved)
+	if err != nil {
+		return nil, err
+	}
+	relocateToolchainRegistry(graph, environment.Runtime.ToolchainRegistry)
+	selected := make(map[string]bool, len(resolved.Components))
+	for _, component := range resolved.Components {
+		selected[component.Name] = true
+	}
+	if err := bindBuildExecution(graph, selected, environment.ExecutionClasses); err != nil {
+		return nil, e.Wrap(e.CodeEngineCapability, err, "build cannot satisfy execution requirements")
+	}
+	return graph, nil
+}
+
+// compileArtifactGraph is the single derivation of executable scheduler nodes,
+// artifacts and their exact edges from admitted inputs and resolved producers.
+// It ignores the supplied Graph and never mutates the caller's Plan.
+func compileArtifactGraph(plan Plan, tools map[string]catalog.ToolPin, packageSpecs []packageSpec) (ArtifactGraph, error) {
+	definition, delivery := plan.Definition, plan.Environment
+	runsOn := delivery.RunsOn
+	if runsOn == "" {
+		runsOn = DefaultRunsOn
+	}
+	plan.Graph = ArtifactGraph{SchemaVersion: ArtifactGraphSchema}
+	artifacts := map[string]Artifact{}
+	nodes := map[string]Node{}
+	for _, name := range sortedKeys(tools) {
+		node, artifact := compileToolOperation(name, tools[name], runsOn)
+		nodes[node.ID] = node
+		artifacts[artifact.ID] = artifact
+	}
+	builds := make(map[string]BuildPlan, len(plan.Builds))
+	for _, build := range plan.Builds {
+		builds[build.Name] = build
+	}
+	for _, target := range definition.Outputs {
+		build, ok := builds[target.Name]
+		if !ok || build.Graph == nil {
+			return ArtifactGraph{}, e.New(e.CodePipelineDrift, "output %q has no resolved producer graph", target.Name)
+		}
+		selected := make(map[string]bool, len(build.Components))
+		for _, name := range build.Components {
+			selected[name] = true
+		}
+		if err := addBuildDataflow(target, runsOn, build.Graph, selected, delivery.UtilityContainer, delivery.UtilityPlatform, nodes, artifacts); err != nil {
+			return ArtifactGraph{}, err
+		}
+	}
+	if definition.SBOMTool != "" {
+		if _, ok := tools[definition.SBOMTool]; !ok {
+			return ArtifactGraph{}, e.New(e.CodeProvenanceMissing, "SBOM scanner is not a pinned tool")
 		}
 		for id, node := range nodes {
 			if node.Kind != NodeSBOM {
@@ -331,32 +310,29 @@ func compileWithTargetStacks(ctx context.Context, definition CompileSpec, delive
 				}
 			}
 			for _, artifact := range artifacts {
-				if artifact.RecipeTarget == node.RecipeTarget && components[artifact.Component] && strings.HasPrefix(artifact.ID, "artifact/") {
+				if artifact.BuildTarget == node.BuildTarget && components[artifact.Component] && strings.HasPrefix(artifact.ID, "artifact/") {
 					node.Inputs = append(node.Inputs, artifact.ID)
 				}
 			}
-			node.Inputs = uniqueSorted(append(node.Inputs, "tool/"+delivery.SBOMTool))
+			node.Inputs = uniqueSorted(append(node.Inputs, "tool/"+definition.SBOMTool))
 			nodes[id] = node
 		}
 	}
-	if err := addClusterCompositions(definition, plan, nodes, artifacts); err != nil {
-		return nil, err
-	}
 
-	packages, err := orderPackageSpecs(definition.Packages)
+	packages, err := orderPackageSpecs(packageSpecs)
 	if err != nil {
-		return nil, err
+		return ArtifactGraph{}, err
 	}
 	for _, spec := range packages {
 		inputs, err := expandSelectors(spec.Inputs, artifacts)
 		if err != nil {
-			return nil, e.Wrap(e.CodeInvalidCatalog, err, "factory package %q", spec.Name)
+			return ArtifactGraph{}, e.Wrap(e.CodeInvalidCatalog, err, "factory package %q", spec.Name)
 		}
 		if err := validatePackageInputs(spec, inputs, artifacts); err != nil {
-			return nil, err
+			return ArtifactGraph{}, err
 		}
 		if spec.Kind == PackageImage && nodes[artifacts[inputs[0]].Producer].Kind != NodeBuild {
-			return nil, e.New(e.CodeEngineCapability, "image package %q currently requires a built OCI export; acquired layouts need a separate adapter", spec.Name)
+			return ArtifactGraph{}, e.New(e.CodeEngineCapability, "image package %q currently requires a built OCI export; acquired layouts need a separate adapter", spec.Name)
 		}
 		// Packaging is explicitly gated by each target's terminal observation as a
 		// separate input, rather than hiding the policy edge in scheduler needs.
@@ -371,44 +347,44 @@ func compileWithTargetStacks(ctx context.Context, definition CompileSpec, delive
 		nodes[nodeID] = Node{ID: nodeID, Kind: NodePackage, PackageKind: spec.Kind,
 			HelmImage:    spec.HelmImage,
 			Distribution: spec.Distribution, PackageComponent: spec.Component,
-			Inputs: inputs, Outputs: []string{artifactID}, Network: ir.NetworkNone, RunsOn: definition.RunsOn,
-			Container: definition.UtilityContainer, Platform: definition.UtilityPlatform}
+			Inputs: inputs, Outputs: []string{artifactID}, Network: ir.NetworkNone, RunsOn: runsOn,
+			Container: delivery.UtilityContainer, Platform: delivery.UtilityPlatform}
 		artifacts[artifactID] = Artifact{ID: artifactID, Name: spec.Name, Kind: spec.Kind,
 			MediaType: packageMediaType(spec.Kind), Path: filepath.ToSlash(filepath.Join(".nkd", "factory", "packages", spec.Name)), Producer: nodeID}
 	}
 
-	routes := append([]Route(nil), delivery.Routes...)
+	routes := append([]Route(nil), plan.Routes...)
 	sort.Slice(routes, func(i, j int) bool { return routes[i].Name < routes[j].Name })
 	for _, route := range routes {
 		inputs, err := expandSelectors([]string{route.Input}, artifacts)
 		if err != nil {
-			return nil, e.Wrap(e.CodeInvalidCatalog, err, "delivery route %q", route.Name)
+			return ArtifactGraph{}, e.Wrap(e.CodeInvalidCatalog, err, "delivery route %q", route.Name)
 		}
 		if len(inputs) != 1 {
-			return nil, e.New(e.CodeInvalidCatalog, "delivery route %q must select exactly one artifact, got %d", route.Name, len(inputs))
+			return ArtifactGraph{}, e.New(e.CodeInvalidCatalog, "delivery route %q must select exactly one artifact, got %d", route.Name, len(inputs))
 		}
-		target := delivery.Targets[route.Target]
+		target := plan.Targets[route.Target]
 		if err := validateRouteCompatibility(route, target, artifacts[inputs[0]]); err != nil {
-			return nil, err
+			return ArtifactGraph{}, err
 		}
 		nodeID := "publish/" + route.Name
 		outputID := "publication/" + route.Name
 		nodes[nodeID] = Node{ID: nodeID, Kind: NodePublish, Target: route.Target,
-			Inputs: inputs, Outputs: []string{outputID}, Network: ir.NetworkDefault, RunsOn: definition.RunsOn}
+			Inputs: inputs, Outputs: []string{outputID}, Network: ir.NetworkDefault, RunsOn: runsOn}
 		artifacts[outputID] = Artifact{ID: outputID, Name: route.Name, Kind: "published-reference",
 			Producer: nodeID, Target: route.Target,
 			Path: filepath.ToSlash(filepath.Join(".nkd", "factory", "publications", route.Name+".txt"))}
-		if err := addSigningDataflow(definition, delivery, route, inputs[0], outputID, nodes, artifacts); err != nil {
-			return nil, err
+		if err := addSigningDataflow(&plan, runsOn, route, inputs[0], outputID, nodes, artifacts); err != nil {
+			return ArtifactGraph{}, err
 		}
 	}
 
 	plan.Graph.Nodes = mapNodes(nodes)
 	plan.Graph.Artifacts = mapArtifacts(artifacts)
-	if err := plan.Validate(); err != nil {
-		return nil, err
+	if err := bindEvidenceAttestation(&plan); err != nil {
+		return ArtifactGraph{}, err
 	}
-	return plan, nil
+	return plan.Graph, nil
 }
 
 func packageProducerResults(inputs []string, nodes map[string]Node, artifacts map[string]Artifact) []string {
@@ -426,14 +402,14 @@ func packageProducerResults(inputs []string, nodes map[string]Node, artifacts ma
 			if member.Kind == string(TierTerminalObservation) {
 				continue
 			}
-			if member.RecipeTarget != "" {
+			if member.BuildTarget != "" {
 				results = append(results, memberID)
 			}
-			if member.RecipeTarget == "" || member.Component == "" || member.Kind == "producer-result" {
+			if member.BuildTarget == "" || member.Component == "" || member.Kind == "producer-result" {
 				continue
 			}
 			for resultID, candidate := range artifacts {
-				if candidate.Kind == "producer-result" && candidate.RecipeTarget == member.RecipeTarget && candidate.Component == member.Component {
+				if candidate.Kind == "producer-result" && candidate.BuildTarget == member.BuildTarget && candidate.Component == member.Component {
 					results = append(results, resultID)
 				}
 			}
@@ -442,7 +418,7 @@ func packageProducerResults(inputs []string, nodes map[string]Node, artifacts ma
 	return uniqueSorted(results)
 }
 
-// Publication carries the complete evidence set for each contributing recipe.
+// Publication carries the complete evidence set for each contributing build.
 // Explicit edges make SBOM generation precede packaging and signing on every engine.
 func publicationSBOMInputs(inputs []string, nodes map[string]Node, artifacts map[string]Artifact) []string {
 	var result []string
@@ -451,7 +427,7 @@ func publicationSBOMInputs(inputs []string, nodes map[string]Node, artifacts map
 		if artifact.Kind != "producer-result" {
 			continue
 		}
-		set := "sbom/" + artifact.RecipeTarget
+		set := "sbom/" + artifact.BuildTarget
 		result = append(result, set)
 		for _, input := range nodes[artifacts[set].Producer].Inputs {
 			if artifacts[input].Kind == "producer-result" {
@@ -465,8 +441,8 @@ func publicationSBOMInputs(inputs []string, nodes map[string]Node, artifacts map
 // orderPackageSpecs derives execution order from package artifact inputs. Authored
 // order and lexical names have no scheduling semantics; ready nodes are selected
 // lexically only to make the topological result canonical.
-func orderPackageSpecs(authored []PackageSpec) ([]PackageSpec, error) {
-	byName := make(map[string]PackageSpec, len(authored))
+func orderPackageSpecs(authored []packageSpec) ([]packageSpec, error) {
+	byName := make(map[string]packageSpec, len(authored))
 	dependencies := make(map[string]map[string]bool, len(authored))
 	for _, spec := range authored {
 		byName[spec.Name] = spec
@@ -485,7 +461,7 @@ func orderPackageSpecs(authored []PackageSpec) ([]PackageSpec, error) {
 			dependencies[spec.Name][dependency] = true
 		}
 	}
-	ordered := make([]PackageSpec, 0, len(authored))
+	ordered := make([]packageSpec, 0, len(authored))
 	emitted := map[string]bool{}
 	for len(ordered) < len(authored) {
 		var ready []string
@@ -531,13 +507,13 @@ const (
 // together with the routed layout (so it can re-derive the digest it is about to
 // bind instead of trusting the reference file), and verify-publication consumes
 // the reference and the signing record (so it cannot run before signing).
-func addSigningDataflow(definition CompileSpec, delivery ExecutionSettings, route Route,
+func addSigningDataflow(plan *Plan, runsOn string, route Route,
 	packageInput, referenceID string, nodes map[string]Node, artifacts map[string]Artifact) error {
-	signing := delivery.Signing
+	signing := plan.Environment.Signing
 	if signing == nil {
 		return nil
 	}
-	if delivery.Targets[route.Target].Kind != TargetOCI {
+	if plan.Targets[route.Target].Kind != TargetOCI {
 		return e.New(e.CodeEngineCapability,
 			"delivery route %q cannot be signed: only OCI registry targets have a signing adapter", route.Name)
 	}
@@ -547,17 +523,17 @@ func addSigningDataflow(definition CompileSpec, delivery ExecutionSettings, rout
 		// The pinned cosign executable is DATA this node consumes; declaring it as an
 		// input is what makes a generated pipeline transport it to the signing job
 		// instead of assuming an ambient binary on the runner.
-		tool := "tool/" + signing.CosignTool
+		tool := "tool/" + plan.Definition.CosignTool
 		if _, ok := artifacts[tool]; !ok {
 			return e.New(e.CodeTrustPolicyMissing,
-				"delivery signing cosignTool %q has no acquired tool artifact", signing.CosignTool)
+				"delivery signing cosignTool %q has no acquired tool artifact", plan.Definition.CosignTool)
 		}
 		signInputs = append(signInputs, tool)
 		verifyInputs = append(verifyInputs, tool)
 	}
 	signID := NodeSign + "/" + route.Name
 	nodes[signID] = Node{ID: signID, Kind: NodeSign, Target: route.Target,
-		Inputs: uniqueSorted(signInputs), Network: ir.NetworkDefault, RunsOn: definition.RunsOn,
+		Inputs: uniqueSorted(signInputs), Network: ir.NetworkDefault, RunsOn: runsOn,
 		Outputs: uniqueSorted([]string{"signature/" + route.Name, "predicate/" + route.Name})}
 	artifacts["signature/"+route.Name] = Artifact{ID: "signature/" + route.Name, Name: route.Name,
 		Kind: ArtifactSigningRecord, MediaType: "application/vnd.nkd.signing-record.v1+json",
@@ -569,105 +545,12 @@ func addSigningDataflow(definition CompileSpec, delivery ExecutionSettings, rout
 		Path: filepath.ToSlash(filepath.Join(".nkd", "factory", "predicates", route.Name+".json"))}
 	verifyID := NodeVerifyPublication + "/" + route.Name
 	nodes[verifyID] = Node{ID: verifyID, Kind: NodeVerifyPublication, Target: route.Target,
-		Inputs: uniqueSorted(verifyInputs), Network: ir.NetworkDefault, RunsOn: definition.RunsOn,
+		Inputs: uniqueSorted(verifyInputs), Network: ir.NetworkDefault, RunsOn: runsOn,
 		Outputs: []string{"verification/" + route.Name}}
 	artifacts["verification/"+route.Name] = Artifact{ID: "verification/" + route.Name, Name: route.Name,
 		Kind: ArtifactVerificationRecord, MediaType: "application/vnd.nkd.verification-record.v1+json",
 		Producer: verifyID, Target: route.Target,
 		Path: filepath.ToSlash(filepath.Join(".nkd", "factory", "verifications", route.Name+".json"))}
-	return nil
-}
-
-func addClusterCompositions(definition CompileSpec, plan *Plan, nodes map[string]Node, artifacts map[string]Artifact) error {
-	recipes := make(map[string]RecipePlan, len(plan.Recipes))
-	for _, recipePlan := range plan.Recipes {
-		recipes[recipePlan.Name] = recipePlan
-	}
-	clusters := append([]ClusterSpec(nil), definition.Clusters...)
-	sort.Slice(clusters, func(i, j int) bool { return clusters[i].Name < clusters[j].Name })
-	for _, spec := range clusters {
-		composition := cluster.ClusterComposition{SchemaVersion: cluster.CompositionSchemaVersion,
-			ClusterType: spec.Type, CNI: spec.CNI, RoleBindings: append([]cluster.RoleBinding(nil), spec.RoleBindings...),
-			ClusterCategories:      append([]string(nil), spec.ClusterCategories...),
-			ValidationRequirements: append([]string(nil), spec.ValidationRequirements...)}
-		graphsByRecipeID := map[string]*ir.Graph{}
-		for index, target := range spec.RecipeTargets {
-			recipePlan := recipes[target]
-			graphsByRecipeID[recipePlan.RecipeID] = recipePlan.Graph
-			if index == 0 {
-				composition.KubernetesVersion = recipePlan.Criteria.K8sVersion
-				composition.OS = recipePlan.Criteria.OS
-				composition.Arch = recipePlan.Criteria.Arch
-			} else if composition.KubernetesVersion != recipePlan.Criteria.K8sVersion ||
-				composition.OS != recipePlan.Criteria.OS || composition.Arch != recipePlan.Criteria.Arch {
-				return e.New(e.CodeInvalidCatalog, "factory cluster %q recipe targets do not share one k8s/os/arch frame", spec.Name)
-			}
-			binding := cluster.RecipeBinding{Category: recipePlan.Criteria.Category,
-				RecipeID: recipePlan.RecipeID, RecipeDigest: recipePlan.RecipeDigest,
-				Criteria: recipePlan.Criteria, Components: append([]string(nil), recipePlan.AllComponents...)}
-			// A ClusterComposition resolves recipes independent of role/SKU. Preserve
-			// the exact recipe identity but normalize delivery-only axes to wildcards.
-			binding.Criteria.Role = "any"
-			binding.Criteria.ClusterType = "any"
-			if recipePlan.Graph.AICR != nil {
-				activation := *recipePlan.Graph.AICR
-				binding.AICRProfileIdentity = recipePlan.AICRProfileIdentity
-				binding.AICR = &activation
-				if spec.AICRBundle != nil {
-					bundle := *spec.AICRBundle
-					binding.AICRBundle = &bundle
-				}
-			}
-			composition.Recipes = append(composition.Recipes, binding)
-		}
-		// The recipe binding intentionally carries the complete pre-SKU component
-		// set because recipe identity is role-independent. Bind each authored role to
-		// the exact component subset selected by its matching factory recipe target so
-		// the composition also describes what this pipeline will actually produce.
-		for index := range composition.RoleBindings {
-			role := &composition.RoleBindings[index]
-			if len(role.Subset) != 0 {
-				continue
-			}
-			selected := map[string]bool{}
-			for _, target := range spec.RecipeTargets {
-				recipePlan := recipes[target]
-				if recipePlan.Criteria.Role != role.Role || !containsString(role.NodeLevelCategories, recipePlan.Criteria.Category) {
-					continue
-				}
-				for _, component := range recipePlan.Components {
-					selected[component] = true
-				}
-			}
-			role.Subset = sortedKeys(selected)
-			if len(role.Subset) == 0 {
-				return e.New(e.CodeInvalidCatalog,
-					"factory cluster %q role %q has no matching recipe-target component subset", spec.Name, role.Role)
-			}
-		}
-		composition.Normalize()
-		if err := composition.Validate(); err != nil {
-			return e.Wrap(e.CodeInvalidCatalog, err, "factory cluster %q", spec.Name)
-		}
-		// Recompute each binding's recipe identity from its compiled graph so a
-		// composition can never carry a fabricated recipeDigest (ADR-19 identity boundary).
-		if err := composition.VerifyRecipeIdentities(graphsByRecipeID); err != nil {
-			return e.Wrap(e.CodeUnverifiedRef, err, "factory cluster %q", spec.Name)
-		}
-		digest, err := composition.Digest()
-		if err != nil {
-			return err
-		}
-		plan.Compositions = append(plan.Compositions, CompositionPlan{Name: spec.Name, Digest: digest, Composition: composition})
-		nodeID := "composition/" + spec.Name
-		artifactID := "composition/" + spec.Name
-		nodes[nodeID] = Node{ID: nodeID, Kind: NodeComposition, RunsOn: definition.RunsOn,
-			Network: ir.NetworkNone, Container: definition.UtilityContainer,
-			Platform: definition.UtilityPlatform, Outputs: []string{artifactID}}
-		artifacts[artifactID] = Artifact{ID: artifactID, Name: spec.Name, Kind: "cluster-composition",
-			MediaType: "application/vnd.nkd.cluster-composition.v1+json", Producer: nodeID,
-			Path: filepath.ToSlash(filepath.Join(".nkd", "factory", "compositions", spec.Name+".json"))}
-	}
 	return nil
 }
 
@@ -680,7 +563,7 @@ func containsString(values []string, wanted string) bool {
 	return false
 }
 
-func addRecipeDataflow(targetSpec RecipeTarget, graph *ir.Graph, selected map[string]bool,
+func addBuildDataflow(targetSpec authored.DefinitionOutput, runsOn string, graph *ir.Graph, selected map[string]bool,
 	utilityContainer, utilityPlatform string, nodes map[string]Node, artifacts map[string]Artifact) error {
 	target := targetSpec.Name
 	byID := map[string]ir.Node{}
@@ -707,14 +590,13 @@ func addRecipeDataflow(targetSpec RecipeTarget, graph *ir.Graph, selected map[st
 			if err != nil {
 				return err
 			}
-			nodes[nodeID] = Node{ID: nodeID, Kind: NodeFetch, RecipeTarget: target, IRNode: irNode.ID,
-				Network: ir.NetworkDefault, Container: irNode.VendorImage, Platform: "linux/" + targetSpec.Criteria.Arch,
-				RunsOn: targetSpec.RunsOn, Outputs: []string{output, receipt}}
+			nodes[nodeID] = Node{ID: nodeID, Kind: NodeFetch, BuildTarget: target, IRNode: irNode.ID,
+				Outputs: []string{output, receipt}}
 			artifacts[output] = Artifact{ID: output, Name: irNode.ID, Kind: "source-closure",
-				Producer: nodeID, RecipeTarget: target,
+				Producer: nodeID, BuildTarget: target,
 				Path: filepath.ToSlash(filepath.Join(".nkd", "factory", target, "src", irNode.Dest))}
 			artifacts[receipt] = Artifact{ID: receipt, Name: irNode.ID + "-receipt", Kind: "source-receipt",
-				Producer: nodeID, RecipeTarget: target,
+				Producer: nodeID, BuildTarget: target,
 				Path: filepath.ToSlash(receiptPath)}
 		case ir.KindBuild:
 			if !selected[irNode.Component] {
@@ -729,19 +611,13 @@ func addRecipeDataflow(targetSpec RecipeTarget, graph *ir.Graph, selected map[st
 			}
 			output := "artifact/" + target + "/" + irNode.Component
 			result := "result/" + target + "/" + irNode.Component
-			runsOn := targetSpec.RunsOn
-			if irNode.ExecutionBinding != nil {
-				runsOn = irNode.ExecutionBinding.Class.RunsOn
-			}
-			nodes[nodeID] = Node{ID: nodeID, Kind: NodeBuild, RecipeTarget: target, IRNode: irNode.ID,
-				Requirements: execution.Clone(irNode.Requirements), ExecutionBinding: execution.CloneBinding(irNode.ExecutionBinding),
-				Network: irNode.Network, Container: irNode.Toolchain, Platform: irNode.Platform,
-				RunsOn: runsOn, Inputs: inputs, Outputs: []string{output, result}}
+			nodes[nodeID] = Node{ID: nodeID, Kind: NodeBuild, BuildTarget: target, IRNode: irNode.ID,
+				Inputs: inputs, Outputs: []string{output, result}}
 			artifacts[output] = Artifact{ID: output, Name: irNode.Component, Kind: irNode.OutputType,
-				MediaType: artifactMediaType(irNode.OutputType), Producer: nodeID, RecipeTarget: target,
+				MediaType: artifactMediaType(irNode.OutputType), Producer: nodeID, BuildTarget: target,
 				Component: irNode.Component, Path: factoryBuildArtifactPath(target, irNode)}
 			artifacts[result] = Artifact{ID: result, Name: irNode.Component + "-result", Kind: "producer-result",
-				Producer: nodeID, RecipeTarget: target, Component: irNode.Component,
+				Producer: nodeID, BuildTarget: target, Component: irNode.Component,
 				Path: filepath.ToSlash(filepath.Join(".nkd", "factory", target, "results", irNode.ID+".json"))}
 			producerOutputs = append(producerOutputs, output, result)
 		case ir.KindPull:
@@ -750,50 +626,49 @@ func addRecipeDataflow(targetSpec RecipeTarget, graph *ir.Graph, selected map[st
 			}
 			output := "artifact/" + target + "/" + irNode.Component
 			result := "result/" + target + "/" + irNode.Component
-			nodes[nodeID] = Node{ID: nodeID, Kind: NodeAcquire, RecipeTarget: target, IRNode: irNode.ID,
-				Network: ir.NetworkDefault, Platform: "linux/" + targetSpec.Criteria.Arch,
-				RunsOn: targetSpec.RunsOn, Outputs: []string{output, result}}
+			nodes[nodeID] = Node{ID: nodeID, Kind: NodeAcquire, BuildTarget: target, IRNode: irNode.ID,
+				Outputs: []string{output, result}}
 			artifacts[output] = Artifact{ID: output, Name: irNode.Component, Kind: irNode.OutputType,
-				MediaType: artifactMediaType(irNode.OutputType), Producer: nodeID, RecipeTarget: target,
+				MediaType: artifactMediaType(irNode.OutputType), Producer: nodeID, BuildTarget: target,
 				Component: irNode.Component, Path: factoryPullArtifactPath(target, irNode)}
 			artifacts[result] = Artifact{ID: result, Name: irNode.Component + "-result", Kind: "producer-result",
-				Producer: nodeID, RecipeTarget: target, Component: irNode.Component,
+				Producer: nodeID, BuildTarget: target, Component: irNode.Component,
 				Path: filepath.ToSlash(filepath.Join(".nkd", "factory", target, "results", irNode.ID+".json"))}
 			producerOutputs = append(producerOutputs, output, result)
 		}
 	}
 	if graph.AICR != nil {
-		generator := targetSpec.AICRGenerator
+		generator := aicrGenerator(targetSpec)
 		generatorArtifact := "tool/" + generator
 		if _, ok := artifacts[generatorArtifact]; !ok {
 			return e.New(e.CodeInvalidCatalog,
-				"factory AICR target %q requires exact generator tool %q so the pinned recipe can be rendered without an ambient executable", target, generator)
+				"factory AICR target %q requires exact generator tool %q so the pinned build can be rendered without an ambient executable", target, generator)
 		}
 		nodeID := target + "/aicr-render"
 		output := "artifact/" + target + "/aicr-bundle"
-		nodes[nodeID] = Node{ID: nodeID, Kind: NodeAICR, RecipeTarget: target,
-			Network: ir.NetworkNone, RunsOn: targetSpec.RunsOn, Container: utilityContainer,
+		nodes[nodeID] = Node{ID: nodeID, Kind: NodeAICR, BuildTarget: target,
+			Network: ir.NetworkNone, RunsOn: runsOn, Container: utilityContainer,
 			Platform: utilityPlatform, Inputs: []string{generatorArtifact}, Outputs: []string{output}}
 		artifacts[output] = Artifact{ID: output, Name: "aicr-bundle", Kind: "aicr-bundle",
 			MediaType: "application/vnd.nkd.aicr-bundle.v1", Producer: nodeID,
-			RecipeTarget: target, Component: "aicr-bundle",
+			BuildTarget: target, Component: "aicr-bundle",
 			Path: filepath.ToSlash(filepath.Join(".nkd", "factory", target, "aicr-bundle"))}
 		producerOutputs = append(producerOutputs, output)
 	}
 	sort.Strings(producerOutputs)
 	if len(producerOutputs) == 0 {
-		return e.New(e.CodeInvalidCatalog, "factory recipe target %q has no selected artifact producers", target)
+		return e.New(e.CodeInvalidCatalog, "factory build target %q has no selected artifact producers", target)
 	}
 	verifyID := target + "/terminal-observe"
 	observationID := "observation/" + target
-	nodes[verifyID] = Node{ID: verifyID, Kind: NodeVerify, RecipeTarget: target,
-		Network: ir.NetworkNone, RunsOn: targetSpec.RunsOn, Container: utilityContainer,
+	nodes[verifyID] = Node{ID: verifyID, Kind: NodeVerify, BuildTarget: target,
+		Network: ir.NetworkNone, RunsOn: runsOn, Container: utilityContainer,
 		Platform: utilityPlatform, Inputs: producerOutputs, Outputs: []string{observationID}}
 	artifacts[observationID] = Artifact{ID: observationID, Name: target + "-terminal-observation",
-		Kind: string(TierTerminalObservation), Producer: verifyID, RecipeTarget: target,
+		Kind: string(TierTerminalObservation), Producer: verifyID, BuildTarget: target,
 		Path: filepath.ToSlash(filepath.Join(".nkd", "factory", target, "terminal-observation.json"))}
 
-	// SBOM node (ADR-13 §1 / ADR-13): one per recipe target, gated on the
+	// SBOM node (ADR-13 §1 / ADR-13): one per build target, gated on the
 	// terminal observation, binding a CycloneDX SBOM per built component to that
 	// component's producer-result digest. It bills only what was built, so a
 	// producer-less target (e.g. AICR-only) mints no SBOM.
@@ -807,12 +682,12 @@ func addRecipeDataflow(targetSpec RecipeTarget, graph *ir.Graph, selected map[st
 		sbomNodeID := target + "/sbom"
 		sbomArtifactID := "sbom/" + target
 		inputs := uniqueSorted(append(resultInputs, observationID))
-		nodes[sbomNodeID] = Node{ID: sbomNodeID, Kind: NodeSBOM, RecipeTarget: target,
-			Network: ir.NetworkNone, RunsOn: targetSpec.RunsOn, Container: utilityContainer,
+		nodes[sbomNodeID] = Node{ID: sbomNodeID, Kind: NodeSBOM, BuildTarget: target,
+			Network: ir.NetworkNone, RunsOn: runsOn, Container: utilityContainer,
 			Platform: utilityPlatform, Inputs: inputs, Outputs: []string{sbomArtifactID}}
 		artifacts[sbomArtifactID] = Artifact{ID: sbomArtifactID, Name: target + "-sbom",
 			Kind: "sbom-set", MediaType: "application/vnd.nkd.sbom-set.v1+json",
-			Producer: sbomNodeID, RecipeTarget: target,
+			Producer: sbomNodeID, BuildTarget: target,
 			Path: filepath.ToSlash(filepath.Join(".nkd", "factory", target, "sbom"))}
 	}
 	return nil
@@ -855,7 +730,7 @@ func expandSelectors(selectors []string, artifacts map[string]Artifact) ([]strin
 		}
 		id := selector
 		if !strings.HasPrefix(id, "artifact/") && !strings.HasPrefix(id, "package/") &&
-			!strings.HasPrefix(id, "composition/") && !strings.HasPrefix(id, "tool/") {
+			!strings.HasPrefix(id, "tool/") {
 			id = "artifact/" + id
 		}
 		if _, ok := artifacts[id]; !ok {
@@ -873,7 +748,7 @@ func expandSelectors(selectors []string, artifacts map[string]Artifact) ([]strin
 func observationInputs(inputs []string, artifacts map[string]Artifact) []string {
 	seen := map[string]bool{}
 	for _, input := range inputs {
-		target := artifacts[input].RecipeTarget
+		target := artifacts[input].BuildTarget
 		if target != "" {
 			seen["observation/"+target] = true
 		}
@@ -881,7 +756,7 @@ func observationInputs(inputs []string, artifacts map[string]Artifact) []string 
 	return sortedKeys(seen)
 }
 
-func validatePackageInputs(spec PackageSpec, inputs []string, artifacts map[string]Artifact) error {
+func validatePackageInputs(spec packageSpec, inputs []string, artifacts map[string]Artifact) error {
 	if spec.HelmImage != nil {
 		if spec.Kind != PackageHelm || len(inputs) != 2 || !canonicalName.MatchString(spec.HelmImage.Chart) {
 			return e.New(e.CodeInvalidCatalog, "Helm image binding requires a source archive and one image package")
@@ -891,7 +766,7 @@ func validatePackageInputs(spec PackageSpec, inputs []string, artifacts map[stri
 			artifact := artifacts[id]
 			if id == spec.HelmImage.Image && artifact.Kind == PackageImage {
 				image = true
-			} else if artifact.Kind == "tarball" && artifact.RecipeTarget != "" {
+			} else if artifact.Kind == "tarball" && artifact.BuildTarget != "" {
 				source = true
 			}
 		}
@@ -910,16 +785,16 @@ func validatePackageInputs(spec PackageSpec, inputs []string, artifacts map[stri
 		artifact := artifacts[id]
 		switch spec.Kind {
 		case PackageImage:
-			if artifact.Kind != "oci-image" || artifact.RecipeTarget == "" {
-				return e.New(e.CodeInvalidCatalog, "container image package %q requires a recipe OCI image export", spec.Name)
+			if artifact.Kind != "oci-image" || artifact.BuildTarget == "" {
+				return e.New(e.CodeInvalidCatalog, "container image package %q requires a build OCI image export", spec.Name)
 			}
 		case PackageAPT:
 			if artifact.Kind != "host-package" {
 				return e.New(e.CodeInvalidCatalog, "APT package %q input %s has kind %q, want host-package", spec.Name, id, artifact.Kind)
 			}
 		case PackageHelm:
-			if artifact.Kind != "aicr-bundle" && (artifact.Kind != "tarball" || artifact.RecipeTarget == "") {
-				return e.New(e.CodeInvalidCatalog, "Helm package %q input %s requires an AICR tree or recipe source archive", spec.Name, id)
+			if artifact.Kind != "aicr-bundle" && (artifact.Kind != "tarball" || artifact.BuildTarget == "") {
+				return e.New(e.CodeInvalidCatalog, "Helm package %q input %s requires an AICR tree or build source archive", spec.Name, id)
 			}
 		}
 	}
@@ -955,7 +830,7 @@ func packageMediaType(kind string) string {
 	case PackageHelm:
 		return "application/vnd.nkd.aicr-helm-bundle.v1"
 	default:
-		return "application/vnd.nkd.publication-root.v1"
+		return "application/vnd.nkd.publication-root.v3"
 	}
 }
 

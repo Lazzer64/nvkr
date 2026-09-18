@@ -20,8 +20,8 @@ func TestGitHubOperationLabels(t *testing.T) {
 		{"binary", Node{ID: "package/cli", Kind: NodePackage, PackageKind: PackageBinaryBundle}, "Package binaries: cli"},
 		{"apt", Node{ID: "package/packages", Kind: NodePackage, PackageKind: PackageAPT}, "Package APT repository: packages"},
 		{"publication bundle", Node{ID: "package/worker-release", Kind: NodePackage, PackageKind: PackageOCI}, "Package publication bundle: worker-release"},
-		{"observation", Node{Kind: NodeVerify, RecipeTarget: "worker"}, "Verify built artifacts: worker"},
-		{"sbom", Node{Kind: NodeSBOM, RecipeTarget: "worker"}, "Generate SBOMs: worker"},
+		{"observation", Node{Kind: NodeVerify, BuildTarget: "worker"}, "Verify built artifacts: worker"},
+		{"sbom", Node{Kind: NodeSBOM, BuildTarget: "worker"}, "Generate SBOMs: worker"},
 		{"publish", Node{ID: "publish/worker", Kind: NodePublish}, "Publish worker"},
 		{"sign", Node{ID: "sign/worker", Kind: NodeSign}, "Sign and attest release and deliverables: worker"},
 		{"verify publication", Node{ID: "verify-publication/worker", Kind: NodeVerifyPublication}, "Verify release and deliverable signatures: worker"},
@@ -52,7 +52,7 @@ func TestGitHubOperationLogsPreserveExitStatus(t *testing.T) {
 				t.Fatal(err)
 			}
 			node := Node{ID: "package/charts", Kind: NodePackage, PackageKind: PackageHelm, Outputs: []string{"package/charts"}, HelmImage: &HelmImageBinding{Image: "package/image"}}
-			commands := githubNodeCommands(node, &Plan{}, nil)
+			commands := githubNodeCommands(node, &Plan{})
 			cmd := exec.CommandContext(t.Context(), "bash", "-c", strings.Join(commands, "\n"))
 			cmd.Dir = dir
 			cmd.Env = append(os.Environ(), "TEST_STATUS="+tc.status, "NKD_CREDENTIAL=do-not-log-this")

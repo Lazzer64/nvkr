@@ -1,8 +1,11 @@
 package canonical
 
 import (
+	"errors"
 	"math"
 	"testing"
+
+	e "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 )
 
 // TestMarshalGolden pins the canonical byte form: sorted keys, no whitespace,
@@ -45,15 +48,15 @@ func TestMarshalStableAcrossKeyOrder(t *testing.T) {
 // different digests, and that Digest is stable.
 func TestDigestDomainSeparation(t *testing.T) {
 	v := map[string]any{"k": "v"}
-	d1, err := Digest(KindRecipe, v)
+	d1, err := Digest(KindBuild, v)
 	if err != nil {
 		t.Fatal(err)
 	}
 	d2, _ := Digest(KindBuilderProfile, v)
 	if d1 == d2 {
-		t.Errorf("domain separation failed: recipe and profile digests equal (%s)", d1)
+		t.Errorf("domain separation failed: build and profile digests equal (%s)", d1)
 	}
-	again, _ := Digest(KindRecipe, v)
+	again, _ := Digest(KindBuild, v)
 	if d1 != again {
 		t.Errorf("Digest not stable: %s vs %s", d1, again)
 	}
@@ -68,18 +71,54 @@ func TestDigestRejectsUnregisteredDomain(t *testing.T) {
 	}
 }
 
+func TestRetiredDomainsRemainReservedButCannotMint(t *testing.T) {
+	for _, allocation := range []struct{ kind, want string }{
+		{KindLegacyRecipe, "nkd.recipe"},
+		{KindBundle, "nkd.bundle"},
+		{KindReproductionResult, "nkd.reproduction-result"},
+		{KindCompatibilityResult, "nkd.compatibility-result"},
+		{KindConformanceResult, "nkd.conformance-result"},
+		{KindEvidenceWaiver, "nkd.evidence-waiver"},
+		{KindClearance, "nkd.clearance"},
+		{KindTrustedTime, "nkd.status-trusted-time/v1"},
+		{KindPublication, "nkd.publication"},
+		{KindPublicationManifest, "nkd.publication-manifest"},
+		{KindVulnReport, "nkd.vuln-report"},
+		{KindCompileSpec, "nkd.compile-spec/v1"},
+		{KindExecutionSettings, "nkd.execution-settings/v1"},
+		{KindLifecycleBinding, "nkd.lifecycle-binding/v1"},
+		{KindClusterDefinition, "nkd.cluster-definition"},
+		{KindClusterComposition, "nkd.cluster-composition"},
+		{KindClusterRealization, "nkd.cluster-realization/v1"},
+		{KindStagingManifest, "nkd.staging-manifest"},
+	} {
+		t.Run(allocation.want, func(t *testing.T) {
+			kind := allocation.kind
+			if kind != allocation.want || !registeredKind(kind) {
+				t.Fatal("retired domain allocation must remain reserved")
+			}
+			value := map[string]string{"value": "new-object"}
+			digest, err := Digest(kind, value)
+			var coded *e.Error
+			if digest != "" || !errors.As(err, &coded) || coded.Code != e.CodeUnsupported {
+				t.Fatalf("retired identity = %q, %v; want no digest and %s", digest, err, e.CodeUnsupported)
+			}
+		})
+	}
+}
+
 func TestAICRBundleHasItsOwnDomain(t *testing.T) {
 	value := map[string]any{"schemaVersion": "nkd.dev/aicr-bundle/v1"}
 	aicrDigest, err := Digest(KindAICRBundle, value)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pipelineDigest, err := Digest(KindBundle, value)
+	buildDigest, err := Digest(KindBuild, value)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if aicrDigest == pipelineDigest {
-		t.Fatal("AICR output tree can be substituted for a pipeline bundle")
+	if aicrDigest == buildDigest {
+		t.Fatal("AICR output tree can be substituted for a producer build graph")
 	}
 }
 
@@ -89,9 +128,9 @@ func TestAuthorityFamiliesRejectSameByteSubstitution(t *testing.T) {
 		name        string
 		left, right string
 	}{
-		{name: "publication identity vs manifest", left: KindPublication, right: KindPublicationManifest},
+		{name: "publication root vs content", left: KindPublicationRoot, right: KindReleaseContent},
 		{name: "publisher evidence vs reproduction", left: KindPublisherEvidence, right: KindReproductionObservation},
-		{name: "trusted time vs checkpoint policy", left: KindTrustedTime, right: KindStatusCheckpointPolicy},
+		{name: "status checkpoint vs policy", left: KindStatusCheckpoint, right: KindStatusCheckpointPolicy},
 		{name: "provenance index vs statement", left: KindProvenance, right: KindProvenanceStatement},
 	} {
 		t.Run(pair.name, func(t *testing.T) {
@@ -228,7 +267,7 @@ func TestMarshalRejectsInvalidUTF8BeforeIdentityCollapses(t *testing.T) {
 	if _, err := Marshal(map[string]string{invalid: "value"}); err == nil {
 		t.Fatal("invalid UTF-8 object name was silently normalized")
 	}
-	if _, err := Digest(KindRecipe, map[string]string{"value": invalid}); err == nil {
+	if _, err := Digest(KindBuild, map[string]string{"value": invalid}); err == nil {
 		t.Fatal("invalid UTF-8 value minted a digest")
 	}
 

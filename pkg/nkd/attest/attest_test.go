@@ -1,6 +1,7 @@
 package attest
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,15 +11,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/buildgraph"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/canonical"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/catalog"
-	"github.com/NVIDIA/nke-recipes/pkg/nkd/criteria"
 	nkderr "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/ir"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/pipeline"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/profile"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/provenance"
-	"github.com/NVIDIA/nke-recipes/pkg/nkd/recipe"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/sbom"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/trust"
 )
@@ -54,8 +54,7 @@ func qualifiedAcquisitionReport(t *testing.T, fixtures []acquisitionFixture) *pi
 	t.Helper()
 	work := filepath.Join(t.TempDir(), "work")
 	options := pipeline.RunOptions{Ctx: context.Background(), SourceRoot: filepath.Join(work, "src")}
-	graph := &ir.Graph{SchemaVersion: ir.SchemaVersion, RecipeID: "recipe",
-		Criteria: criteria.Criteria{OS: "ubuntu", Arch: "amd64"}}
+	graph := &ir.Graph{SchemaVersion: ir.SchemaVersion, Platform: "linux/amd64"}
 	verify := ir.Node{ID: "verify", Kind: ir.KindVerify}
 	for _, fixture := range fixtures {
 		sum := sha256.Sum256(fixture.contents)
@@ -76,16 +75,16 @@ func qualifiedAcquisitionReport(t *testing.T, fixtures []acquisitionFixture) *pi
 		result := pipeline.ArtifactResult{Component: fixture.component, OutputType: "raw",
 			Qualification: pipeline.ArtifactProfileFreeAcquisition, EngineClass: ir.EnginePrebuiltAcquire,
 			Path: fixture.component, SHA256: digest, Size: int64(len(fixture.contents))}
-		writePipelineResult(t, pipeline.ResultDirectory(options.SourceRoot), node.ID, result)
+		writePipelineResult(t, filepath.Join(filepath.Dir(options.SourceRoot), "results"), node.ID, result)
 	}
 	graph.Nodes = append(graph.Nodes, verify)
 	graph.Normalize()
-	recipeDigest, err := graph.Digest()
+	buildDigest, err := graph.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := (pipeline.Local{}).VerifyResults(graph, recipeDigest,
-		pipeline.ResultDirectory(options.SourceRoot), options)
+	report, err := (pipeline.Local{}).VerifyResults(graph, buildDigest,
+		filepath.Join(filepath.Dir(options.SourceRoot), "results"), options)
 	if err != nil {
 		t.Fatalf("terminal acquisition verification failed: %v", err)
 	}
@@ -107,16 +106,15 @@ func writePipelineResult(t *testing.T, dir, nodeID string, result pipeline.Artif
 	}
 }
 
-func qualifiedSourceEvidenceFixture(t *testing.T, repo, toolchain string) (*recipe.Resolved,
+func qualifiedSourceEvidenceFixture(t *testing.T, repo, toolchain string) (*buildgraph.Resolved,
 	*ir.Graph, *pipeline.Report,
 ) {
 	t.Helper()
-	resolved := &recipe.Resolved{
-		RecipeID: "publisher-source-evidence-fixture",
-		Criteria: criteria.Criteria{OS: "ubuntu", Arch: "amd64"},
+	resolved := &buildgraph.Resolved{
+		Platform: "linux/amd64",
 		Components: []catalog.NamedComponent{{
 			Name: "agent",
-			Component: catalog.Component{
+			Component: catalog.Component{Platforms: []string{"linux/amd64"},
 				FromSource: true, Repo: repo, Tag: "v1.0.0",
 				Commit: strings.Repeat("d", 40), TreeHash: strings.Repeat("e", 40),
 				ToolchainImage: toolchain, OutputType: "raw",
@@ -125,11 +123,11 @@ func qualifiedSourceEvidenceFixture(t *testing.T, repo, toolchain string) (*reci
 			},
 		}},
 	}
-	graph, err := recipe.Compile(resolved)
+	graph, err := buildgraph.Compile(resolved)
 	if err != nil {
 		t.Fatal(err)
 	}
-	recipeDigest, err := graph.Digest()
+	buildDigest, err := graph.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,9 +197,9 @@ func qualifiedSourceEvidenceFixture(t *testing.T, repo, toolchain string) (*reci
 		ExecutionBinding: execution.ExecutionBinding(), Path: build.ArtifactPath,
 		SHA256: "sha256:" + hex.EncodeToString(sum[:]), Size: int64(len(payload)),
 	}
-	resultsDir := pipeline.ResultDirectory(options.SourceRoot)
+	resultsDir := filepath.Join(filepath.Dir(options.SourceRoot), "results")
 	writePipelineResult(t, resultsDir, build.ID, result)
-	report, err := (pipeline.Local{}).VerifyResults(graph, recipeDigest, resultsDir, options)
+	report, err := (pipeline.Local{}).VerifyResults(graph, buildDigest, resultsDir, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +219,7 @@ func TestPublisherEvidenceComparisonRequiresAuthenticatedExactVector(t *testing.
 		ProvenanceSchema: "in-toto-slsa-provenance/v1",
 	}
 	core := publisherEvidenceCore{
-		SchemaVersion: PublisherEvidenceSchemaVersion, RecipeDigest: attestDigest('1'),
+		SchemaVersion: PublisherEvidenceSchemaVersion, BuildDigest: attestDigest('1'),
 		SBOMIndexDigest: attestDigest('2'), ProvenanceIndexDigest: attestDigest('3'),
 		Artifacts: []publisherEvidenceRow{row},
 	}
@@ -233,7 +231,7 @@ func TestPublisherEvidenceComparisonRequiresAuthenticatedExactVector(t *testing.
 		sbomReceipts:       make([]sbom.LocalEvidenceReceipt, 1),
 		provenanceReceipts: make([]provenance.LocalEvidenceReceipt, 1)}
 	manifest := &Manifest{
-		SchemaVersion: SchemaVersion, RecipeID: "recipe", RecipeDigest: core.RecipeDigest,
+		SchemaVersion: SchemaVersion, BuildDigest: core.BuildDigest,
 		Evidence: &EvidenceRef{SBOMDigest: core.SBOMIndexDigest,
 			ProvenanceDigest: core.ProvenanceIndexDigest},
 		EvidenceDigest: digest,
@@ -282,10 +280,27 @@ func TestPublisherEvidenceComparisonRequiresAuthenticatedExactVector(t *testing.
 	}
 }
 
+func TestValidationVectorRejectsRemovedDeploymentEvidenceFields(t *testing.T) {
+	for _, field := range []string{"e2eTestDigest", "clusterValidationDigest"} {
+		t.Run(field, func(t *testing.T) {
+			manifest := man('a', prebuiltComponent("agent", "raw", '1'))
+			raw, err := manifest.Marshal()
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Unknown deployment evidence must fail strict decoding even when its
+			// value is a valid digest and the surrounding document is current.
+			raw = bytes.Replace(raw, []byte(`"evidence":{`), []byte(`"evidence":{"`+field+`":"`+attestDigest('4')+`",`), 1)
+			var decoded Manifest
+			if err := canonical.UnmarshalExact(raw, &decoded); attestErrorCode(err) != nkderr.CodeVerifyFailed {
+				t.Fatalf("removed deployment evidence decoded: %v", err)
+			}
+		})
+	}
+}
+
 func TestAuthenticatedPublishedVectorRejectsLegacyOperatorEvidenceFields(t *testing.T) {
 	for name, mutate := range map[string]func(*EvidenceRef){
-		"e2e":         func(ref *EvidenceRef) { ref.E2ETestDigest = attestDigest('4') },
-		"conformance": func(ref *EvidenceRef) { ref.ClusterValidationDigest = attestDigest('5') },
 		"vulnerability": func(ref *EvidenceRef) {
 			ref.VulnReportDigest = attestDigest('6')
 		},
@@ -333,12 +348,12 @@ func TestPublisherEvidenceIsMirrorInvariant(t *testing.T) {
 	mirrorResolved, mirrorGraph, mirrorReport := qualifiedSourceEvidenceFixture(t,
 		"https://source.airgap.example/mirror/agent.git",
 		"registry.airgap.example/mirror/toolchain@"+toolchainDigest)
-	if onlineReport.RecipeDigest != mirrorReport.RecipeDigest {
-		t.Fatalf("transport relocation changed recipe identity: %s != %s",
-			onlineReport.RecipeDigest, mirrorReport.RecipeDigest)
+	if onlineReport.BuildDigest != mirrorReport.BuildDigest {
+		t.Fatalf("transport relocation changed build identity: %s != %s",
+			onlineReport.BuildDigest, mirrorReport.BuildDigest)
 	}
 
-	buildEvidence := func(resolved *recipe.Resolved, graph *ir.Graph,
+	buildEvidence := func(resolved *buildgraph.Resolved, graph *ir.Graph,
 		report *pipeline.Report,
 	) *PublisherEvidence {
 		verifiedSBOMs, err := sbom.BuildVerifiedFromReport(context.Background(), resolved, report, nil)
@@ -365,7 +380,7 @@ func TestPublisherEvidenceIsMirrorInvariant(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if onlineBinding.RecipeDigest != mirrorBinding.RecipeDigest ||
+	if onlineBinding.BuildDigest != mirrorBinding.BuildDigest ||
 		onlineBinding.SBOMIndexDigest != mirrorBinding.SBOMIndexDigest ||
 		onlineBinding.ProvenanceIndexDigest != mirrorBinding.ProvenanceIndexDigest ||
 		onlineBinding.EvidenceDigest != mirrorBinding.EvidenceDigest ||
@@ -387,7 +402,7 @@ func publishedReceiptFixture(t *testing.T, manifest *Manifest) PublishedVectorRe
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(payload)
-	return PublishedVectorReceipt{valid: true, manifest: *manifest, identity: identity,
+	return PublishedVectorReceipt{valid: true, identity: identity,
 		blobDigest: "sha256:" + hex.EncodeToString(sum[:]), signer: "publisher@example.test",
 		canonicalPayload: string(payload)}
 }
@@ -417,7 +432,7 @@ func sourceComponent(name, outputType string, artifact, input, toolchain byte) C
 
 func TestValidationVectorProjectionIsInvariantToToolchainTransport(t *testing.T) {
 	base := pipeline.Report{
-		RecipeID: "recipe", RecipeDigest: attestDigest('a'),
+		BuildDigest: attestDigest('a'),
 		Artifacts: []pipeline.ArtifactResult{{
 			Component: "kubelet", OutputType: "host-package",
 			Toolchain:   "registry.example/toolchain@" + attestDigest('2'),
@@ -433,9 +448,10 @@ func TestValidationVectorProjectionIsInvariantToToolchainTransport(t *testing.T)
 	offline := FromReport(&mirrored)
 	for _, manifest := range []*Manifest{online, offline} {
 		manifest.SetBuilderProfile("", attestDigest('5'), "")
-		manifest.AttachEvidence(&EvidenceRef{
+		manifest.Evidence = &EvidenceRef{
 			SBOMDigest: attestDigest('6'), ProvenanceDigest: attestDigest('7'),
-		}, attestDigest('8'))
+		}
+		manifest.EvidenceDigest = attestDigest('8')
 	}
 	if online.Components[0].Toolchain != attestDigest('2') ||
 		offline.Components[0].Toolchain != attestDigest('2') {
@@ -456,9 +472,9 @@ func TestValidationVectorProjectionIsInvariantToToolchainTransport(t *testing.T)
 	}
 }
 
-func man(recipe byte, comps ...ComponentDigest) *Manifest {
+func man(build byte, comps ...ComponentDigest) *Manifest {
 	m := &Manifest{
-		SchemaVersion: SchemaVersion, RecipeID: "recipe", RecipeDigest: attestDigest(recipe),
+		SchemaVersion: SchemaVersion, BuildDigest: attestDigest(build),
 		Evidence:       &EvidenceRef{SBOMDigest: attestDigest('6'), ProvenanceDigest: attestDigest('7')},
 		EvidenceDigest: attestDigest('8'),
 		Components:     append([]ComponentDigest(nil), comps...),
@@ -484,9 +500,9 @@ func TestVerifyMatch(t *testing.T) {
 func TestVerifyFailsClosed(t *testing.T) {
 	base := man('a', prebuiltComponent("kubectl", "host-package", '1'))
 	cases := map[string]*Manifest{
-		"recipeDigest mismatch": man('b', prebuiltComponent("kubectl", "host-package", '1')),
-		"component diverged":    man('a', prebuiltComponent("kubectl", "host-package", '2')),
-		"component missing":     {SchemaVersion: SchemaVersion, RecipeID: "recipe", RecipeDigest: attestDigest('a')},
+		"buildDigest mismatch": man('b', prebuiltComponent("kubectl", "host-package", '1')),
+		"component diverged":   man('a', prebuiltComponent("kubectl", "host-package", '2')),
+		"component missing":    {SchemaVersion: SchemaVersion, BuildDigest: attestDigest('a')},
 	}
 	for name, got := range cases {
 		if code(base.VerifyAgainst(got)) != nkderr.CodeVerifyFailed {
@@ -517,9 +533,6 @@ func TestVerifyResolvedInputIdentityIsMandatoryAndExact(t *testing.T) {
 		mutate(got)
 		if code(want.VerifyAgainst(got)) != nkderr.CodeVerifyFailed {
 			t.Fatalf("%s resolved-input identity must fail reproduction", name)
-		}
-		if _, _, err := want.Check(got); code(err) != nkderr.CodeVerifyFailed {
-			t.Fatalf("%s resolved-input identity mismatch must be rejected: %v", name, err)
 		}
 	}
 }
@@ -641,7 +654,7 @@ func TestManifestAICRReceiptRequirementsFailClosed(t *testing.T) {
 
 func TestFromReportIsSortedButExplicitlyUnqualified(t *testing.T) {
 	rep := &pipeline.Report{
-		RecipeID: "recipe", RecipeDigest: attestDigest('a'),
+		BuildDigest: attestDigest('a'),
 		Artifacts: []pipeline.ArtifactResult{
 			{Component: "kubectl", OutputType: "host-package", Toolchain: "registry.example/toolchain@" + attestDigest('2'), InputDigest: attestDigest('4'), BuilderType: ir.BuilderOCIHermetic, EngineClass: ir.EngineOCIHermetic, SHA256: attestDigest('6')},
 			{Component: "etcd", OutputType: "oci-image", Toolchain: "registry.example/toolchain@" + attestDigest('1'), InputDigest: attestDigest('3'), BuilderType: ir.BuilderOCIHermetic, EngineClass: ir.EngineOCIHermetic, SHA256: attestDigest('5')},
@@ -666,9 +679,8 @@ func TestManifestValidateRejectsAmbiguousAuthorityData(t *testing.T) {
 	}
 
 	tests := map[string]func(*Manifest){
-		"schema":              func(m *Manifest) { m.SchemaVersion = "nkd.dev/validation-vector/v2" },
-		"recipe id":           func(m *Manifest) { m.RecipeID = " Recipe " },
-		"recipe digest":       func(m *Manifest) { m.RecipeDigest = "sha256:ABCD" },
+		"schema":              func(m *Manifest) { m.SchemaVersion = "nkd.dev/validation-vector/v1" },
+		"build digest":        func(m *Manifest) { m.BuildDigest = "sha256:ABCD" },
 		"profile mismatch":    func(m *Manifest) { m.BuilderProfile.Digest = attestDigest('8') },
 		"component digest":    func(m *Manifest) { m.Components[0].SHA256 = "sha256:1" },
 		"evidence digest":     func(m *Manifest) { m.Evidence = &EvidenceRef{SBOMDigest: "sha256:short"} },
@@ -769,14 +781,11 @@ func TestComparisonRejectsCriticalIdentityDrift(t *testing.T) {
 		if code(want.VerifyAgainst(got)) != nkderr.CodeVerifyFailed {
 			t.Errorf("VerifyAgainst accepted %s drift", name)
 		}
-		if _, _, err := want.Check(got); code(err) != nkderr.CodeVerifyFailed {
-			t.Errorf("Check accepted %s drift: %v", name, err)
-		}
 	}
 }
 
 func TestFromQualifiedReportRejectsUnqualifiedReport(t *testing.T) {
-	rep := &pipeline.Report{RecipeID: "recipe", RecipeDigest: attestDigest('a'), Artifacts: []pipeline.ArtifactResult{{
+	rep := &pipeline.Report{BuildDigest: attestDigest('a'), Artifacts: []pipeline.ArtifactResult{{
 		Component: "kubectl", OutputType: "host-package", Qualification: pipeline.ArtifactUnqualified,
 		EngineClass: ir.EnginePrebuiltAcquire, SHA256: attestDigest('1'),
 	}}}
@@ -795,9 +804,10 @@ func TestFromQualifiedReportAcceptsProfileFreeAcquisition(t *testing.T) {
 	if manifest.ProfileDigest != "" || manifest.BuilderProfile != nil {
 		t.Fatalf("byte-preserving acquisition unexpectedly gained a profile: %+v", manifest.BuilderProfile)
 	}
-	manifest.AttachEvidence(&EvidenceRef{SBOMDigest: attestDigest('6'), ProvenanceDigest: attestDigest('7')}, attestDigest('8'))
-	if _, err := manifest.MarshalQualifiedDiagnostic(ctx); err != nil {
-		t.Fatalf("qualified profile-free diagnostic bytes rejected: %v", err)
+	manifest.Evidence = &EvidenceRef{SBOMDigest: attestDigest('6'), ProvenanceDigest: attestDigest('7')}
+	manifest.EvidenceDigest = attestDigest('8')
+	if err := manifest.VerifyQualifiedAgainst(ctx, manifest); err != nil {
+		t.Fatalf("qualified profile-free observation rejected: %v", err)
 	}
 	if _, err := manifest.MarshalQualified(ctx); code(err) != nkderr.CodeProvenanceMissing {
 		t.Fatalf("caller-authored evidence acquired publisher authority: %v", err)
@@ -810,7 +820,8 @@ func TestPublishedManifestRejectsLegacyCallerAuthoredConformance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest.AttachEvidence(&EvidenceRef{SBOMDigest: attestDigest('6'), ProvenanceDigest: attestDigest('7')}, attestDigest('8'))
+	manifest.Evidence = &EvidenceRef{SBOMDigest: attestDigest('6'), ProvenanceDigest: attestDigest('7')}
+	manifest.EvidenceDigest = attestDigest('8')
 
 	for name, mutate := range map[string]func(*Manifest){
 		"conformance claim":    func(candidate *Manifest) { candidate.ConformanceClaim = "conformant" },
@@ -836,7 +847,7 @@ func TestQualifiedManifestCloseReleasesReportAuthority(t *testing.T) {
 	if err := manifest.Close(); err != nil {
 		t.Fatalf("closing qualified manifest: %v", err)
 	}
-	if _, err := manifest.MarshalQualifiedDiagnostic(ctx); code(err) != nkderr.CodePreflightFailed {
+	if err := manifest.VerifyQualifiedAgainst(ctx, manifest); code(err) != nkderr.CodePreflightFailed {
 		t.Fatalf("closed manifest retained report authority: %v", err)
 	}
 	if err := manifest.Close(); err != nil {
@@ -853,9 +864,10 @@ func TestQualifiedObservationRejectsManifestAndReportMutation(t *testing.T) {
 		t.Fatalf("profile-free qualified vector unexpectedly gained a builder profile: %+v", got.BuilderProfile)
 	}
 	got.ConformanceClaim = "conformant"
-	got.AttachEvidence(&EvidenceRef{SBOMDigest: attestDigest('a'), ProvenanceDigest: attestDigest('c')}, attestDigest('b'))
-	if _, err := got.MarshalQualifiedDiagnostic(context.Background()); err != nil {
-		t.Fatalf("validated metadata enrichment must preserve diagnostic report-core qualification: %v", err)
+	got.Evidence = &EvidenceRef{SBOMDigest: attestDigest('a'), ProvenanceDigest: attestDigest('c')}
+	got.EvidenceDigest = attestDigest('b')
+	if err := want.VerifyQualifiedAgainst(context.Background(), got); err != nil {
+		t.Fatalf("validated metadata enrichment must preserve report-core qualification: %v", err)
 	}
 
 	got.Components[0].SHA256 = attestDigest('e')
@@ -890,7 +902,8 @@ func qualifiedSourceVector(t *testing.T) (want, got *Manifest, report *pipeline.
 	if err != nil {
 		t.Fatalf("qualified report projection failed: %v", err)
 	}
-	got.AttachEvidence(&EvidenceRef{SBOMDigest: attestDigest('6'), ProvenanceDigest: attestDigest('7')}, attestDigest('8'))
+	got.Evidence = &EvidenceRef{SBOMDigest: attestDigest('6'), ProvenanceDigest: attestDigest('7')}
+	got.EvidenceDigest = attestDigest('8')
 	raw, err := got.Marshal()
 	if err != nil {
 		t.Fatal(err)

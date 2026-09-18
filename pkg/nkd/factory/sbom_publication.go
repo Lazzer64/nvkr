@@ -47,25 +47,25 @@ func sbomPublicationObjects(ctx context.Context, plan *Plan, artifact Artifact, 
 		if err != nil {
 			return nil, e.Wrap(e.CodeProvenanceMissing, err, "reading hosted producer result")
 		}
-		if result.Component != input.Component || input.RecipeTarget != artifact.RecipeTarget || results[result.Component].Component != "" {
+		if result.Component != input.Component || input.BuildTarget != artifact.BuildTarget || results[result.Component].Component != "" {
 			return nil, e.New(e.CodeVerifyFailed, "SBOM producer identity is ambiguous")
 		}
 		results[result.Component] = result
 	}
-	recipeDigest := ""
-	for _, recipe := range plan.Recipes {
-		if recipe.Name == artifact.RecipeTarget {
-			recipeDigest = recipe.RecipeDigest
+	buildDigest := ""
+	for _, build := range plan.Builds {
+		if build.Name == artifact.BuildTarget {
+			buildDigest = build.BuildDigest
 		}
 	}
-	if index.RecipeDigest != recipeDigest || recipeDigest == "" {
-		return nil, e.New(e.CodeVerifyFailed, "SBOM index has the wrong recipe")
+	if index.BuildDigest != buildDigest || buildDigest == "" {
+		return nil, e.New(e.CodeVerifyFailed, "SBOM index has the wrong build")
 	}
 	indexDigest, err := index.Digest()
 	if err != nil {
 		return nil, err
 	}
-	objects := []delivery.ObjectInput{{Name: "sbom-index-" + strings.TrimPrefix(indexDigest, "sha256:"), Kind: "sbom-index", ArtifactType: "application/vnd.nkd.sbom-index.v1+json", LayerMediaType: "application/vnd.nkd.sbom-index.v1+json", SemanticDigest: indexDigest, Bytes: raw}}
+	objects := []delivery.ObjectInput{{Name: "sbom-index-" + strings.TrimPrefix(indexDigest, "sha256:"), Kind: "sbom-index", ArtifactType: "application/vnd.nkd.sbom-index.v2+json", LayerMediaType: "application/vnd.nkd.sbom-index.v2+json", SemanticDigest: indexDigest, Bytes: raw}}
 	if len(results) != len(index.Entries) {
 		return nil, e.New(e.CodeProvenanceMissing, "hosted SBOM index does not cover every producer result")
 	}
@@ -90,12 +90,12 @@ func sbomPublicationObjects(ctx context.Context, plan *Plan, artifact Artifact, 
 			return nil, e.New(e.CodeVerifyFailed, "hosted SBOM subject differs from its producer")
 		}
 		for _, prop := range bom.Metadata.Props {
-			if prop.Name == "nkd:recipeDigest" && prop.Value != recipeDigest {
-				return nil, e.New(e.CodeVerifyFailed, "SBOM document has the wrong recipe")
+			if prop.Name == "nkd:buildDigest" && prop.Value != buildDigest {
+				return nil, e.New(e.CodeVerifyFailed, "SBOM document has the wrong build")
 			}
 		}
 		objects = append(objects, delivery.ObjectInput{Name: "sbom-" + strings.TrimPrefix(digest, "sha256:"), Kind: "sbom", ArtifactType: "application/vnd.cyclonedx+json", LayerMediaType: "application/vnd.cyclonedx+json", SemanticDigest: digest, Bytes: bomRaw})
-		if plan.ExecutionSettings.SBOMTool != "" {
+		if plan.Definition.SBOMTool != "" {
 			if len(bom.Components) == 0 {
 				return nil, e.New(e.CodeProvenanceMissing, "hosted SBOM omits required dependency inventory")
 			}
@@ -115,7 +115,7 @@ func sbomPublicationObjects(ctx context.Context, plan *Plan, artifact Artifact, 
 					kind = input.Kind
 				}
 			}
-			if (kind == "tarball" && method != "helm-manifests/v1") || (kind != "tarball" && (method != "syft-cyclonedx/v1" || scanner != toolExecutableDigest(plan, plan.ExecutionSettings.SBOMTool))) {
+			if (kind == "tarball" && method != "helm-manifests/v1") || (kind != "tarball" && (method != "syft-cyclonedx/v1" || scanner != toolExecutableDigest(plan, plan.Definition.SBOMTool))) {
 				return nil, e.New(e.CodeVerifyFailed, "hosted SBOM inspection does not match the planned scanner")
 			}
 		}

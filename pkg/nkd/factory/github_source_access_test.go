@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	authored "github.com/NVIDIA/nke-recipes/pkg/nkd/definition"
+
 	e "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/pipeline"
 	"sigs.k8s.io/yaml"
@@ -22,19 +24,19 @@ func authenticatedSourcePlan(t *testing.T) (*Plan, Node, string) {
 		if node.Kind != NodeFetch {
 			continue
 		}
-		for _, recipe := range plan.Recipes {
-			for _, source := range recipe.Graph.Nodes {
-				if recipe.Name != node.RecipeTarget || source.ID != node.IRNode {
+		for _, build := range plan.Builds {
+			for _, source := range build.Graph.Nodes {
+				if build.Name != node.BuildTarget || source.ID != node.IRNode {
 					continue
 				}
-				plan.ExecutionSettings.SourceAccess = map[string]SourceAccess{
+				plan.Environment.SourceAccess = map[string]authored.SourceAccess{
 					source.Repo: {Mirror: "https://github.com/test-owner/private-source", CredentialRef: "github:NKE_SOURCE_TOKEN"},
 				}
-				digest, err := plan.ExecutionSettings.Digest()
+				digest, err := plan.Environment.Digest()
 				if err != nil {
 					t.Fatal(err)
 				}
-				plan.ExecutionSettingsDigest = digest
+				plan.EnvironmentDigest = digest
 				return plan, node, source.Repo
 			}
 		}

@@ -31,15 +31,15 @@ func TestBinaryBundlePublicationRootAndExtraction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	definition := filepath.Join(root, "cluster-definition.json")
+	definition := filepath.Join(root, "build-record.json")
 	definitionRaw := []byte(`{"schemaVersion":"example/v1","release":"exact"}`)
 	if err := os.WriteFile(definition, definitionRaw, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	publicationPath := filepath.Join(root, "publication")
 	publication, err := BuildPublicationRoot(ctx, publicationPath, PublicationRequest{Objects: []ObjectInput{
-		{Name: "cluster-definition", Kind: "cluster-definition", Path: definition,
-			ArtifactType: MediaClusterDefinition, LayerMediaType: MediaClusterDefinition, SemanticDigest: digestBytes(definitionRaw)},
+		{Name: "build-record", Kind: "build-record", Path: definition,
+			ArtifactType: MediaDeliveryObject, LayerMediaType: MediaDeliveryObject, SemanticDigest: digestBytes(definitionRaw)},
 		{Name: "operator-tools-linux-amd64", Kind: "binary-bundle", Path: bundlePath,
 			ArtifactType: MediaBinaryBundle, SemanticDigest: bundle.SemanticDigest,
 			OS: "linux", Arch: "amd64", Layout: true},
@@ -68,8 +68,8 @@ func TestBinaryBundlePublicationRootAndExtraction(t *testing.T) {
 			t.Fatalf("extracted %s = %q, %v", name, got, err)
 		}
 	}
-	extractedDefinition := filepath.Join(root, "consumer", "cluster-definition.json")
-	object, err := ExtractObject(ctx, publicationPath, "cluster-definition", extractedDefinition)
+	extractedDefinition := filepath.Join(root, "consumer", "build-record.json")
+	object, err := ExtractObject(ctx, publicationPath, "build-record", extractedDefinition)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestBinaryBundlePublicationRootAndExtraction(t *testing.T) {
 	if err != nil || string(gotDefinition) != string(definitionRaw) || object.SemanticDigest != digestBytes(definitionRaw) {
 		t.Fatalf("extracted definition = %q, object=%#v, err=%v", gotDefinition, object, err)
 	}
-	if _, err := ExtractObject(ctx, publicationPath, "cluster-definition", extractedDefinition); err == nil {
+	if _, err := ExtractObject(ctx, publicationPath, "build-record", extractedDefinition); err == nil {
 		t.Fatal("object extraction overwrote an existing destination")
 	}
 }
@@ -182,17 +182,6 @@ func TestAPTRepositoryProjectsExactDebianPackage(t *testing.T) {
 	packages, err := os.ReadFile(filepath.Join(out, "dists/stable/main/binary-amd64/Packages"))
 	if err != nil || !strings.Contains(string(packages), "SHA256: "+strings.TrimPrefix(result.Repository.Packages[0].SHA256, "sha256:")) {
 		t.Fatalf("Packages did not bind exact deb: %v\n%s", err, packages)
-	}
-}
-
-func TestQualifiedPublicationAdmissionRequiresOpaqueAuthorityBeforeOutput(t *testing.T) {
-	t.Parallel()
-	out := filepath.Join(t.TempDir(), "qualified")
-	if _, err := BuildQualifiedPublicationRoot(context.Background(), out, QualifiedPublicationRequest{}); err == nil {
-		t.Fatal("zero caller input minted a qualified publication root")
-	}
-	if _, err := os.Stat(out); !os.IsNotExist(err) {
-		t.Fatalf("qualified admission touched output before authority: %v", err)
 	}
 }
 

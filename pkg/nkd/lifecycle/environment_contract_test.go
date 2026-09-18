@@ -157,7 +157,7 @@ func TestEnvironmentStrictlyDecodesExecutionClasses(t *testing.T) {
 	}
 }
 
-func TestEnvironmentYAMLLowersToDeterministicPlanBinding(t *testing.T) {
+func TestEnvironmentYAMLCompilesDeterministicPlanBinding(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "environment.yaml")
 	document := `apiVersion: nkd.dev/environment/v1
 kind: Environment
@@ -194,14 +194,7 @@ executionClasses:
 	}
 	definition := testDefinition(t)
 	definition.Outputs[0].Components = []string{"kubelet"}
-	compileSpec, delivery, err := lower(definition, environment)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(delivery.ExecutionClasses) != 2 || delivery.ExecutionClasses[1].Name != "beta-kvm" {
-		t.Fatalf("lifecycle lowering lost execution classes: %#v", delivery.ExecutionClasses)
-	}
-	base, err := catalog.LoadContext(t.Context(), catalog.Dir(compileSpec.Catalog.Base))
+	base, err := catalog.LoadContext(t.Context(), catalog.Dir(definition.Catalog.Base))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,40 +214,47 @@ executionClasses:
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := factory.Compile(t.Context(), compileSpec, delivery, stack, "test")
+	plan, err := factory.Compile(t.Context(), definition, environment, stack, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var recipeNode *ir.Node
-	for index := range plan.Recipes[0].Graph.Nodes {
-		if plan.Recipes[0].Graph.Nodes[index].Component == "kubelet" {
-			recipeNode = &plan.Recipes[0].Graph.Nodes[index]
+	var buildNode *ir.Node
+	for index := range plan.Builds[0].Graph.Nodes {
+		if plan.Builds[0].Graph.Nodes[index].Component == "kubelet" {
+			buildNode = &plan.Builds[0].Graph.Nodes[index]
 			break
 		}
 	}
-	if recipeNode == nil || recipeNode.ExecutionBinding == nil ||
-		recipeNode.ExecutionBinding.Class.Name != "beta-kvm" {
-		t.Fatalf("public Environment did not select preferred class: %#v", recipeNode)
+	if buildNode == nil || buildNode.ExecutionBinding == nil ||
+		buildNode.ExecutionBinding.Class.Name != "beta-kvm" {
+		t.Fatalf("public Environment did not select preferred class: %#v", buildNode)
 	}
 	var planNode *factory.Node
 	for index := range plan.Graph.Nodes {
-		if plan.Graph.Nodes[index].IRNode == recipeNode.ID {
+		if plan.Graph.Nodes[index].IRNode == buildNode.ID {
 			planNode = &plan.Graph.Nodes[index]
 			break
 		}
 	}
-	if planNode == nil || planNode.RunsOn != "linux-amd64-kvm" ||
-		!execution.EqualBinding(planNode.ExecutionBinding, recipeNode.ExecutionBinding) {
-		t.Fatalf("Plan did not preserve deterministic binding: %#v", planNode)
+	if planNode == nil || planNode.ExecutionBinding != nil || planNode.Requirements != nil || planNode.RunsOn != "" {
+		t.Fatalf("Plan copied producer execution fields: %#v", planNode)
 	}
-
-	alternative, err := execution.Match(recipeNode.Requirements,
-		[]execution.Class{delivery.ExecutionClasses[0]}, execution.MatchOptions{})
+	instruction, err := plan.ExecutionFor(*planNode)
 	if err != nil {
 		t.Fatal(err)
 	}
-	recipeNode.ExecutionBinding = alternative
-	planNode.ExecutionBinding = execution.CloneBinding(alternative)
-	planNode.RunsOn = alternative.Class.RunsOn
+	if instruction.RunsOn != "linux-amd64-kvm" || !execution.EqualBinding(instruction.ExecutionBinding, buildNode.ExecutionBinding) {
+		t.Fatalf("Plan did not resolve the deterministic binding: %#v", instruction)
+	}
+	if len(plan.Environment.ExecutionClasses) != 2 || plan.Environment.ExecutionClasses[1].Name != "beta-kvm" {
+		t.Fatalf("compilation lost authored execution classes: %#v", plan.Environment.ExecutionClasses)
+	}
+
+	alternative, err := execution.Match(buildNode.Requirements,
+		[]execution.Class{environment.ExecutionClasses[0]}, execution.MatchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildNode.ExecutionBinding = alternative
 	assertCode(t, plan.Validate(), e.CodePipelineDrift)
 }

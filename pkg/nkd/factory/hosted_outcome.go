@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/canonical"
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/definition"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/delivery"
 	e "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/pipeline"
@@ -93,7 +94,7 @@ func validateHostedOutcomes(ctx context.Context, workspace string, plan *Plan) e
 		}
 		return filepath.Join(workspace, filepath.FromSlash(strings.TrimPrefix(clean, prefix+"/"))), nil
 	}
-	observedRecipes := map[string]bool{}
+	observedBuilds := map[string]bool{}
 	evidenceSets := map[string][]delivery.ObjectInput{}
 	for _, artifact := range artifacts {
 		path, err := local(artifact.Path)
@@ -108,18 +109,18 @@ func validateHostedOutcomes(ctx context.Context, workspace string, plan *Plan) e
 			}
 			var observation factoryObservation
 			if err := canonical.UnmarshalExact(bytes.TrimSuffix(raw, []byte{'\n'}), &observation); err != nil ||
-				observation.SchemaVersion != "nkd.dev/factory-observation/v1" || !canonical.IsDigest(observation.RecipeDigest) || len(observation.Inputs) == 0 {
+				observation.SchemaVersion != "nkd.dev/factory-observation/v2" || !canonical.IsDigest(observation.BuildDigest) || len(observation.Inputs) == 0 {
 				return e.New(e.CodeProvenanceMissing, "hosted terminal observation is missing or malformed")
 			}
 			node := nodes[artifact.Producer]
-			var recipeDigest string
-			for _, recipe := range plan.Recipes {
-				if recipe.Name == node.RecipeTarget {
-					recipeDigest = recipe.RecipeDigest
+			var buildDigest string
+			for _, build := range plan.Builds {
+				if build.Name == node.BuildTarget {
+					buildDigest = build.BuildDigest
 					break
 				}
 			}
-			if observation.Qualification != TierStaticUnqualified || observation.RecipeDigest != recipeDigest || len(observation.Inputs) != len(node.Inputs) {
+			if observation.BuildTarget != node.BuildTarget || observation.Qualification != TierStaticUnqualified || observation.BuildDigest != buildDigest || len(observation.Inputs) != len(node.Inputs) {
 				return e.New(e.CodeProvenanceMissing, "hosted terminal observation does not cover its exact planned inputs")
 			}
 			for index, input := range observation.Inputs {
@@ -136,7 +137,7 @@ func validateHostedOutcomes(ctx context.Context, workspace string, plan *Plan) e
 					return e.New(e.CodeVerifyFailed, "hosted terminal observation input %q differs from restored bytes", input.ArtifactID)
 				}
 			}
-			observedRecipes[observation.RecipeDigest] = true
+			observedBuilds[node.BuildTarget] = true
 		case "sbom-set":
 			evidence, err := sbomPublicationObjects(ctx, plan, artifact, artifacts, local)
 			if err != nil {
@@ -145,19 +146,19 @@ func validateHostedOutcomes(ctx context.Context, workspace string, plan *Plan) e
 			evidenceSets[artifact.ID] = evidence
 		}
 	}
-	for _, recipe := range plan.Recipes {
-		if !observedRecipes[recipe.RecipeDigest] {
-			return e.New(e.CodeProvenanceMissing, "hosted Run omits terminal observation for recipe %q", recipe.Name)
+	for _, build := range plan.Builds {
+		if !observedBuilds[build.Name] {
+			return e.New(e.CodeProvenanceMissing, "hosted Run omits terminal observation for build %q", build.Name)
 		}
 	}
-	for _, route := range plan.ExecutionSettings.Routes {
+	for _, route := range plan.Routes {
 		packageArtifact := artifacts[route.Input]
 		if packageArtifact.Kind == PackageOCI {
 			layout, err := local(packageArtifact.Path)
 			if err != nil {
 				return err
 			}
-			if plan.ExecutionSettings.Signing != nil && plan.ExecutionSettings.Signing.Mode == SigningModeCosign && len(plan.LifecycleOutputs) > 0 {
+			if plan.Environment.Signing != nil && plan.Environment.Signing.Mode == SigningModeCosign && len(plan.LifecycleOutputs) > 0 {
 				inspection, err := delivery.Inspect(ctx, layout)
 				if err != nil {
 					return err
@@ -209,7 +210,7 @@ func validateHostedOutcomes(ctx context.Context, workspace string, plan *Plan) e
 		if err != nil {
 			return e.Wrap(e.CodeProvenanceMissing, err, "reading hosted publication subject")
 		}
-		if plan.ExecutionSettings.Signing == nil {
+		if plan.Environment.Signing == nil {
 			continue
 		}
 		signingPath, err := local(artifacts["signature/"+route.Name].Path)
@@ -229,10 +230,10 @@ func validateHostedOutcomes(ctx context.Context, workspace string, plan *Plan) e
 			return e.Wrap(e.CodeProvenanceMissing, err, "reading hosted provenance predicate")
 		}
 		if record.Ref != publication.Ref || record.Digest != publication.Digest || record.PredicateSHA256 != pipeline.FileDigest(predicate) ||
-			record.Identity != plan.ExecutionSettings.Signing.Identity || record.Issuer != plan.ExecutionSettings.Signing.Issuer {
+			record.Identity != plan.Environment.Signing.Identity || record.Issuer != plan.Environment.Signing.Issuer {
 			return e.New(e.CodeVerifyFailed, "hosted signing record for %q differs from its publication, predicate, or policy", route.Name)
 		}
-		if err := validateHostedProductionPredicate(predicate, plan, plan.ExecutionSettings.Signing); err != nil {
+		if err := validateHostedProductionPredicate(predicate, plan, plan.Environment.Signing); err != nil {
 			return err
 		}
 	}
@@ -249,7 +250,7 @@ func (r hostedPredicateRun) InvocationID() string  { return r.invocationID }
 func (r hostedPredicateRun) StartedOn() time.Time  { return r.startedOn }
 func (r hostedPredicateRun) FinishedOn() time.Time { return r.finishedOn }
 
-func validateHostedProductionPredicate(raw []byte, plan *Plan, signing *SigningProfile) error {
+func validateHostedProductionPredicate(raw []byte, plan *Plan, signing *definition.Signing) error {
 	var predicate provenance.Predicate
 	trimmed := bytes.TrimSuffix(raw, []byte{'\n'})
 	if err := canonical.UnmarshalExact(trimmed, &predicate); err != nil {

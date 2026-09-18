@@ -4,7 +4,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/NVIDIA/nke-recipes/pkg/nkd/criteria"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/ir"
 )
 
@@ -85,10 +84,9 @@ func completeTestBuild(node ir.Node, fetch ir.Node) ir.Node {
 	return node
 }
 
-func testSourceGraph(recipeID string, fetch ir.Node, builds ...ir.Node) *ir.Graph {
+func testSourceGraph(fetch ir.Node, builds ...ir.Node) *ir.Graph {
 	graph := &ir.Graph{
-		SchemaVersion: ir.SchemaVersion, RecipeID: recipeID,
-		Criteria: criteria.Criteria{OS: "ubuntu", Arch: "amd64"},
+		SchemaVersion: ir.SchemaVersion, Platform: "linux/amd64",
 	}
 	verify := ir.Node{ID: "verify", Kind: ir.KindVerify}
 	for _, build := range builds {
@@ -107,4 +105,34 @@ func mustGraphDigest(t *testing.T, graph *ir.Graph) string {
 		t.Fatal(err)
 	}
 	return digest
+}
+
+func sampleGraph() *ir.Graph {
+	commit := strings.Repeat("c", 40)
+	tree := strings.Repeat("e", 40)
+	toolchain := "golang@sha256:" + strings.Repeat("d", 64)
+	vendorSpec, err := ir.VendorSpecIdentity(nil, toolchain)
+	if err != nil {
+		panic(err)
+	}
+	return &ir.Graph{
+		SchemaVersion: ir.SchemaVersion, Platform: "linux/amd64",
+		Nodes: []ir.Node{
+			{ID: "build-kubectl", Kind: ir.KindBuild, Component: "kubectl", Needs: []string{"fetch-k"},
+				BuilderType: ir.BuilderOCIHermetic, Toolchain: toolchain,
+				Platform: "linux/amd64", Network: ir.NetworkNone, Workdir: "/src",
+				Env: []ir.EnvVar{
+					{Name: "CGO_ENABLED", Value: "0"}, {Name: "GOAMD64", Value: "v1"},
+					{Name: "GOARCH", Value: "amd64"}, {Name: "GOFLAGS", Value: "-trimpath -buildvcs=false"},
+					{Name: "GOOS", Value: "linux"}, {Name: "GOTOOLCHAIN", Value: "local"},
+					{Name: "LC_ALL", Value: "C"}, {Name: "SOURCE_DATE_EPOCH", Value: "1"}, {Name: "TZ", Value: "UTC"},
+				},
+				Command: []string{"make", "kubectl"}, SourceDest: "k-src", SourceCommit: commit,
+				SourceTreeHash: tree, VendorSpecDigest: vendorSpec, SourceReadOnly: true,
+				WriteDir: "out", ArtifactPath: "out/kubectl", OutputType: "host-package", Version: "1.32.0"},
+			{ID: "fetch-k", Kind: ir.KindFetch, Repo: "https://x/k", Commit: commit, TreeHash: tree,
+				Dest: "k-src", VendorImage: toolchain, VendorSpecDigest: vendorSpec, Network: ir.NetworkDefault},
+			{ID: "verify", Kind: ir.KindVerify, Needs: []string{"build-kubectl"}},
+		},
+	}
 }

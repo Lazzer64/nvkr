@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/canonical"
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/catalog"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/delivery"
 	nkderr "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/factory"
@@ -16,6 +17,17 @@ import (
 )
 
 func TestObserveOutputReconstructsExactBundleAndPublicationMembership(t *testing.T) {
+	plan, err := Compile(t.Context(), "definition.yaml", testDefinition(t), "environment.yaml", testEnvironment(), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plannedProducer factory.Artifact
+	for _, artifact := range plan.Graph.Artifacts {
+		if artifact.ID == "result/cli/kubectl" {
+			plannedProducer = artifact
+			break
+		}
+	}
 	workspace := t.TempDir()
 	componentPath := filepath.Join(workspace, "component")
 	if err := os.WriteFile(componentPath, []byte("exact component bytes"), 0o755); err != nil {
@@ -36,11 +48,7 @@ func TestObserveOutputReconstructsExactBundleAndPublicationMembership(t *testing
 	if err := os.MkdirAll(filepath.Dir(producerPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(componentPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	producer := pipeline.ArtifactResult{Component: "kubectl", SHA256: pipeline.FileDigest([]byte("exact component bytes")), Size: info.Size()}
+	producer := fixtureProducerResult(t, plan, plannedProducer, componentPath)
 	raw, err := canonical.Marshal(producer)
 	if err != nil {
 		t.Fatal(err)
@@ -53,7 +61,7 @@ func TestObserveOutputReconstructsExactBundleAndPublicationMembership(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := testReleaseRequest(t, []Artifact{{Name: "cli-bundle", Kind: OutputExecutable, Digest: descriptor.Digest, RecipeDigest: "sha256:" + repeat("5", 64), Components: []string{"kubectl"}}}, []delivery.ObjectInput{{Name: "cli-bundle", Kind: factory.PackageBinaryBundle, Path: bundlePath, Layout: true, ArtifactType: delivery.MediaBinaryBundle, SemanticDigest: bundleResult.SemanticDigest, BlobDigest: bundleResult.RootDigest}}, map[string]string{"kubectl": producer.SHA256})
+	request := testReleaseRequest(t, []Artifact{{Name: "cli-bundle", Kind: OutputExecutable, Digest: descriptor.Digest, BuildDigest: "sha256:" + repeat("5", 64), Components: []string{"kubectl"}}}, []delivery.ObjectInput{{Name: "cli-bundle", Kind: factory.PackageBinaryBundle, Path: bundlePath, Layout: true, ArtifactType: delivery.MediaBinaryBundle, SemanticDigest: bundleResult.SemanticDigest, BlobDigest: bundleResult.RootDigest}}, map[string]string{"kubectl": producer.SHA256})
 	_, err = delivery.BuildPublicationRoot(context.Background(), rootPath, request)
 	if err != nil {
 		t.Fatal(err)
@@ -61,10 +69,10 @@ func TestObserveOutputReconstructsExactBundleAndPublicationMembership(t *testing
 	artifacts := map[string]factory.Artifact{
 		"package/cli-bundle": {ID: "package/cli-bundle", Name: "cli-bundle", Kind: factory.PackageBinaryBundle, MediaType: delivery.MediaBinaryBundle, Path: ".nkd/factory/outputs/cli-bundle"},
 		"package/cli":        {ID: "package/cli", Name: "cli", Kind: factory.PackageOCI, Path: ".nkd/factory/outputs/cli"},
-		"result/cli/kubectl": {ID: "result/cli/kubectl", Component: "kubectl", RecipeTarget: "cli", Path: ".nkd/factory/results/kubectl.json"},
+		"result/cli/kubectl": {ID: "result/cli/kubectl", Component: "kubectl", BuildTarget: "cli", Path: ".nkd/factory/results/kubectl.json"},
 	}
 	slot := requiredOutput{Name: "cli", Kind: OutputExecutable, ArtifactID: "package/cli", MemberArtifactID: "package/cli-bundle",
-		RecipeDigest: "sha256:" + repeat("5", 64), Components: []string{"kubectl"}, ComponentResults: []string{"result/cli/kubectl"}}
+		BuildDigest: "sha256:" + repeat("5", 64), Components: []string{"kubectl"}, ComponentResults: []string{"result/cli/kubectl"}}
 	observed, err := observeOutput(context.Background(), workspace, slot, artifacts, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +99,6 @@ func TestObserveOutputReconstructsExactBundleAndPublicationMembership(t *testing
 func TestObserveAPTRejectsSubstitutedProducerBytes(t *testing.T) {
 	ctx := context.Background()
 	definition, environment := testDefinition(t), testEnvironment()
-	definition.Clusters = nil
 	definition.Outputs[0].Format = OutputAPT
 	definition.Outputs[0].APT = &APTOutput{Distribution: "stable", Component: "main"}
 	environment.Publication = nil
@@ -109,15 +116,15 @@ func TestObserveAPTRejectsSubstitutedProducerBytes(t *testing.T) {
 	}
 	t.Chdir(t.TempDir())
 	payload := []byte("synthetic kubectl original bytes")
-	input := artifacts["artifact/cli-recipe/kubectl"]
+	input := artifacts["artifact/cli/kubectl"]
 	if err := os.MkdirAll(filepath.Dir(input.Path), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(input.Path, payload, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	resultPath := artifacts["result/cli-recipe/kubectl"].Path
-	result := pipeline.ArtifactResult{Component: "kubectl", SHA256: pipeline.FileDigest(payload), Size: int64(len(payload))}
+	resultPath := artifacts["result/cli/kubectl"].Path
+	result := fixtureProducerResult(t, plan, input, input.Path)
 	writeCanonicalTestFile(t, resultPath, result)
 	if err := factory.ExecuteNode(ctx, plan, "package/cli", nil, nil); err != nil {
 		t.Fatal(err)
@@ -185,7 +192,7 @@ func TestObserveHelmReproducesPayloadAcrossWorkspaceRelocation(t *testing.T) {
 		artifacts[artifact.ID] = artifact
 	}
 	t.Chdir(t.TempDir())
-	inputPath := artifacts["artifact/h100-runtime/aicr-bundle"].Path
+	inputPath := artifacts["artifact/gpu-runtime/aicr-bundle"].Path
 	if err := os.MkdirAll(inputPath, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -241,6 +248,17 @@ func TestCompleteGPUPublicationClosureAcrossFormatsAndArchitectures(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
+			// Keep the supplier acquisition in this synthetic closure, but pin its
+			// private test overlay to the bytes the fixture will materialize.
+			overlay, err := catalog.LoadOverlayContext(ctx, filepath.Join(filepath.Dir(definitionPath), "supplier-kubectl.yaml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			pin := pipeline.FileDigest([]byte("synthetic GPU producer kubectl"))
+			overlay.Components["kubectl"].Prebuilt.Digests = map[string]string{"amd64": pin, "arm64": pin}
+			overlayPath := filepath.Join(t.TempDir(), "supplier-kubectl.json")
+			writeCanonicalTestFile(t, overlayPath, overlay)
+			definition.Catalog.Overlays = []string{overlayPath}
 			environment, err := LoadEnvironment(ctx, "testdata/examples/ai-factory/environment-local.yaml")
 			if err != nil {
 				t.Fatal(err)
@@ -256,8 +274,8 @@ func TestCompleteGPUPublicationClosureAcrossFormatsAndArchitectures(t *testing.T
 				payload := []byte("synthetic GPU producer " + artifact.Component)
 				switch {
 				case artifact.Kind == "producer-result":
-					writeCanonicalTestFile(t, artifact.Path, pipeline.ArtifactResult{Component: artifact.Component,
-						OutputType: "binary", Path: artifact.Component, SHA256: pipeline.FileDigest(payload), Size: int64(len(payload))})
+					input := artifacts["artifact/"+artifact.BuildTarget+"/"+artifact.Component]
+					writeCanonicalTestFile(t, artifact.Path, fixtureProducerResult(t, plan, artifact, input.Path))
 				case strings.HasSuffix(artifact.ID, "/aicr-bundle"):
 					if err := os.MkdirAll(artifact.Path, 0o700); err != nil {
 						t.Fatal(err)
@@ -283,7 +301,7 @@ func TestCompleteGPUPublicationClosureAcrossFormatsAndArchitectures(t *testing.T
 					}
 				}
 			}
-			for _, nodeID := range []string{"composition/gpu-tenant", "package/gpu-runtime", "package/worker-apt", "package/worker-binaries", "package/release"} {
+			for _, nodeID := range []string{"package/gpu-runtime", "package/worker-apt", "package/worker-binaries", "package/release"} {
 				if err := factory.ExecuteNode(ctx, plan, nodeID, nil, nil); err != nil {
 					t.Fatalf("%s: %v", nodeID, err)
 				}
@@ -305,12 +323,12 @@ func TestCompleteGPUPublicationClosureAcrossFormatsAndArchitectures(t *testing.T
 			if shared == 0 {
 				t.Fatal("shared build SBOMs were not deduplicated across APT and binary outputs")
 			}
-			outputs, subject, clusters, err := artifactsFromBinding(ctx, layout, inspection)
+			outputs, subject, err := inspectTestPublication(t, ctx, layout, inspection.RootDigest)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(outputs) != 3 || len(clusters) != 1 || len(clusters[0].Members) != 2 || clusters[0].ContentSubject != subject {
-				t.Fatalf("incomplete GPU closure: outputs=%+v clusters=%+v", outputs, clusters)
+			if len(outputs) != 3 || subject == "" {
+				t.Fatalf("incomplete GPU closure: outputs=%+v subject=%s", outputs, subject)
 			}
 			prepared, err := PrepareRun(definition, environment, plan, "gpu-closure")
 			if err != nil {
@@ -328,12 +346,12 @@ func TestCompleteGPUPublicationClosureAcrossFormatsAndArchitectures(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
-			bound, err = bindClusterRealizations(definition, plan, bound)
+			bound, err = bindReleaseContent(plan, bound)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if bound.ContentSubject != subject || len(bound.Clusters) != 1 || bound.Clusters[0].CompositionDigest != clusters[0].CompositionDigest {
-				t.Fatalf("Run and Release closure diverged: run=%+v release=%+v", bound.Clusters, clusters)
+			if bound.ContentSubject != subject {
+				t.Fatalf("Run and Release content diverged: run=%s release=%s", bound.ContentSubject, subject)
 			}
 		})
 	}

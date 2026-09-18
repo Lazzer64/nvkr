@@ -4,7 +4,7 @@
 |---|---|
 | Use Definition → Run → Release | [Lifecycle guide](lifecycle.md) |
 | Choose and run a demo | [Demo index](../scripts/README.md) |
-| Learn the seven public objects | [Domain vocabulary](../CONTEXT.md) |
+| Learn the six public objects | [Domain vocabulary](../CONTEXT.md) |
 | Understand architecture and failure behavior | [SADD](sadd.md) |
 | Inspect the single release registry graph and signing scope | [Publication architecture](publication-architecture.md) |
 | Change an engineering contract | Current [ADRs](adr/); public lifecycle in [ADR-17](adr/0017-cli-sdk-foundation-and-package-topology.md) |

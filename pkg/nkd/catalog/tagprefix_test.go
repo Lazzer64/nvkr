@@ -52,7 +52,7 @@ func TestSelectTagForSourceOnlyConsidersPrefixedTags(t *testing.T) {
 // tag's trailing segment parses as a newer semver.
 func TestSelectTagIgnoresForeignPrefixedTags(t *testing.T) {
 	tags := []string{"v1.32.0", "cli/v1.32.9", "sub/module/v1.32.8"}
-	got, err := SelectTag(tags, "1.32.x")
+	got, err := SelectTagForSource(tags, Source{Constraint: "1.32.x"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestRenderStampsUnprefixedUnchanged(t *testing.T) {
 // A tagPrefix declaration must survive the strict registry decoder and reach the loaded
 // catalog's source (it is authoring surface, not a machine-managed pin).
 func TestRegistryAcceptsTagPrefix(t *testing.T) {
-	registry := `apiVersion: nkd.dev/catalog/v1
+	registry := `apiVersion: nkd.dev/catalog/v3
 kind: SourceBuildRegistry
 sources:
   nke:
@@ -156,12 +156,9 @@ sources:
     tagPrefix: cli/
     constraint: 0.1.x
     toolchainImage: ` + goodImage + `
-recipes:
-  - id: nke-cli
-    criteria: {category: operations, os: any, arch: amd64, k8sVersion: any}
-    components: [nke-cli]
 components:
   nke-cli:
+    platforms: [linux/amd64, linux/arm64]
     fromSource: true
     source: nke
     outputType: raw

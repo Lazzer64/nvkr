@@ -2,6 +2,8 @@ package assemble
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -19,7 +21,7 @@ func TestDiskManifestDeterministic(t *testing.T) {
 	if err := os.WriteFile(raw, []byte("this-is-a-fake-raw-node-disk-stream"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	m1, err := NewDiskManifestContext(context.Background(), DiskKindRAW, "control-plane", raw, MinDiskBlockSizeBytes)
+	m1, err := NewDiskManifestContext(context.Background(), DiskKindRAW, raw, MinDiskBlockSizeBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,29 +31,20 @@ func TestDiskManifestDeterministic(t *testing.T) {
 	if !m1.PreEncryption {
 		t.Fatal("a freshly computed manifest is over the pre-encryption bytes")
 	}
-	m2, _ := NewDiskManifestContext(context.Background(), DiskKindRAW, "control-plane", raw, MinDiskBlockSizeBytes)
+	m2, _ := NewDiskManifestContext(context.Background(), DiskKindRAW, raw, MinDiskBlockSizeBytes)
 	d1, _ := m1.Digest()
 	d2, _ := m2.Digest()
 	if d1 != d2 {
 		t.Fatalf("disk manifest not deterministic: %s != %s", d1, d2)
 	}
-	// Role scopes the SKU: a worker disk over the same bytes is a distinct identity.
-	mw, _ := NewDiskManifestContext(context.Background(), DiskKindRAW, "worker", raw, MinDiskBlockSizeBytes)
-	dw, _ := mw.Digest()
-	if dw == d1 {
-		t.Fatal("control-plane and worker disks must have distinct manifest identities")
-	}
+
 }
 
 func TestDiskManifestBlockBoundsFailBeforeScanningContent(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "must-not-be-opened.raw")
 	for _, blockSize := range []int{MinDiskBlockSizeBytes - 1, MaxDiskBlockSizeBytes + 1} {
-		if _, err := NewDiskManifestContext(context.Background(), DiskKindRAW, "worker", missing, blockSize); code(err) != nkderr.CodeInvalidCatalog {
+		if _, err := NewDiskManifestContext(context.Background(), DiskKindRAW, missing, blockSize); code(err) != nkderr.CodeInvalidCatalog {
 			t.Fatalf("NewDiskManifest block size %d code = %q, want %q (%v)",
-				blockSize, code(err), nkderr.CodeInvalidCatalog, err)
-		}
-		if _, err := BlockManifestOfContext(context.Background(), missing, blockSize); code(err) != nkderr.CodeInvalidCatalog {
-			t.Fatalf("BlockManifestOf block size %d code = %q, want %q (%v)",
 				blockSize, code(err), nkderr.CodeInvalidCatalog, err)
 		}
 	}
@@ -66,12 +59,8 @@ func TestDiskManifestBlockBoundsFailBeforeScanningContent(t *testing.T) {
 	if err := os.Truncate(oversized, size); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewDiskManifestContext(context.Background(), DiskKindRAW, "worker", oversized, MinDiskBlockSizeBytes); code(err) != nkderr.CodeInvalidCatalog {
+	if _, err := NewDiskManifestContext(context.Background(), DiskKindRAW, oversized, MinDiskBlockSizeBytes); code(err) != nkderr.CodeInvalidCatalog {
 		t.Fatalf("oversized DiskManifest code = %q, want %q (%v)",
-			code(err), nkderr.CodeInvalidCatalog, err)
-	}
-	if _, err := BlockManifestOfContext(context.Background(), oversized, MinDiskBlockSizeBytes); code(err) != nkderr.CodeInvalidCatalog {
-		t.Fatalf("oversized BlockManifestOf code = %q, want %q (%v)",
 			code(err), nkderr.CodeInvalidCatalog, err)
 	}
 }
@@ -80,15 +69,9 @@ func TestDiskManifestContextFailsBeforeInputIO(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	missing := filepath.Join(t.TempDir(), "must-not-be-opened.raw")
-	if _, err := NewDiskManifestContext(ctx, DiskKindRAW, "worker", missing,
+	if _, err := NewDiskManifestContext(ctx, DiskKindRAW, missing,
 		MinDiskBlockSizeBytes); code(err) != nkderr.CodeTimeout || !nkderr.Retryable(err) {
 		t.Fatalf("canceled manifest construction returned %v", err)
-	}
-	if _, _, err := LogicalDiskDigestContext(ctx, missing); code(err) != nkderr.CodeTimeout {
-		t.Fatalf("canceled logical digest returned %v", err)
-	}
-	if _, err := BlockManifestOfContext(ctx, missing, MinDiskBlockSizeBytes); code(err) != nkderr.CodeTimeout {
-		t.Fatalf("canceled block manifest returned %v", err)
 	}
 }
 
@@ -125,48 +108,8 @@ func TestDiskManifestFailsClosedOnEncrypted(t *testing.T) {
 	if err := os.WriteFile(enc, append([]byte{'L', 'U', 'K', 'S', 0xba, 0xbe}, make([]byte, 32)...), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewDiskManifestContext(context.Background(), DiskKindRAW, "control-plane", enc, MinDiskBlockSizeBytes); code(err) != nkderr.CodeEncryptedArtifact {
+	if _, err := NewDiskManifestContext(context.Background(), DiskKindRAW, enc, MinDiskBlockSizeBytes); code(err) != nkderr.CodeEncryptedArtifact {
 		t.Fatalf("encrypted image must fail closed, got %v", err)
-	}
-}
-
-// ADR-14 §4: the node-SKU staging manifest is role-scoped, deterministic (sorted), and
-// distinct per role — so a control-plane vs worker SKU is individually reproducible.
-func TestStagingManifestRoleScoped(t *testing.T) {
-	recipeDigest := "sha256:" + strings.Repeat("c", 64)
-	comps := []StagedComponent{
-		{Name: "kubelet", OutputType: "host-package", ArtifactDigest: "sha256:" + strings.Repeat("a", 64)},
-		{Name: "containerd", OutputType: "host-package", ArtifactDigest: "sha256:" + strings.Repeat("b", 64)},
-	}
-	cp, err := NewStagingManifest("control-plane", recipeDigest, comps)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cp.Components[0].Name != "containerd" {
-		t.Fatalf("components must be sorted, got %s first", cp.Components[0].Name)
-	}
-	wk, _ := NewStagingManifest("worker", recipeDigest, comps)
-	dcp, _ := cp.Digest()
-	dwk, _ := wk.Digest()
-	if dcp == dwk {
-		t.Fatal("control-plane and worker staging manifests must differ")
-	}
-	if _, err := NewStagingManifest("", recipeDigest, comps); code(err) != nkderr.CodeUsage {
-		t.Fatal("an unscoped SKU must fail closed")
-	}
-	if _, err := NewStagingManifest("worker", recipeDigest, nil); code(err) != nkderr.CodeUsage {
-		t.Fatal("an empty SKU must fail closed")
-	}
-	duplicate := *cp
-	duplicate.Components = append([]StagedComponent(nil), cp.Components...)
-	duplicate.Components[1] = duplicate.Components[0]
-	if _, err := duplicate.Digest(); code(err) != nkderr.CodeInvalidCatalog {
-		t.Fatalf("duplicate component must not acquire an identity, got %v", err)
-	}
-	unbound := *cp
-	unbound.RecipeDigest = "sha256:recipe"
-	if _, err := unbound.Marshal(); code(err) != nkderr.CodeUnverifiedRef {
-		t.Fatalf("unpinned recipe must not marshal as canonical evidence, got %v", err)
 	}
 }
 
@@ -175,7 +118,7 @@ func TestDiskManifestRejectsSemanticMutation(t *testing.T) {
 	if err := os.WriteFile(raw, []byte("this-is-a-fake-raw-node-disk-stream"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := NewDiskManifestContext(context.Background(), DiskKindRAW, "control-plane", raw, MinDiskBlockSizeBytes)
+	manifest, err := NewDiskManifestContext(context.Background(), DiskKindRAW, raw, MinDiskBlockSizeBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +154,7 @@ func TestDiskManifestRejectsSymlinkInputs(t *testing.T) {
 	if err := os.Symlink(raw, rawLink); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewDiskManifestContext(context.Background(), DiskKindRAW, "worker", rawLink, MinDiskBlockSizeBytes); code(err) != nkderr.CodeVerifyFailed {
+	if _, err := NewDiskManifestContext(context.Background(), DiskKindRAW, rawLink, MinDiskBlockSizeBytes); code(err) != nkderr.CodeVerifyFailed {
 		t.Fatalf("symlinked canonical disk code = %q, want %q (%v)",
 			code(err), nkderr.CodeVerifyFailed, err)
 	}
@@ -219,7 +162,7 @@ func TestDiskManifestRejectsSymlinkInputs(t *testing.T) {
 		return
 	}
 
-	manifest, err := NewDiskManifestContext(context.Background(), DiskKindRAW, "worker", raw, MinDiskBlockSizeBytes)
+	manifest, err := NewDiskManifestContext(context.Background(), DiskKindRAW, raw, MinDiskBlockSizeBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,12 +183,12 @@ func TestCanonicalDiskCapabilityDetectsMutationBetweenDerivations(t *testing.T) 
 	if err := os.WriteFile(raw, []byte("hello world!"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	capability, err := openRegularFileCapability(raw, "canonical disk")
+	capability, err := openRegularFileCapabilityContext(t.Context(), raw, "canonical disk")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer capability.Close()
-	if _, _, err := capability.logicalDigest(); err != nil {
+	if _, _, _, err := capability.diskEvidenceContext(t.Context(), MinDiskBlockSizeBytes, true); err != nil {
 		t.Fatal(err)
 	}
 	file, err := os.OpenFile(raw, os.O_APPEND|os.O_WRONLY, 0)
@@ -259,7 +202,7 @@ func TestCanonicalDiskCapabilityDetectsMutationBetweenDerivations(t *testing.T) 
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := capability.blockManifest(MinDiskBlockSizeBytes); code(err) != nkderr.CodeVerifyFailed {
+	if _, _, _, err := capability.diskEvidenceContext(t.Context(), MinDiskBlockSizeBytes, true); code(err) != nkderr.CodeVerifyFailed {
 		t.Fatalf("mutated held canonical-disk capability code = %q, want %q (%v)",
 			code(err), nkderr.CodeVerifyFailed, err)
 	}
@@ -279,14 +222,11 @@ func TestAddEnvelopeUsesOneSnapshotWhenCallerPathMutates(t *testing.T) {
 	if err := os.WriteFile(envelope, initial, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := NewDiskManifestContext(context.Background(), DiskKindRAW, "worker", raw, MinDiskBlockSizeBytes)
+	manifest, err := NewDiskManifestContext(context.Background(), DiskKindRAW, raw, MinDiskBlockSizeBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantContainerDigest, _, err := LogicalDiskDigestContext(context.Background(), envelope)
-	if err != nil {
-		t.Fatal(err)
-	}
+	wantContainerDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(initial))
 	qemu, qemuDigest := fakeQemuImg(t, `{"format":"qcow2","virtual-size":12,"encrypted":false}`)
 	codec, err := OpenQemuImgCodec(context.Background(), qemu, qemuDigest)
 	if err != nil {
