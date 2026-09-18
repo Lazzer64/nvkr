@@ -112,6 +112,13 @@ func Resolve(cat *catalog.Catalog, query criteria.Criteria, reserved map[string]
 		}
 		comps = append(comps, catalog.NamedComponent{Name: n, Component: c})
 	}
+	// Catalog validation already closes authored flat recipes. Revalidate the
+	// exact selected slice at the public resolution boundary so future selection
+	// transforms cannot return a material-incomplete Resolved value.
+	if err := catalog.ValidateMaterialSet(comps); err != nil {
+		return nil, e.Wrap(e.CodeInvalidCatalog, err,
+			"recipe %q has an incomplete material set", win.ID)
+	}
 	return &Resolved{
 		RecipeID:    win.ID,
 		Criteria:    resolved,
@@ -224,6 +231,10 @@ func resolveLayered(cat *catalog.Catalog, query criteria.Criteria, reserved map[
 		if err := requireResolvedComponentRoute(nc.Name, nc.Component, resolved.Arch); err != nil {
 			return nil, err
 		}
+	}
+	if err := catalog.ValidateMaterialSet(comps); err != nil {
+		return nil, e.Wrap(e.CodeInvalidCatalog, err,
+			"layered recipe %q has an incomplete material set", coordinate(resolved))
 	}
 	return &Resolved{RecipeID: coordinate(resolved), Criteria: resolved,
 		AICRProfile: composed.AICRProfile, Components: comps}, nil
