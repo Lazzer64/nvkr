@@ -118,7 +118,13 @@ invocation mechanism, not a builder type or an output semantic:
   authoring-only until this ADR and the catalog add an explicit typed handoff before lowering is admitted.
 - `packer` invokes a pinned Packer executable against a source-owned HCL project and one exact Packer build name.
   NKD does not generate, rewrite, or interpret HCL. Packer plugins and the VM toolchain are authenticated parts
-  of the pre-realized toolchain closure, not downloads discovered during image construction.
+  of the pre-realized toolchain closure, not downloads discovered during image construction. The Packer
+  executable and every host executable that Packer or a plugin resolves through `PATH` are exact-digest inputs;
+  admitted execution constructs `PATH` only from that held closure and never exposes the ambient host path.
+  The held-executable boundary admits only Linux ELF files. Scripts and other binfmt-dispatched formats fail
+  capability admission because holding their bytes does not authenticate the selected host interpreter. The
+  outer realized-runtime adapter must additionally authenticate the ELF dynamic loader and shared-library
+  closure; a future script lane must bind its interpreter in that same closure.
 
 The direct-Packer authoring form names only the stable boundary that future lowering must enforce:
 
@@ -126,7 +132,7 @@ The direct-Packer authoring form names only the stable boundary that future lowe
 builderType: vm-image
 packer:
   projectPath: os-image/packer
-  buildName: qemu.nke-non-fde
+  buildName: nke-node-non-fde.qemu.nke-non-fde
   architectureVariable: architecture
   materialManifestVariable: material_manifest
   outputDirectoryVariable: output_directory
@@ -145,11 +151,27 @@ format, line/paragraph-separator and non-ASCII space-separator characters, disti
 `buildName` selection without list or glob syntax. It does not parse HCL or claim
 that the named build or variables exist. Before any image construction or output collection, admitted lowering
 must invoke the pinned Packer executable's `validate` command against the pinned project, the exact build name,
-and the declared variable bindings, and fail closed on any diagnostic. `artifactPath` is relative to the private
+and the declared variable bindings, and fail closed on any diagnostic, including a warning returned with exit
+status zero when `-only` matches no build. For a named HCL build block, the selector is the complete compiled
+name (for example `nke-node-non-fde.qemu.nke-non-fde`), not only the source type and source name. `artifactPath` is relative to the private
 output directory bound through `outputDirectoryVariable`. The three variable names are explicit and distinct, so
 NKD never guesses source-owned HCL names. `packer.variables` contains only public literal strings. It is not a
 credential channel, and future invocation records expose these values. The pinned Packer subprocess remains
 authoritative for checking their names and values against source-owned HCL declarations.
+
+Packer v1.14.2's
+[`validate` implementation](https://github.com/hashicorp/packer/blob/v1.14.2/command/validate.go) emits the clean
+success line only after diagnostic handling returns zero, and its
+[`validate` tests](https://github.com/hashicorp/packer/blob/v1.14.2/command/validate_test.go) fix clean stdout to
+exactly `The configuration is valid.` plus a newline while demonstrating that warnings can precede that line on
+stdout with exit status zero. The dormant driver therefore accepts only that clean line (ignoring surrounding
+whitespace) with empty stderr; any other output fails closed. A real pinned Packer/NKE execution remains required
+before lowering is admitted. A local 2026-09-18 framing probe used the official Packer 1.14.2 Darwin ARM64 ZIP
+(`sha256:b053c01272f87fe669c642dfac167b0b48cfb5c119e2e946d90ef92c2407f746`, matching HashiCorp's published
+`SHA256SUMS`) and Packer-installed Docker plugin 1.1.2. The full compiled selector returned exit zero, the single
+28-byte success line on stdout, and empty stderr; a short selector returned exit zero, a 251-byte warning plus
+the same success line on stdout, and empty stderr. This probes validation framing only, not NKE execution or disk
+production.
 
 `materials` is a one-to-one map from a source-owned binding name to another component in the same resolved
 Recipe. The target may be a from-source build or a digest-pinned acquisition. Unknown, excluded, self-referential,
