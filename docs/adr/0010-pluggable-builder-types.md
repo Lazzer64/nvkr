@@ -137,7 +137,10 @@ invocation mechanism, not a builder type or an output semantic:
   outer realized-runtime adapter must additionally authenticate the ELF dynamic loader and shared-library
   closure; a future script lane must bind its interpreter in that same closure.
 
-The direct-Packer authoring form names the stable boundary that compilation records and future execution must enforce:
+The direct-Packer authoring form names the stable boundary that compilation records and future execution must
+enforce. The concrete projection values below match the source-owned
+[NKE direct-Packer contract](https://github.com/dsx-ai-factory/nke/blob/e45aa0d7f245d9e0ae7def612ebbeeda6c5208f3/os-image/packer/variables.pkr.hcl#L14-L58);
+they are example producer vocabulary, not NKD-reserved values.
 
 ```yaml
 builderType: vm-image
@@ -148,6 +151,11 @@ packer:
   architectureVariable: architecture
   acceleratorVariable: accelerator
   materialManifestVariable: material_manifest
+  materialManifest: # optional producer-owned wire projection
+    schemaVersion: nke.dev/os-image-materials/v1
+    kinds:
+      image-inputs: archive
+      installer-iso: disk-image
   outputDirectoryVariable: output_directory
   sshPrivateKeyVariable: ssh_private_key_file # optional as a pair
   sshPublicKeyVariable: ssh_public_key_file   # optional as a pair
@@ -156,7 +164,8 @@ packer:
   variables:
     image_variant: standard
 materials:
-  agent-package: nke-agent
+  image-inputs: nke-image-inputs
+  installer-iso: ubuntu-installer-iso
 artifactPath: nke-node.qcow2
 ```
 
@@ -212,9 +221,15 @@ infer or fetch undeclared build materials.
 
 Compilation lowers each declared binding to the exact selected build or acquisition producer and records both
 the typed binding and graph dependency. Before either driver may execute, required component outputs must be built or acquired, verified, and assembled
-into a deterministic build-material manifest. Each v2 entry binds its source-owned binding name, observed component
-name, output kind, selected target architecture, exact artifact digest, and a slash-relative path derived from the binding name beneath a private
-staging root. Binding, component and kind text use the same display-safe UTF-8 policy as producer transport.
+into a deterministic build-material manifest. By default, each v2 entry binds its source-owned binding name,
+observed component name, output kind, selected target architecture, exact artifact digest, and a slash-relative
+path derived from the binding name beneath a private staging root. A Packer producer may instead declare one
+`materialManifest` projection with its source-owned `schemaVersion` and one producer-visible `kind` for every
+declared binding. The projection must cover the binding set exactly and is a logical Build input. It changes only
+the serialized schema and kind vocabulary; authenticated bytes, component, architecture, digest and deterministic
+staging path remain the same. NKD has no source-specific conditional or implicit kind translation. Binding and
+component text use the display-safe canonical-text policy. Schema and kind values use the stricter
+whitespace-free canonical-token policy.
 Random or absolute execution-root paths never enter its canonical bytes. The manifest is a
 deterministic description, not an authenticated receipt; admitted execution must derive it from authenticated
 producer observations and bind the exact serialized file bytes before invoking a subprocess. Direct Packer will

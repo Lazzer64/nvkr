@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/canonical"
 	e "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 )
 
@@ -80,6 +81,127 @@ func TestManifestIsDeterministicAndDerivesRelativePaths(t *testing.T) {
 	}
 }
 
+func TestProjectedManifestPreservesAuthenticatedFieldsAndIsDeterministic(t *testing.T) {
+	observations := []Observation{
+		{Binding: "installer-iso", Component: "ubuntu-installer-iso", Kind: "raw", Architecture: "arm64", Digest: "sha256:" + strings.Repeat("a", 64)},
+		{Binding: "image-inputs", Component: "nke-image-inputs", Kind: "tarball", Architecture: "arm64", Digest: "sha256:" + strings.Repeat("b", 64)},
+	}
+	projection := &Projection{
+		SchemaVersion: "nke.dev/os-image-materials/v1",
+		Kinds: map[string]string{
+			"installer-iso": "disk-image",
+			"image-inputs":  "archive",
+		},
+	}
+	forward, err := MarshalProjected(observations, projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reverse, err := MarshalProjected([]Observation{observations[1], observations[0]}, projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(forward, reverse) {
+		t.Fatalf("projection depends on observation order:\n%s\n%s", forward, reverse)
+	}
+	var manifest Manifest
+	if err := canonical.UnmarshalExact(forward, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.SchemaVersion != projection.SchemaVersion || len(manifest.Materials) != 2 {
+		t.Fatalf("projected manifest = %#v", manifest)
+	}
+	if got := manifest.Materials[0]; got.Binding != "image-inputs" || got.Component != "nke-image-inputs" ||
+		got.Kind != "archive" || got.Architecture != "arm64" || got.Digest != observations[1].Digest ||
+		got.Path != "materials/image-inputs" {
+		t.Fatalf("projected image inputs = %#v", got)
+	}
+	if got := manifest.Materials[1]; got.Binding != "installer-iso" || got.Component != "ubuntu-installer-iso" ||
+		got.Kind != "disk-image" || got.Architecture != "arm64" || got.Digest != observations[0].Digest ||
+		got.Path != "materials/installer-iso" {
+		t.Fatalf("projected installer ISO = %#v", got)
+	}
+
+	native, err := MarshalProjected(observations, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := NewManifest(observations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyBytes, err := legacy.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(native, legacyBytes) {
+		t.Fatalf("nil projection changed native v2 bytes:\n%s\n%s", native, legacyBytes)
+	}
+}
+
+func TestMaterialManifestProjectionValidationFailsClosed(t *testing.T) {
+	bindings := []string{"image-inputs", "installer-iso"}
+	valid := func() *Projection {
+		return &Projection{SchemaVersion: "nke.dev/os-image-materials/v1", Kinds: map[string]string{
+			"image-inputs": "archive", "installer-iso": "disk-image",
+		}}
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*Projection)
+	}{
+		{name: "missing schema", mutate: func(p *Projection) { p.SchemaVersion = "" }},
+		{name: "schema whitespace", mutate: func(p *Projection) { p.SchemaVersion = "nke.dev/os image/v1" }},
+		{name: "nil kinds", mutate: func(p *Projection) { p.Kinds = nil }},
+		{name: "missing binding", mutate: func(p *Projection) { delete(p.Kinds, "image-inputs") }},
+		{name: "unknown binding", mutate: func(p *Projection) { p.Kinds["other"] = "raw" }},
+		{name: "invalid binding", mutate: func(p *Projection) { p.Kinds[" bad"] = "raw" }},
+		{name: "missing kind", mutate: func(p *Projection) { p.Kinds["image-inputs"] = "" }},
+		{name: "kind whitespace", mutate: func(p *Projection) { p.Kinds["image-inputs"] = "input archive" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			projection := valid()
+			test.mutate(projection)
+			if got := errorCode(ValidateProjection(projection, bindings)); got != e.CodeInvalidCatalog {
+				t.Fatalf("ValidateProjection() = %v, want %s", ValidateProjection(projection, bindings), e.CodeInvalidCatalog)
+			}
+		})
+	}
+	if got := errorCode(ValidateProjection(valid(), []string{"image-inputs", "image-inputs"})); got != e.CodeInvalidCatalog {
+		t.Fatalf("duplicate binding validation = %v, want %s", ValidateProjection(valid(), []string{"image-inputs", "image-inputs"}), e.CodeInvalidCatalog)
+	}
+	if got := errorCode(ValidateProjection(valid(), []string{" bad", "installer-iso"})); got != e.CodeInvalidCatalog {
+		t.Fatalf("invalid declared binding validation = %v, want %s", ValidateProjection(valid(), []string{" bad", "installer-iso"}), e.CodeInvalidCatalog)
+	}
+}
+
+func TestProjectedManifestRejectsAmbiguousObservations(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	projection := &Projection{SchemaVersion: "example.dev/materials/v1", Kinds: map[string]string{
+		"one": "archive", "two": "archive",
+	}}
+	for _, test := range []struct {
+		name         string
+		observations []Observation
+	}{
+		{name: "mixed architecture", observations: []Observation{
+			{Binding: "one", Component: "one", Kind: "raw", Architecture: "amd64", Digest: digest},
+			{Binding: "two", Component: "two", Kind: "raw", Architecture: "arm64", Digest: digest},
+		}},
+		{name: "duplicate component", observations: []Observation{
+			{Binding: "one", Component: "component", Kind: "raw", Architecture: "arm64", Digest: digest},
+			{Binding: "two", Component: "component", Kind: "raw", Architecture: "arm64", Digest: digest},
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw, err := MarshalProjected(test.observations, projection)
+			if raw != nil || errorCode(err) != e.CodeInvalidCatalog {
+				t.Fatalf("MarshalProjected() = %q, %v, want %s", raw, err, e.CodeInvalidCatalog)
+			}
+		})
+	}
+}
+
 func TestManifestValidationFailsClosed(t *testing.T) {
 	var absent *Manifest
 	if got := errorCode(absent.Validate()); got != e.CodeInvalidCatalog {
@@ -106,6 +228,7 @@ func TestManifestValidationFailsClosed(t *testing.T) {
 		{name: "component metadata", mutate: func(manifest *Manifest) { manifest.Materials[0].Component = "agent\ncomponent" }, want: e.CodeInvalidCatalog},
 		{name: "component display control", mutate: func(manifest *Manifest) { manifest.Materials[0].Component = "agent\u202ecomponent" }, want: e.CodeInvalidCatalog},
 		{name: "kind metadata", mutate: func(manifest *Manifest) { manifest.Materials[0].Kind = "" }, want: e.CodeInvalidCatalog},
+		{name: "kind whitespace", mutate: func(manifest *Manifest) { manifest.Materials[0].Kind = "host package" }, want: e.CodeInvalidCatalog},
 		{name: "missing architecture", mutate: func(manifest *Manifest) { manifest.Materials[0].Architecture = "" }, want: e.CodeInvalidCatalog},
 		{name: "unsupported architecture", mutate: func(manifest *Manifest) { manifest.Materials[0].Architecture = "riscv64" }, want: e.CodeInvalidCatalog},
 		{name: "mixed architecture", mutate: func(manifest *Manifest) { manifest.Materials[0].Architecture = "amd64" }, want: e.CodeInvalidCatalog},
