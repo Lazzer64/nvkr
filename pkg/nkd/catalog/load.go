@@ -10,6 +10,7 @@ import (
 	"strings"
 	"text/template"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/aicr"
@@ -717,6 +718,12 @@ func validatePackerConfig(name string, config *PackerConfig) error {
 			"component %q: packer.buildName %q must be a bounded exact Packer build name without list or glob syntax",
 			name, config.BuildName)
 	}
+	if !validPackerTransportValue(config.PackerVersion, 64) ||
+		strings.TrimSpace(config.PackerVersion) != config.PackerVersion ||
+		strings.IndexFunc(config.PackerVersion, unicode.IsSpace) >= 0 {
+		return e.New(e.CodeInvalidCatalog,
+			"component %q: packer.packerVersion must be an exact bounded version", name)
+	}
 	variableNames := sortedStringKeys(config.Variables)
 	publicVariables := make([]packertransport.Variable, 0, len(variableNames))
 	for _, variableName := range variableNames {
@@ -724,11 +731,28 @@ func validatePackerConfig(name string, config *PackerConfig) error {
 			Name: variableName, Value: config.Variables[variableName],
 		})
 	}
-	if err := packertransport.ValidateVariables([]string{
+	reserved := []string{
 		config.ArchitectureVariable,
+		config.AcceleratorVariable,
 		config.MaterialManifestVariable,
 		config.OutputDirectoryVariable,
-	}, publicVariables); err != nil {
+	}
+	if (config.SSHPrivateKeyVariable == "") != (config.SSHPublicKeyVariable == "") {
+		return e.New(e.CodeInvalidCatalog,
+			"component %q must declare both Packer SSH key variables or neither", name)
+	}
+	if config.SSHPrivateKeyVariable != "" {
+		reserved = append(reserved, config.SSHPrivateKeyVariable, config.SSHPublicKeyVariable)
+	}
+	for _, optional := range []string{
+		config.BuildLogDirectoryVariable,
+		config.HTTPDirectoryVariable,
+	} {
+		if optional != "" {
+			reserved = append(reserved, optional)
+		}
+	}
+	if err := packertransport.ValidateVariables(reserved, publicVariables); err != nil {
 		return e.Wrap(e.CodeInvalidCatalog, err,
 			"component %q has invalid Packer variable bindings", name)
 	}
