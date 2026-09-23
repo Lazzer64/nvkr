@@ -44,8 +44,9 @@ Definition has no disk variant, encryption boolean, build command, or Packer fie
 and production details. Definition schema validation, catalog resolution, and compiler-only Run Plan lowering
 are supported. The Plan points the lifecycle output at the root producer's exact disk artifact and carries typed
 command/Packer, disk, public-variable, material-edge, execution-class, and host-toolchain inputs. It does not
-wrap the QCOW2 as a binary bundle. Local or hosted execution, generated jobs, observation, evidence, and
-publication still fail with `engine-capability` before source, subprocess, or output work.
+wrap the QCOW2 as a binary bundle. Local unencrypted direct-Packer execution and held-QCOW2 observation are
+supported as described below. Hosted and qualified execution, generated VM jobs, FDE, full-disk evidence, and
+disk publication remain unsupported and fail with `engine-capability` before source, subprocess, or output work.
 
 Definition v4, Run/Release v3, and compiled Run Plan/artifact graph v4 records reject the
 retired cluster, role, category and composition fields. Signer policy roles remain a distinct security concept.
@@ -61,9 +62,14 @@ partially completed plan and exposes no independently authored CompileSpec or Ex
 snapshot; subsequent caller mutation cannot change execution. `factory` owns Run scheduling/execution and
 provider generation. Its typed payload observer rechecks binary, APT, Helm and image outputs against their
 exact planned producer inputs; lifecycle retains frozen requirements and outer publication membership.
-Disk outputs use factory's concrete in-process `LocalRunResult` and held-QCOW2 observer. Lifecycle closes that
-result before committing a successful or failed observation record; serialized descriptions cannot restore
-the held capability. This observation contract does not enable production VM execution or disk publication.
+Disk outputs use factory's concrete in-process `LocalRunResult` and held-QCOW2 observer. Lifecycle stages the
+observed bytes beneath its immutable attempt workspace while the held capability rechecks their digest, syncs
+the read-only file, binds the observation, and closes the held result. An explicit attempt transaction then
+commits the QCOW2 and successful Run record together. After successful rollback, a commit failure records a
+failed Run. Its durable marker makes interruption
+distinct from completion on a reused attempt. Marker removal plus attempt-directory sync is the success commit
+point; handle cleanup after it is non-authoritative. Serialized descriptions cannot restore the held capability,
+and callers cannot select an export path. This local retention contract does not enable disk publication.
 `delivery` owns checked publication membership and canonical release-content identity;
 Release consumers do not reconstruct compiler bindings. Existing domain modules retain their
 canonical, trust, evidence, status and release invariants. `client/v1` is a context-first facade,

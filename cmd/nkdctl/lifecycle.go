@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -49,6 +51,12 @@ func cmdDefinition() *cli.Command {
 }
 
 func cmdRun() *cli.Command {
+	return cmdRunWithLocalExecutor(lifecycle.ExecuteLocal)
+}
+
+type localLifecycleExecutor func(context.Context, *lifecycle.PreparedRun, lifecycle.LocalOptions) (*lifecycle.Run, error)
+
+func cmdRunWithLocalExecutor(executeLocal localLifecycleExecutor) *cli.Command {
 	generationFlags := append(lifecycleInputFlags(), &cli.StringFlag{Name: "engine", Value: factory.EngineGitHub, Usage: "hosted CI adapter: github"})
 	return &cli.Command{Name: "run", Usage: "plan, generate, and execute Definition runs", Subcommands: []*cli.Command{
 		{Name: "finalize", Hidden: true, Usage: "finalize one generated hosted Run from restored carriers", Flags: append(lifecycleInputFlags(),
@@ -108,18 +116,41 @@ func cmdRun() *cli.Command {
 			if err != nil {
 				return err
 			}
-			result, err := lifecycle.ExecuteLocal(c.Context, prepared, lifecycle.LocalOptions{AttemptsRoot: c.String("attempts-root"), RunnerSource: c.String("runner-source"), Jobs: c.Int("jobs"), Runtime: c.String("runtime"), Go: c.String("go"), Publish: c.Bool("publish"), DryRun: c.Bool("dry-run"), Stdout: os.Stdout, Stderr: os.Stderr})
+			result, err := executeLocal(c.Context, prepared, lifecycle.LocalOptions{AttemptsRoot: c.String("attempts-root"), RunnerSource: c.String("runner-source"), Jobs: c.Int("jobs"), Runtime: c.String("runtime"), Go: c.String("go"), Publish: c.Bool("publish"), DryRun: c.Bool("dry-run"), Stdout: os.Stdout, Stderr: os.Stderr})
 			if err != nil {
+				if result != nil && result.Status == lifecycle.RunComplete {
+					if reportErr := printLocalRunResult(c, result); reportErr != nil {
+						return e.Wrap(e.CodeImmutableViolation, errors.Join(err, reportErr),
+							"completed local Run was retained, but reporting its outputs and commit cleanup both failed")
+					}
+					return e.Wrap(e.CodeImmutableViolation, err,
+						"completed local Run and outputs were retained, but commit cleanup is incomplete")
+				}
 				return err
 			}
-			workspace := filepath.Join(c.String("attempts-root"), c.String("attempt"))
-			fmt.Printf("\nattempt: %s\nrun: %s\nlane: %s\nstatus: %s\nobserved outputs: %d\n", result.Attempt, result.PlanDigest, result.Lane, result.Status, len(result.Observed))
-			if !c.Bool("dry-run") {
-				fmt.Printf("record: %s\n", filepath.Join(workspace, "lifecycle.json"))
-			}
-			return nil
+			return printLocalRunResult(c, result)
 		}},
 	}}
+}
+
+func printLocalRunResult(c *cli.Context, result *lifecycle.Run) error {
+	workspace := filepath.Join(c.String("attempts-root"), c.String("attempt"))
+	fmt.Printf("\nattempt: %s\nrun: %s\nlane: %s\nstatus: %s\nobserved outputs: %d\n", result.Attempt, result.PlanDigest, result.Lane, result.Status, len(result.Observed))
+	if c.Bool("dry-run") {
+		return nil
+	}
+	fmt.Printf("record: %s\n", filepath.Join(workspace, "lifecycle.json"))
+	for _, observed := range result.Observed {
+		if observed.Kind != lifecycle.OutputDiskImage {
+			continue
+		}
+		path, err := lifecycle.LocalDiskOutputPath(workspace, observed.Name)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("disk: %s\n", path)
+	}
+	return nil
 }
 
 func compileLifecycleInput(c *cli.Context) (*factory.Plan, error) {

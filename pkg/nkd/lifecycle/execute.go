@@ -26,8 +26,44 @@ type LocalOptions struct {
 // ExecuteLocal performs one new attempt and independently observes every output
 // before binding observations. Existing attempt storage is immutable.
 func ExecuteLocal(ctx context.Context, prepared *PreparedRun, options LocalOptions) (*Run, error) {
+	return executeLocalWithFactoryRunner(ctx, prepared, options,
+		func(ctx context.Context, plan *factory.Plan, options factory.LocalRunOptions) (localExecutionResult, error) {
+			return factory.RunLocal(ctx, plan, options)
+		})
+}
+
+type localExecutionResult interface {
+	diskPayloadObserver
+	QualificationLane() string
+	Close() error
+}
+
+type localFactoryRunner func(context.Context, *factory.Plan, factory.LocalRunOptions) (localExecutionResult, error)
+
+type localExecutionDependencies struct {
+	admitLocal       func(context.Context, *factory.Plan, factory.LocalRunOptions) error
+	runFactory       localFactoryRunner
+	writeRecordState func(context.Context, string, *Run) (bool, error)
+	beginDiskCommit  func(string) (*diskAttemptTransaction, error)
+}
+
+func executeLocalWithFactoryRunner(ctx context.Context, prepared *PreparedRun, options LocalOptions,
+	runFactory localFactoryRunner,
+) (*Run, error) {
+	return executeLocalWithDependencies(ctx, prepared, options, localExecutionDependencies{
+		admitLocal: factory.AdmitLocal, runFactory: runFactory, writeRecordState: writeRunRecordState,
+		beginDiskCommit: beginDiskAttemptTransaction,
+	})
+}
+
+func executeLocalWithDependencies(ctx context.Context, prepared *PreparedRun, options LocalOptions,
+	deps localExecutionDependencies,
+) (*Run, error) {
 	if prepared == nil || prepared.plan == nil || prepared.run == nil {
 		return nil, e.New(e.CodeUsage, "local execution requires a prepared run")
+	}
+	if deps.admitLocal == nil || deps.runFactory == nil || deps.writeRecordState == nil || deps.beginDiskCommit == nil {
+		return nil, e.New(e.CodeInternal, "local execution dependencies are incomplete")
 	}
 	root := options.AttemptsRoot
 	if root == "" {
@@ -38,11 +74,14 @@ func ExecuteLocal(ctx context.Context, prepared *PreparedRun, options LocalOptio
 	factoryOptions := factory.LocalRunOptions{Workspace: workspace, RunnerSource: options.RunnerSource,
 		Jobs: options.Jobs, Runtime: options.Runtime, Go: options.Go, Publish: options.Publish,
 		DryRun: options.DryRun, Stdout: options.Stdout, Stderr: options.Stderr}
-	if err := factory.AdmitLocal(ctx, prepared.plan, factoryOptions); err != nil {
+	// Workspace-independent admission always precedes immutable attempt
+	// reservation. RunLocal owns only the later held-workspace, capacity, and
+	// KVM admission for disk plans.
+	if err := deps.admitLocal(ctx, prepared.plan, factoryOptions); err != nil {
 		return nil, err
 	}
 	if options.DryRun {
-		if _, err := factory.RunLocal(ctx, prepared.plan, factoryOptions); err != nil {
+		if _, err := deps.runFactory(ctx, prepared.plan, factoryOptions); err != nil {
 			return nil, err
 		}
 		description := prepared.Description()
@@ -53,12 +92,12 @@ func ExecuteLocal(ctx context.Context, prepared *PreparedRun, options LocalOptio
 			return nil, e.Wrap(e.CodeImmutableViolation, err, "creating run attempts root")
 		}
 		if err := os.Mkdir(workspace, 0o700); errors.Is(err, os.ErrExist) {
-			return nil, e.New(e.CodeImmutableViolation, "run attempt %q already exists", prepared.run.Attempt)
+			return nil, describeExistingAttempt(workspace, prepared.run.Attempt)
 		} else if err != nil {
 			return nil, e.Wrap(e.CodeImmutableViolation, err, "reserving run attempt storage")
 		}
 	}
-	result, err := factory.RunLocal(ctx, prepared.plan, factoryOptions)
+	result, err := deps.runFactory(ctx, prepared.plan, factoryOptions)
 	if err != nil {
 		return recordRunFailure(ctx, recordPath, prepared.run, err, "recording failed run attempt")
 	}
@@ -67,36 +106,93 @@ func ExecuteLocal(ctx context.Context, prepared *PreparedRun, options LocalOptio
 	}
 	defer func() { _ = result.Close() }()
 	runForObservation := prepared.Description()
-	runForObservation.Lane = result.Qualification.String()
+	runForObservation.Lane = result.QualificationLane()
 	artifacts := make(map[string]factory.Artifact, len(prepared.plan.Graph.Artifacts))
 	for _, artifact := range prepared.plan.Graph.Artifacts {
 		artifacts[artifact.ID] = artifact
 	}
-	observed, err := observeOutputs(ctx, workspace, prepared.run.Expected, artifacts, prepared.plan, result)
+	diskExports := newDiskExportTransaction(workspace)
+	observed, err := observeOutputsWithDiskStaging(ctx, workspace, prepared.run.Expected,
+		artifacts, prepared.plan, result, diskExports.observe)
 	if err != nil {
-		return recordRunFailure(ctx, recordPath, &runForObservation,
-			closeLocalExecutionResult(result, err), "recording failed run attempt")
+		cause := closeLocalExecutionResult(result, err)
+		if cleanupErr := cleanupDiskExports(diskExports.stages, false); cleanupErr != nil {
+			return nil, diskCleanupFailure(cause, cleanupErr)
+		}
+		return recordRunFailure(ctx, recordPath, &runForObservation, cause, "recording failed run attempt")
 	}
 	bound, err := bindObserved(&runForObservation, observed)
 	if err != nil {
-		return recordRunFailure(ctx, recordPath, &runForObservation,
-			closeLocalExecutionResult(result, err), "recording failed run attempt")
+		cause := closeLocalExecutionResult(result, err)
+		if cleanupErr := cleanupDiskExports(diskExports.stages, false); cleanupErr != nil {
+			return nil, diskCleanupFailure(cause, cleanupErr)
+		}
+		return recordRunFailure(ctx, recordPath, &runForObservation, cause, "recording failed run attempt")
 	}
 	bound, err = bindReleaseContent(prepared.plan, bound)
 	if err != nil {
-		return recordRunFailure(ctx, recordPath, &runForObservation,
-			closeLocalExecutionResult(result, err), "recording failed run attempt")
+		cause := closeLocalExecutionResult(result, err)
+		if cleanupErr := cleanupDiskExports(diskExports.stages, false); cleanupErr != nil {
+			return nil, diskCleanupFailure(cause, cleanupErr)
+		}
+		return recordRunFailure(ctx, recordPath, &runForObservation, cause, "recording failed run attempt")
 	}
 	if err := result.Close(); err != nil {
+		if cleanupErr := cleanupDiskExports(diskExports.stages, false); cleanupErr != nil {
+			return nil, diskCleanupFailure(err, cleanupErr)
+		}
 		return recordRunFailure(ctx, recordPath, &runForObservation, err, "recording failed run attempt")
 	}
-	if err := writeRunRecord(ctx, recordPath, bound); err != nil {
-		return nil, err
+	// Ordinary outputs retain the original immutable-record path. The disk
+	// marker transaction is needed only when held disk bytes were staged and
+	// must be committed atomically with the Run record.
+	if len(diskExports.stages) == 0 {
+		if _, err := deps.writeRecordState(ctx, recordPath, bound); err != nil {
+			return nil, err
+		}
+		return bound, nil
 	}
+	attemptTransaction, err := deps.beginDiskCommit(workspace)
+	if err != nil {
+		if cleanupErr := cleanupDiskExports(diskExports.stages, false); cleanupErr != nil {
+			return nil, diskCleanupFailure(err, cleanupErr)
+		}
+		return recordRunFailure(ctx, recordPath, &runForObservation, err, "recording failed run attempt")
+	}
+	if err := commitDiskExports(diskExports.stages); err != nil {
+		rollbackErr := attemptTransaction.rollback(false, diskExports.stages)
+		if rollbackErr != nil {
+			return nil, diskCleanupFailure(err, rollbackErr)
+		}
+		return recordRunFailure(ctx, recordPath, &runForObservation, err, "recording failed run attempt")
+	}
+	recordLinked, err := deps.writeRecordState(ctx, recordPath, bound)
+	if err != nil {
+		rollbackErr := attemptTransaction.rollback(recordLinked, diskExports.stages)
+		if rollbackErr != nil {
+			return nil, e.Wrap(e.CodeImmutableViolation, errors.Join(err, rollbackErr),
+				"committing run record and rolling back disk outputs")
+		}
+		return recordRunFailure(ctx, recordPath, &runForObservation, err,
+			"recording failed run after local disk commit rollback")
+	}
+	if err := attemptTransaction.complete(); err != nil {
+		// The immutable record and byte-verified disk outputs are already
+		// committed. Marker cleanup cannot revoke that successful result.
+		releaseDiskExportHandles(diskExports.stages)
+		if closeErr := attemptTransaction.close(); closeErr != nil {
+			return bound, e.Wrap(e.CodeImmutableViolation, errors.Join(err, closeErr),
+				"closing completed local disk transaction after cleanup failure")
+		}
+		return bound, err
+	}
+	// Marker-directory sync is the durable success commit point. Descriptor
+	// close cannot change the completed outcome after it.
+	releaseDiskExportHandles(diskExports.stages)
 	return bound, nil
 }
 
-func closeLocalExecutionResult(result *factory.LocalRunResult, cause error) error {
+func closeLocalExecutionResult(result localExecutionResult, cause error) error {
 	closeErr := result.Close()
 	if closeErr == nil {
 		return cause
@@ -111,4 +207,9 @@ func closeLocalExecutionResult(result *factory.LocalRunResult, cause error) erro
 	}
 	return e.Wrap(code, errors.Join(cause, closeErr),
 		"local Run failed and closing disk results also failed")
+}
+
+func diskCleanupFailure(cause, cleanup error) error {
+	return e.Wrap(e.CodeImmutableViolation, errors.Join(cause, cleanup),
+		"local Run failed and durable disk cleanup also failed")
 }
