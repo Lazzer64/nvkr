@@ -13,11 +13,12 @@ for a deeper environment walkthrough and **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.
 git clone https://github.com/NVIDIA/nke-recipes && cd nke-recipes
 make help          # list all targets
 make build         # compile bin/nkdctl; catalogs are supplied explicitly
-make check         # the full local gate: fmt-check + vet + lint + shellcheck + test
+make check         # the full local gate, including the Go vulnerability check
 ```
 
-- [`.go-version`](.go-version) records the supported Go major/minor used by CI. `make` keeps
-  `GOTOOLCHAIN=local` to prevent an implicit download; it does not claim an exact local compiler-byte identity.
+- [`.go-version`](.go-version) pins the exact Go patch used by CI. The local
+  build and vulnerability gates require the same patch, while `GOTOOLCHAIN=local`
+  prevents an implicit toolchain download.
 - **`make test`** runs pure logic with the race detector — no Docker needed.
 - Active local **development producer** paths such as `build` (and the build phase of an applicable `attest` or
   `bake-off`) need **Docker + git** and network for their fetch step. The ordinary `build` path is unqualified.
@@ -27,8 +28,11 @@ make check         # the full local gate: fmt-check + vet + lint + shellcheck + 
 
 ## Local development equals CI
 
-CI (`.github/workflows/merge-gate.yaml`) runs the same format, vet, lint, and race-test gates as
-`make check`, then also compiles the binary. Run `make check` and `make build` before opening a PR.
+CI (`.github/workflows/merge-gate.yaml`) runs the same format, vet, lint,
+shellcheck, race-test, and Go vulnerability checks as `make check`, then also
+compiles the binary. Run `make check` and `make build` before opening a PR. The
+vulnerability check needs access to the Go vulnerability database; see the
+[maintainer procedure](docs/cve-management.md) for triage and scope.
 
 ## The invariants your change must respect
 
@@ -159,3 +163,5 @@ refactor(environment)!: derive publication routes from one prefix
 
 Open a GitHub issue with repro steps and the coded error/exit status where relevant. For security
 issues, follow **[SECURITY.md](SECURITY.md)** instead of filing a public issue.
+See the [GitHub issue and PR management procedure](docs/github-issue-pr-management.md)
+for triage, priority ownership, and Discussions routing.

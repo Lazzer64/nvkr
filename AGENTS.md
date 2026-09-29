@@ -90,7 +90,7 @@ retains its original scope; superseded requirements and plans are available only
 ## Commands
 
 ```sh
-make check          # full local gate: fmt-check → vet → lint → shellcheck → test (run before pushing)
+make check          # full local gate: fmt-check → vet → lint → shellcheck → test → vulncheck (run before pushing)
 make test           # unit tests with -race and coverage
 make lint           # golangci-lint v2 (.golangci.yml)
 make build          # build bin/nkdctl
@@ -206,13 +206,17 @@ go test ./... -count=1
 go test -race ./... -count=1
 go vet ./...
 golangci-lint run
+make shellcheck
+make vulncheck
 git diff --check
 ```
 
-`make check` is the same gate plus shellcheck. Tests that need local listeners may require execution outside a
-restricted sandbox. The `-race` gate has historically differed between macOS and Linux; when a change touches
-`pkg/nkd/sign` or `pkg/nkd/pipeline`, run it on Linux too. Record external operational evidence separately from
-the contract suite.
+`make check` runs the repository gate, including shellcheck and the Go vulnerability scan. The direct commands
+above also include uncached tests and `git diff --check`. Tests that need local listeners may require execution
+outside a restricted sandbox. `make vulncheck` needs access to the Go module proxy and vulnerability database;
+run it with network access or report it as unverified. The `-race` gate has historically differed between macOS
+and Linux; when a change touches `pkg/nkd/sign` or `pkg/nkd/pipeline`, run it on Linux too. Record external
+operational evidence separately from the contract suite.
 
 ## Troubleshooting
 
