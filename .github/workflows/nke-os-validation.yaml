@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Companion implementation: https://github.com/dsx-ai-factory/nke-recipes/pull/59
-# Merge this trusted workflow first; full mode remains fail-closed until #59 lands.
+# Full mode runs only from this trusted main workflow. A pre-merge candidate
+# requires an exact copy-pr-bot mirror. Candidate code receives the pinned
+# private NKE source and a network-capable KVM runner, but never its credential.
 
 name: NKE OS validation
 
@@ -17,10 +19,8 @@ on:
         required: false
         type: string
       arch:
-        description: Native architecture; ARM64 is the default until maintained AMD64 inputs land
+        description: Native architecture for toolchain or full image validation
         required: true
-        # AMD64 remains an explicit selection until its maintained Definition
-        # and native toolchain identity land in the companion change.
         default: arm64
         type: choice
         options: [both, amd64, arm64]
@@ -53,6 +53,7 @@ jobs:
       commit: ${{ steps.select.outputs.commit }}
       legs: ${{ steps.select.outputs.legs }}
       mode: ${{ steps.select.outputs.mode }}
+      mirror_pr: ${{ steps.select.outputs.mirror_pr }}
       nke_commit: ${{ steps.source.outputs.commit }}
       nke_tree: ${{ steps.source.outputs.tree }}
       retain_qcow2: ${{ steps.select.outputs.retain_qcow2 }}
@@ -102,20 +103,22 @@ jobs:
               echo "mirror_pr must be a positive pull request number" >&2
               exit 1
             fi
-            mirror_ref="refs/remotes/origin/pull-request/${mirror_pr}"
-            if ! git show-ref --verify --quiet "${mirror_ref}"; then
+            mirror_commit="$(gh api "repos/${REPOSITORY}/git/ref/heads/pull-request/${mirror_pr}" --jq '.object.sha')" || {
               echo "copy-pr-bot mirror pull-request/${mirror_pr} is unavailable" >&2
               exit 1
-            fi
-            mirror_commit="$(git rev-parse "${mirror_ref}^{commit}")"
-            IFS=$'\t' read -r pr_commit pr_state pr_repo < <(
-              gh api "repos/${REPOSITORY}/pulls/${mirror_pr}" \
-                --jq '[.head.sha, .state, .head.repo.full_name] | @tsv'
-            )
+            }
+            pr_json="$(gh api "repos/${REPOSITORY}/pulls/${mirror_pr}")" || {
+              echo "unable to inspect PR ${mirror_pr}" >&2
+              exit 1
+            }
+            IFS=$'\t' read -r pr_commit pr_state pr_repo pr_base pr_draft <<<"$(
+              jq -r '[.head.sha, .state, .head.repo.full_name, .base.ref, .draft] | @tsv' <<<"${pr_json}"
+            )"
             if [[ "${mirror_commit}" != "${commit}" || "${pr_commit}" != "${commit}" ||
-                  "${pr_state}" != open || "${pr_repo}" != "${REPOSITORY}" ]]; then
-              echo "commit_sha ${commit} is not the authenticated open in-repository PR ${mirror_pr} tip" >&2
-              echo "mirror=${mirror_commit} head=${pr_commit} state=${pr_state} repository=${pr_repo}" >&2
+                  "${pr_state}" != open || "${pr_repo}" != "${REPOSITORY}" ||
+                  "${pr_base}" != main || "${pr_draft}" != false ]]; then
+              echo "commit_sha ${commit} is not the authenticated, ready in-repository PR ${mirror_pr} tip" >&2
+              echo "mirror=${mirror_commit} head=${pr_commit} state=${pr_state} repository=${pr_repo} base=${pr_base} draft=${pr_draft}" >&2
               exit 1
             fi
           else
@@ -129,10 +132,11 @@ jobs:
             amd64='{"arch":"amd64","runner":"ubuntu-24.04"}'
             arm64='{"arch":"arm64","runner":"ubuntu-24.04-arm"}'
           else
-            # Full builds declare the two operator-provisioned KVM pools. An
-            # actual successful job is still required to prove repository access.
-            amd64='{"arch":"amd64","runner":"linux-amd64-gpu-l4-latest-1"}'
-            arm64='{"arch":"arm64","runner":"nke-recipes-arm64-16c64g"}'
+            # NKE main uses arc-arm64-kvm; NKE PR #1100 selects
+            # arc-amd64-kvm. Neither establishes access from nke-recipes;
+            # verify both scale sets are granted before a full dispatch.
+            amd64='{"arch":"amd64","runner":"arc-amd64-kvm"}'
+            arm64='{"arch":"arm64","runner":"arc-arm64-kvm"}'
           fi
           case "${arch}" in
             amd64) legs="[${amd64}]" ;;
@@ -144,6 +148,7 @@ jobs:
             echo "commit=${commit}"
             echo "legs=${legs}"
             echo "mode=${mode}"
+            echo "mirror_pr=${mirror_pr}"
             echo "retain_qcow2=${retain_qcow2}"
           } >>"${GITHUB_OUTPUT}"
 
@@ -168,8 +173,66 @@ jobs:
       - name: Resolve the recipe-owned NKE source pin
         id: source
         if: steps.select.outputs.mode == 'full'
+        env:
+          VALIDATED_LEGS: ${{ steps.select.outputs.legs }}
         run: |
           set -euo pipefail
+          mapfile -t required_arches < <(jq -r '.[].arch' <<<"${VALIDATED_LEGS}")
+          for target_arch in "${required_arches[@]}"; do
+            input_dir=.candidate-inputs/definitions/nke-os
+            test -f "${input_dir}/definition-${target_arch}-kvm.yaml" || {
+              echo "missing maintained ${target_arch} KVM Definition" >&2
+              exit 1
+            }
+            test -f "${input_dir}/environment-local-linux-${target_arch}-docker.yaml" || {
+              echo "missing maintained ${target_arch} Docker Environment" >&2
+              exit 1
+            }
+          done
+          # Reject drift in locked toolchain source pins. Candidate build scripts
+          # and the resulting image remain untrusted diagnostic inputs; this
+          # comparison does not establish a toolchain trust boundary.
+          candidate_lock=.candidate-inputs/toolchains/nkd-packer/toolchain.lock.json
+          test -f "${candidate_lock}" || {
+            echo "candidate toolchain lock is missing" >&2
+            exit 1
+          }
+          jq -n -e --slurpfile candidate "${candidate_lock}" \
+            --slurpfile reviewed toolchains/nkd-packer/toolchain.lock.json '
+            def valid_ids:
+              type == "object" and
+              (keys | sort) == ["amd64", "arm64"] and
+              all(.[]; . == null or (type == "string" and test("^sha256:[0-9a-f]{64}$")));
+            ($candidate | length) == 1 and ($reviewed | length) == 1 and
+            ($candidate[0] as $input |
+              ($reviewed[0] | del(.localImages, .localPodmanImages, .localDockerImages)) as $trusted |
+              ($input | del(.localImages, .localPodmanImages, .localDockerImages)) == $trusted and
+              if $input | has("localImages") then
+                ($input | has("localPodmanImages") | not) and
+                ($input | has("localDockerImages") | not) and
+                ($input.localImages | valid_ids)
+              else
+                ($input | has("localPodmanImages")) and
+                ($input | has("localDockerImages")) and
+                ($input.localPodmanImages | valid_ids) and
+                ($input.localDockerImages | valid_ids)
+              end)
+          ' >/dev/null || {
+            jq -n -r --slurpfile candidate "${candidate_lock}" \
+              --slurpfile reviewed toolchains/nkd-packer/toolchain.lock.json '
+              if ($candidate | length) != 1 then
+                "candidate lock must contain exactly one JSON document"
+              else
+                ($candidate[0] | del(.localImages, .localPodmanImages, .localDockerImages)) as $input |
+                ($reviewed[0] | del(.localImages, .localPodmanImages, .localDockerImages)) as $trusted |
+                [($input | keys[]), ($trusted | keys[])] | unique |
+                map(select($input[.] != $trusted[.])) |
+                "mismatched locked fields: " + join(", ")
+              end
+            ' >&2 || true
+            echo "candidate toolchain pins or local image IDs are invalid; use toolchain mode or land reviewed pins first" >&2
+            exit 1
+          }
           pin="$(bin/nkdctl catalog source-pin \
             --data .candidate-inputs/definitions/nke-os/catalog nke-os)"
           {
@@ -177,9 +240,9 @@ jobs:
             echo "tree=$(jq -er '.treeHash' <<<"${pin}")"
           } >>"${GITHUB_OUTPUT}"
 
-      # The candidate recipe remains authoritative for the exact NKE pin. This
-      # independent dispatch value makes the trusted operator authorize that pin
-      # before the repository credential can be used to acquire it.
+      # The candidate recipe owns the exact NKE pin. The dispatch value must
+      # match it before the separate source-fetch job receives its credential;
+      # this check is not an independent authorization of candidate code.
       - name: Authorize the NKE source pin
         if: steps.select.outputs.mode == 'full'
         env:
@@ -247,7 +310,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: nke-os-${{ matrix.arch }}-toolchain-${{ needs.select.outputs.commit }}
+          name: nke-os-${{ matrix.arch }}-toolchain-${{ needs.select.outputs.commit }}-${{ github.run_attempt }}
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 14
@@ -322,8 +385,27 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.select.outputs.legs) }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    timeout-minutes: 420
     steps:
+      - name: Admit native KVM runner
+        run: |
+          set -euo pipefail
+          if [[ ! -c /dev/kvm ]]; then
+            echo "::error::Missing /dev/kvm for ${{ matrix.arch }}"
+            exit 1
+          fi
+          # ARC runs in a container without udev. Match the NKE OS workflow's
+          # fallback, which changes the host-bind-mounted device beyond this
+          # pod. Grant KVM group access or use a device plugin in the scale set.
+          if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+            sudo chmod 666 /dev/kvm
+          fi
+          # This only proves the runner can open KVM. NKD passes its held fd
+          # through Docker as /proc/<runner-pid>/fd/<fd>; the first full build
+          # must prove the daemon can resolve that path on this ARC topology.
+          exec 3<>/dev/kvm
+          exec 3>&-
+
       - name: Download exact NKE source handoff
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -357,9 +439,12 @@ jobs:
         working-directory: .candidate
         env:
           CANDIDATE_COMMIT: ${{ needs.select.outputs.commit }}
+          MIRROR_PR: ${{ needs.select.outputs.mirror_pr }}
           NKE_COMMIT: ${{ needs.select.outputs.nke_commit }}
           NKE_TREE: ${{ needs.select.outputs.nke_tree }}
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_SHA: ${{ github.sha }}
           RUNNER_ARCH: ${{ runner.arch }}
           RUNNER_NAME: ${{ runner.name }}
           RUNNER_OS: ${{ runner.os }}
@@ -367,19 +452,26 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .nkd/evidence
+          candidate_tree="$(git rev-parse 'HEAD^{tree}')"
           jq -n \
             --arg scope unqualified-diagnostic \
             --arg candidateCommit "${CANDIDATE_COMMIT}" \
+            --arg candidateTree "${candidate_tree}" \
+            --arg mirrorPR "${MIRROR_PR}" \
             --arg nkeCommit "${NKE_COMMIT}" \
             --arg nkeTree "${NKE_TREE}" \
             --arg runID "${RUN_ID}" \
+            --arg runAttempt "${RUN_ATTEMPT}" \
+            --arg workflowSHA "${WORKFLOW_SHA}" \
             --arg runnerName "${RUNNER_NAME}" \
             --arg runnerOS "${RUNNER_OS}" \
             --arg runnerArch "${RUNNER_ARCH}" \
             --arg targetArch "${TARGET_ARCH}" \
             '{schemaVersion:"nkd.dev/nke-os-validation/v1", scope:$scope,
-              candidateCommit:$candidateCommit, nkeCommit:$nkeCommit, nkeTree:$nkeTree,
-              runID:$runID, targetArch:$targetArch,
+              candidateCommit:$candidateCommit, candidateTree:$candidateTree,
+              mirrorPR:$mirrorPR, workflowSHA:$workflowSHA,
+              nkeCommit:$nkeCommit, nkeTree:$nkeTree,
+              runID:$runID, runAttempt:$runAttempt, targetArch:$targetArch,
               runner:{name:$runnerName, os:$runnerOS, arch:$runnerArch}}' \
             >.nkd/evidence/context.json
 
@@ -447,7 +539,13 @@ jobs:
           set -euo pipefail
           attempt="$(cat ".nkd/evidence/attempt-${ARCH}")"
           qcow=".nkd/runs/${attempt}/outputs/nke-node-image-${ARCH}.qcow2"
-          image="$(jq -er --arg arch "${ARCH}" '.localImages[$arch]' toolchains/nkd-packer/toolchain.lock.json)"
+          # This image was built by candidate code; the smoke result remains
+          # diagnostic and does not authenticate the toolchain or disk.
+          image="$(cat ".nkd/evidence/toolchain-${ARCH}.image-id")"
+          [[ "${image}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "missing exact observed ${ARCH} Packer toolchain image ID" >&2
+            exit 1
+          }
           mkdir -p ".nkd/boot-smoke/${ARCH}"
           identity_dir="${PWD}/.nkd/boot-smoke-identity/${ARCH}"
           install -d -m 0700 "${identity_dir}"
@@ -462,11 +560,11 @@ jobs:
             --mount "type=bind,src=${identity_dir}/passwd,dst=/etc/passwd,readonly" \
             --mount "type=bind,src=${identity_dir}/group,dst=/etc/group,readonly" \
             --volume "${GITHUB_WORKSPACE}/.trusted/nke:/nke:ro" \
-            --volume "${PWD}/${qcow}:/artifact.qcow2:ro" \
+            --volume "${PWD}/${qcow}:/nke-node-image-${ARCH}.qcow2:ro" \
             --volume "${PWD}/.nkd/boot-smoke/${ARCH}:/work:rw" \
             --env ARCH="${ARCH}" --entrypoint bash "${image}" -ec '
               ssh-keygen -q -t ed25519 -N "" -f /work/id_ed25519
-              QCOW=/artifact.qcow2 SSH_KEY=/work/id_ed25519 REQUIRE_ACCELERATION=1 \
+              QCOW=/nke-node-image-${ARCH}.qcow2 SSH_KEY=/work/id_ed25519 REQUIRE_ACCELERATION=1 \
                 /nke/os-image/packer/scripts/boot-smoke.sh
             ' 2>&1 | tee ".nkd/evidence/boot-smoke-${ARCH}.log"
 
@@ -474,7 +572,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: nke-os-${{ matrix.arch }}-evidence-${{ needs.select.outputs.commit }}
+          name: nke-os-${{ matrix.arch }}-evidence-${{ needs.select.outputs.commit }}-${{ github.run_attempt }}
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 14
@@ -488,7 +586,7 @@ jobs:
         if: success() && needs.select.outputs.retain_qcow2 == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: nke-os-${{ matrix.arch }}-qcow2-${{ needs.select.outputs.commit }}
+          name: nke-os-${{ matrix.arch }}-qcow2-${{ needs.select.outputs.commit }}-${{ github.run_attempt }}
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 3

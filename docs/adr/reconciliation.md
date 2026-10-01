@@ -121,6 +121,17 @@ direct-Packer runtime enforce the admitted mode. A Linux ARM64 Podman execution 
 non-FDE QCOW2 and recorded its digest and size. Docker and hosted execution remain unexercised, and FDE remains
 unsupported.
 
+The hand-authored NKE OS validation workflow selects `arc-amd64-kvm` and `arc-arm64-kvm` for full validation.
+At the 2026-09-30 review, NKE main used the ARM64 scale set and NKE PR #1100 selected the AMD64 set.
+Neither proves that both scale sets are granted to `nke-recipes`.
+The preflight opens `/dev/kvm` in the runner container. NKD's Docker adapter
+passes its held descriptor as `/proc/<runner-pid>/fd/<fd>` to the daemon.
+A daemon in a different PID or mount namespace may be unable to resolve that
+path. No full-mode run has proved this Docker device handoff or built an image
+on either ARC route. The workflow's `chmod` fallback follows NKE's current
+practice, but changes a host-bind-mounted device beyond the runner pod. KVM
+group access or a device plugin belongs in the scale-set configuration.
+
 The historical NKE direct-Packer source contract merged at commit
 `5ac0ce2389c06d0291535fb6bf0f25be8a4ca0f2`, tree
 `7d9b93c65c3cc8c2317b2953bca638c2203701e9`. The current development catalog instead pins NKE PR head
