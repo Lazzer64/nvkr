@@ -22,7 +22,7 @@ import (
 )
 
 func executeHelmPackage(ctx context.Context, plan *Plan, node Node, output Artifact, inputs []Artifact, artifacts map[string]Artifact, stdout io.Writer) error {
-	var imageDigest string
+	imageDigests := map[string]string{}
 	if node.HelmImage != nil {
 		var ids []string
 		for _, input := range inputs {
@@ -31,11 +31,15 @@ func executeHelmPackage(ctx context.Context, plan *Plan, node Node, output Artif
 		if err := validatePackageInputs(packageSpec{Kind: PackageHelm, HelmImage: node.HelmImage}, ids, artifacts); err != nil {
 			return err
 		}
-		image, err := inspectFactoryImage(ctx, plan, artifacts[node.HelmImage.Image])
-		if err != nil {
-			return err
+		for _, slot := range sortedKeys(node.HelmImage.Images) {
+			binding := node.HelmImage.Images[slot]
+			image, err := inspectFactoryImage(ctx, plan, artifacts[binding.From])
+			if err != nil {
+				return err
+			}
+			imageDigests[slot] = image.ManifestDigest
+			fmt.Fprintf(stdout, "Verified Helm image slot %q at %s\n", slot, image.ManifestDigest)
 		}
-		imageDigest = image.ManifestDigest
 		for _, input := range inputs {
 			if input.Kind == "tarball" {
 				inputs = []Artifact{input}
@@ -68,10 +72,10 @@ func executeHelmPackage(ctx context.Context, plan *Plan, node Node, output Artif
 	// by node.HelmImage.Chart.
 	chartPrefix := relative
 	if node.HelmImage != nil {
-		if err := bindHelmImage(ctx, filepath.Join(root, relative), node.HelmImage.Chart, imageDigest); err != nil {
+		if err := bindHelmImages(ctx, filepath.Join(root, relative), *node.HelmImage, imageDigests); err != nil {
 			return err
 		}
-		fmt.Fprintf(stdout, "Bound Helm chart %q to image %q at %s; checksums refreshed\n", node.HelmImage.Chart, artifacts[node.HelmImage.Image].Name, imageDigest)
+		fmt.Fprintf(stdout, "Bound Helm chart %q to %d image slots\n", node.HelmImage.Chart, len(imageDigests))
 		chartPrefix = filepath.Join(relative, node.HelmImage.Chart)
 	}
 	chartName, err := readHelmChartName(filepath.Join(root, chartPrefix, "Chart.yaml"))
@@ -233,9 +237,10 @@ func rerootHelmChartLayer(source, destination, wrapperRoot, prefix, chartName st
 			// itself): not chart content, safe to omit from the chart layer.
 			continue
 		case name == wrapperRoot+"/checksums.txt":
-			// bindHelmImage's own wrapper-level integrity bookkeeping (see
+			// For a nested chart, bindHelmImages' wrapper bookkeeping (see
 			// helm_binding.go), not a real Helm chart file in any chart it
 			// writes about; it was never meant to reach a published chart.
+			// A root chart owns this filename and matches the prefix case above.
 			continue
 		default:
 			// Content that lives in the wrapper alongside the bound chart but

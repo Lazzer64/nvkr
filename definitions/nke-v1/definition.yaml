@@ -4,7 +4,7 @@ catalog:
 cosignTool: cosign
 kind: Definition
 metadata:
-  description: Build the NKE CLI, CWE runtime image and quickstart Helm bundle from
+  description: Build the NKE CLI, CWE runtime image and upstream controller Helm chart from
     pinned source.
   name: nke-v1
 outputs:
@@ -17,8 +17,8 @@ outputs:
   - nke-helm
   format: helm-oci
   helm:
-    chart: 007-controller
-    imageOutput: cwe
+    images:
+      controller: cwe
   name: nke-helm
   platform: linux/amd64
 - components:
