@@ -227,22 +227,77 @@ func (codec *QemuImgCodec) envelopeLogicalDigest(ctx context.Context, format str
 	return sealed.Digest(), sealed.Size(), nil
 }
 
+// ValidateHeldEnvelope checks one existing immutable envelope without decoding
+// it or granting reproduction authority. The exact held qemu-img probe enforces
+// explicit QCOW2 format, virtual-size bounds, no encryption, no backing files
+// and no external data files. Other formats require separately admitted layouts.
+// Downstream inspectors must use this gate before exposing an image to an
+// appliance. The loader/library closure remains the enclosing runtime's TCB.
+func (codec *QemuImgCodec) ValidateHeldEnvelope(ctx context.Context, format string, input *heldfile.File) error {
+	if codec == nil {
+		return e.New(e.CodeTrustPolicyMissing, "disk inspection requires a pinned qemu-img codec")
+	}
+	if ctx == nil {
+		return e.New(e.CodeUsage, "validating a held envelope requires context")
+	}
+	if format != "qcow2" {
+		return e.New(e.CodeEngineCapability, "diagnostic envelope inspection supports only QCOW2")
+	}
+	if input == nil {
+		return e.New(e.CodeEnvelopeDecode, "validating a held envelope requires held input")
+	}
+	if err := codec.lockContext(ctx, "validating held disk envelope"); err != nil {
+		return err
+	}
+	defer codec.mu.Unlock()
+	if err := codec.requireSnapshotContext(ctx); err != nil {
+		return err
+	}
+	if err := assertHeldPreEncryption(ctx, input, "inspection subject"); err != nil {
+		return err
+	}
+	_, err := codec.probe(ctx, format, input)
+	return err
+}
+
 type qemuInfo struct {
 	Format              string `json:"format"`
 	VirtualSize         int64  `json:"virtual-size"`
 	Encrypted           bool   `json:"encrypted"`
 	BackingFilename     string `json:"backing-filename"`
 	FullBackingFilename string `json:"full-backing-filename"`
+	FormatSpecific      struct {
+		Type string `json:"type"`
+		Data struct {
+			DataFile   string `json:"data-file"`
+			CreateType string `json:"create-type"`
+			Extents    []struct {
+				Filename    string  `json:"filename"`
+				Format      *string `json:"format"`
+				VirtualSize int64   `json:"virtual-size"`
+			} `json:"extents"`
+		} `json:"data"`
+	} `json:"format-specific"`
 }
 
 func (codec *QemuImgCodec) probe(ctx context.Context, format string, input *heldfile.File) (int64, error) {
+	if format == "vmdk" {
+		if err := admitVMDKSparseInput(ctx, input); err != nil {
+			return 0, err
+		}
+	}
 	inputPath, err := heldfile.ChildPath(1)
 	if err != nil {
 		return 0, e.Wrap(e.CodeEngineCapability, err, "mapping held disk envelope for qemu-img info")
 	}
 	var stdout, stderr bytes.Buffer
 	err = heldfile.RunContext(ctx, codec.executable,
-		[]string{"info", "--output=json", inputPath},
+		// QEMU opens info inputs with BDRV_O_NO_BACKING | BDRV_O_NO_IO. VMDK
+		// descriptors can still open extents, so admit their binary subset first.
+		// QCOW2 probe pins must carry the CVE-2024-4467 data-file NO_IO fix.
+		// Never request --backing-chain: backing names are metadata to reject, not
+		// paths to open. The explicit format also prevents format autodetection.
+		[]string{"info", "-f", qemuFormat(format), "--output=json", inputPath},
 		heldfile.RunOptions{Stdout: &stdout, Stderr: &stderr}, input)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -271,6 +326,28 @@ func (codec *QemuImgCodec) probe(ctx context.Context, format string, input *held
 	if info.BackingFilename != "" || info.FullBackingFilename != "" {
 		return 0, e.New(e.CodeEnvelopeDecode,
 			"held %s envelope depends on a backing file and is not self-contained", format)
+	}
+	// QEMU's ImageInfoSpecificQCow2 reports external data-file references even
+	// under NO_IO. Reject them before a consumer opens the image for actual I/O.
+	if info.FormatSpecific.Data.DataFile != "" {
+		return 0, e.New(e.CodeEnvelopeDecode,
+			"held %s envelope depends on an external data file and is not self-contained", format)
+	}
+	if format == "vmdk" {
+		data := info.FormatSpecific.Data
+		if info.FormatSpecific.Type != "vmdk" ||
+			(data.CreateType != "monolithicSparse" && data.CreateType != "streamOptimized") ||
+			len(data.Extents) != 1 {
+			return 0, e.New(e.CodeEnvelopeDecode, "held VMDK must report one admitted sparse extent")
+		}
+		extent := data.Extents[0]
+		// QEMU 8.2.2 leaves the native binary extent type empty; descriptor
+		// extents carry labels such as SPARSE or FLAT. Require the QAPI field,
+		// allowing only the native empty label or its explicit sparse equivalent.
+		if extent.Filename != inputPath || extent.Format == nil ||
+			(*extent.Format != "" && *extent.Format != "SPARSE") || extent.VirtualSize != info.VirtualSize {
+			return 0, e.New(e.CodeEnvelopeDecode, "held VMDK extent is not bound to its complete held input")
+		}
 	}
 	return info.VirtualSize, nil
 }
