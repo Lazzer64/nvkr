@@ -172,6 +172,78 @@ on these observed runners. Mode 0666 permits access without KVM group membership
 whether it originated in scale-set configuration or an earlier host-device change. No durable permission
 baseline for newly provisioned hosts, new QCOW2 or boot test is established by this probe.
 
+## Automatic post-merge validation
+
+[Run 36933187521](https://github.com/dsx-ai-factory/nke-recipes/actions/runs/36933187521) was triggered by a
+push at `156d32c51b43c2ae8ecbfc02da117ea9ab7e07a2`. Both full architecture jobs completed successfully,
+including lifecycle build, QCOW2 identity recording, source-owned boot smoke and image upload.
+
+[Run 36939569803](https://github.com/dsx-ai-factory/nke-recipes/actions/runs/36939569803) was triggered by a
+push at `53ba88b39b049afc0928a7303e5a7c4a4eee89d5`. Its
+[AMD64 job](https://github.com/dsx-ai-factory/nke-recipes/actions/runs/36939569803/job/110628080228) completed
+those same steps successfully. Its
+[ARM64 job](https://github.com/dsx-ai-factory/nke-recipes/actions/runs/36939569803/job/110628080327) passed
+native KVM admission and the dispatcher regression, then failed while vendoring the agent's Go modules:
+
+```text
+google.golang.org/protobuf@v1.36.12: ... stream error: stream ID 31; INTERNAL_ERROR; received from peer
+```
+
+The lifecycle returned `NKD-E-FETCH-FAILED`, exit code 20, before Packer or QEMU started. Toolchain recording
+then failed because `.nkd/evidence/attempt-arm64` had not been written. Diagnostic upload succeeded; boot
+smoke and image upload were skipped. This is acquisition failure evidence, not a VM-build failure.
+
+These observations were rechecked through GitHub's run/job records and the failed ARM64 log. They establish
+automatic triggering at those exact heads, not successful execution of subsequent reliability changes.
+
+## Reliability candidate regression
+
+[Push run 36944892985](https://github.com/dsx-ai-factory/nke-recipes/actions/runs/36944892985) completed
+successfully on both full architecture legs at main commit
+`91567c2717dd195829d6a88a19a6d6e4baec3dd9`. This is successful base-code execution, not validation of
+the later reliability candidate.
+
+[Dispatch run 36958996866](https://github.com/dsx-ai-factory/nke-recipes/actions/runs/36958996866) executed
+candidate `db4b8d92d2da31e9be18064a9ab4681277f8550f` through the trusted workflow at that main commit.
+It used the NKE pin recorded above. Both full legs failed in the new module-file Git guard after download:
+the rootful vendor container could not use the differently owned checkout, so `git diff` emitted its
+`--no-index` usage and exited 129. The lifecycle returned `NKD-E-FETCH-FAILED` before Packer/QEMU.
+The main-owned toolchain-recording step also failed on the absent attempt file. Neither leg produced a QCOW2.
+
+The corrected command compares exact module-file checksums instead of invoking Git. Local fault tests cover
+metadata/ZIP transport and guard behavior. The corrected candidate's full bake is recorded below. Candidate
+dispatch cannot exercise the reordered attempt recording and outcome guards in candidate workflow YAML;
+their acceptance still requires the first post-merge main push and a clean rerun.
+
+## Corrected reliability candidate, 2026-10-02
+
+[Run 37043068395](https://github.com/dsx-ai-factory/nke-recipes/actions/runs/37043068395) completed successfully
+with both full architecture jobs. It executed NKD candidate
+`d1e28cec8d66a4aa1def782bedf88392a73cc4b2`, tree `0c0984cee6cfc78384e6405d45459e4bd08fa619`, through the
+trusted main workflow at `91567c2717dd195829d6a88a19a6d6e4baec3dd9`, using the exact NKE commit and tree
+recorded above. [ARM64 job 110958231126](https://github.com/dsx-ai-factory/nke-recipes/actions/runs/37043068395/job/110958231126)
+and [AMD64 job 110958231246](https://github.com/dsx-ai-factory/nke-recipes/actions/runs/37043068395/job/110958231246)
+passed acquisition, the lifecycle QCOW2 build, identity recording, source-owned boot smoke and image upload.
+
+| Recorded field | ARM64 | AMD64 |
+|---|---|---|
+| QCOW2 SHA-256 | `d31c8c53ccac6cc4b4a0593a45b52e94660a47e9cd7e1272323cfbbfef5bac14` | `1b8dd35744c328bc0d9dcc5ee281cc6491601fb51ea8d3bd43880a4f3de1d9b6` |
+| QCOW2 size, bytes | `3350724608` | `3622699008` |
+| Plan digest | `sha256:da34e35b1dbe41f47f0655806a5e97790e5b9ba44e1e095ffba3ca6bd717f34b` | `sha256:0570e594c997aeba57ee5ec4b7b22ad1ab7d695491d3fcafe1e454eedfafbb02` |
+| Observed toolchain image ID | `sha256:2dd4c0502dde289d10842f354cd9e860d0d468d2823a0bf80987c3af6483123c` | `sha256:782a1e6444618f86b62180b097c3f3f503eede2e8cffc201b94d9b859539e81d` |
+
+Downloaded evidence binds the candidate, trusted workflow and NKE identities separately. Each retained lifecycle
+record is `complete` in `unqualified-local-execution`, with exactly one successful, unencrypted QCOW2 observation.
+Its digest and size agree with the workflow metadata. Both boot logs confirm cloud-init completion, the NKE
+image contract and root-filesystem growth. The workflow labels these artifacts `unqualified-diagnostic`.
+
+- [ARM64 QCOW2](https://github.com/dsx-ai-factory/nke-recipes/actions/runs/37043068395/artifacts/11244063827), [ARM64 evidence](https://github.com/dsx-ai-factory/nke-recipes/actions/runs/37043068395/artifacts/11244300302)
+- [AMD64 QCOW2](https://github.com/dsx-ai-factory/nke-recipes/actions/runs/37043068395/artifacts/11245430043), [AMD64 evidence](https://github.com/dsx-ai-factory/nke-recipes/actions/runs/37043068395/artifacts/11244441294)
+
+This proves `d1e28ce`'s exact native Docker/KVM bake and boot path. It does not exercise changed workflow YAML
+or later execution inputs, generated hosted execution, publication or qualification. Actions artifacts expire;
+their compressed transport sizes are not the QCOW2 byte counts above.
+
 ## Remaining proof
 
 FDE, full-disk SBOM, publication, qualified execution, and the generated hosted VM adapter remain outside
