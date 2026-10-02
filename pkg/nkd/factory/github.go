@@ -95,12 +95,14 @@ func renderGitHub(ctx context.Context, plan *Plan, validate bool) (*GeneratedBun
 		fmt.Fprintf(&body, "    name: %s\n", yamlSingle("Prepare NKD runner ("+runner+")"))
 		fmt.Fprintf(&body, "    runs-on: %s\n", yamlSingle(runner))
 		fmt.Fprintf(&body, "    timeout-minutes: %d\n", githubSupportJobTimeoutMinutes)
+		if len(githubCatalogSourceEnvironment(plan)) > 0 {
+			fmt.Fprintf(&body, "    if: ${{ %s }}\n", githubDispatchCondition(plan))
+		}
 		fmt.Fprintf(&body, "    steps:\n")
 		actions.writeCheckoutStep(&body)
 		actions.writeSetupGoStep(&body)
 		fmt.Fprintf(&body, "      - name: Build runner from this checkout\n        run: CGO_ENABLED=0 go build -trimpath -ldflags %s -o nkd-exec ./cmd/nkdctl\n", shellQuote(linkerFlags))
-		fmt.Fprintf(&body, "      - name: Verify committed Run generation is current\n        run: %s\n",
-			generationCommand(plan, EngineGitHub))
+		writeCatalogValidationStep(&body, plan, "Verify committed Run generation is current", "validate-catalog", generationCommand(plan, EngineGitHub))
 		actions.writeUploadStep(&body, "NKD runner", "nkd-exec-"+shortStableName(runner), "nkd-exec")
 	}
 	for _, stage := range stages {
@@ -131,7 +133,7 @@ func renderGitHub(ctx context.Context, plan *Plan, validate bool) (*GeneratedBun
 			}
 		}
 		fmt.Fprintf(&body, "    needs: [%s]\n", strings.Join(needs, ", "))
-		fmt.Fprintf(&body, "    if: %s\n", stage.condition())
+		fmt.Fprintf(&body, "    if: %s\n", stage.condition(plan))
 		if githubProtectedPublication(plan, node) {
 			fmt.Fprintf(&body, "    environment: %s\n", yamlSingle(githubReleaseEnvironment))
 		}
@@ -241,7 +243,7 @@ func renderGitHub(ctx context.Context, plan *Plan, validate bool) (*GeneratedBun
 		fmt.Fprintf(&body, "    runs-on: %s\n", yamlSingle(runners[0]))
 		fmt.Fprintf(&body, "    timeout-minutes: %d\n", githubSupportJobTimeoutMinutes)
 		fmt.Fprintf(&body, "    needs: [%s]\n", strings.Join(allNeeds, ", "))
-		fmt.Fprintf(&body, "    if: ${{ always() && %s }}\n", githubExecutionCondition)
+		fmt.Fprintf(&body, "    if: ${{ always() && %s }}\n", githubDispatchCondition(plan))
 		fmt.Fprintln(&body, "    steps:")
 		actions.writeCheckoutStep(&body)
 		actions.writeDownloadStep(&body, "NKD runner", "nkd-exec-"+shortStableName(runners[0]), ".")
@@ -249,8 +251,8 @@ func renderGitHub(ctx context.Context, plan *Plan, validate bool) (*GeneratedBun
 		if err := writeGitHubFinalizerRestoreSteps(&body, plan, nodeJobs); err != nil {
 			return nil, err
 		}
-		fmt.Fprintf(&body, "      - name: Finalize Run and check completeness\n        run: ./nkd-exec run finalize --definition %s --environment %s --plan %s --attempt \"${{ github.run_id }}-${{ github.run_attempt }}\" --workspace .nkd/factory --out .nkd/run.json\n",
-			shellQuote(plan.DefinitionPath), shellQuote(plan.EnvironmentPath), shellQuote(FactoryPlanPath))
+		writeCatalogValidationStep(&body, plan, "Finalize Run and check completeness", "finalize-catalog", fmt.Sprintf("./nkd-exec run finalize --definition %s --environment %s --plan %s --attempt \"${{ github.run_id }}-${{ github.run_attempt }}\" --workspace .nkd/factory --out .nkd/run.json",
+			shellQuote(plan.DefinitionPath), shellQuote(plan.EnvironmentPath), shellQuote(FactoryPlanPath)))
 		fmt.Fprintf(&body, "      - name: Upload final Run record\n        uses: %s\n        if: ${{ always() }}\n        with:\n          name: nkd-lifecycle-run\n          path: .nkd/run.json\n          if-no-files-found: error\n", actions.Upload)
 	}
 	workflow := body.Bytes()
@@ -446,4 +448,17 @@ func sortedFileNames(files map[string][]byte) []string {
 func githubProtectedPublication(plan *Plan, node Node) bool {
 	return plan.Environment.Signing != nil && plan.Environment.Signing.Mode == SigningModeCosign &&
 		(node.Kind == NodePublish || signFamilyNode(node.Kind))
+}
+
+// The default branch is admitted unless an explicit Environment adds exact
+// branch refs. Tags, pull requests, wildcards and arbitrary dispatch refs stay closed.
+func githubDispatchCondition(plan *Plan) string {
+	if len(plan.Environment.GitHubDispatchBranches) == 0 {
+		return githubExecutionCondition
+	}
+	refs := []string{"github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"}
+	for _, branch := range plan.Environment.GitHubDispatchBranches {
+		refs = append(refs, "github.ref == 'refs/heads/"+branch+"'")
+	}
+	return "github.event_name == 'workflow_dispatch' && (" + strings.Join(refs, " || ") + ")"
 }

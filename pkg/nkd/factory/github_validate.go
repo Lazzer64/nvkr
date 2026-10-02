@@ -142,7 +142,13 @@ func ValidateGitHubBundle(ctx context.Context, plan *Plan, bundle *GeneratedBund
 			signJobs[nodeJobs[node.ID]] = true
 		}
 	}
+	catalogEnv := githubCatalogSourceEnvironment(plan)
 	for jobID, job := range document.Jobs {
+		for key := range job.Env {
+			if strings.HasPrefix(key, "NKD_PIN_SOURCE_TOKEN_") {
+				return e.New(e.CodeEngineCapability, "catalog credential cannot be job-scoped")
+			}
+		}
 		if _, present := job.Env[sourceTokenEnv]; present {
 			return e.New(e.CodeEngineCapability, "GitHub source credential must be scoped to its fetch step")
 		}
@@ -150,6 +156,17 @@ func ValidateGitHubBundle(ctx context.Context, plan *Plan, bundle *GeneratedBund
 		foundSource := false
 		for _, step := range job.Steps {
 			if len(step.Env) == 0 {
+				continue
+			}
+			if len(catalogEnv) > 0 && ((strings.HasPrefix(jobID, "build-runner-") && step.ID == "validate-catalog") || (jobID == "nkd-lifecycle-run" && step.ID == "finalize-catalog")) {
+				if !reflect.DeepEqual(step.Env, catalogEnv) {
+					return e.New(e.CodeEngineCapability, "catalog source environment differs")
+				}
+				for key := range catalogEnv {
+					if strings.HasPrefix(key, "NKD_PIN_SOURCE_TOKEN_") && !strings.Contains(step.Run, strings.ReplaceAll(requireSourceToken, sourceTokenEnv, key)) {
+						return e.New(e.CodeEngineCapability, "catalog validation must reject an empty source credential")
+					}
+				}
 				continue
 			}
 			if len(wantSourceEnv) == 0 || step.ID != jobID || len(step.Env) != len(wantSourceEnv) {
@@ -174,7 +191,7 @@ func ValidateGitHubBundle(ctx context.Context, plan *Plan, bundle *GeneratedBund
 				"GitHub job %q timeout is %d minutes; expected %d",
 				jobID, job.TimeoutMinutes, wantTimeout)
 		}
-		if jobID == "nkd-lifecycle-run" && job.If != "${{ always() && "+githubExecutionCondition+" }}" {
+		if jobID == "nkd-lifecycle-run" && job.If != "${{ always() && "+githubDispatchCondition(plan)+" }}" {
 			return e.New(e.CodeEngineCapability, "GitHub Run finalization must follow the admitted execution event even after failure")
 		}
 		// An OIDC identity token is the credential a keyless signature is minted from.
@@ -201,7 +218,11 @@ func ValidateGitHubBundle(ctx context.Context, plan *Plan, bundle *GeneratedBund
 	}
 	for runner, jobID := range bootstrap {
 		job, ok := document.Jobs[jobID]
-		if !ok || job.RunsOn != runner || job.If != "" || len(job.Steps) != 5 || job.Steps[0].Uses != actions.Checkout {
+		wantCondition := ""
+		if len(catalogEnv) > 0 {
+			wantCondition = "${{ " + githubDispatchCondition(plan) + " }}"
+		}
+		if !ok || job.RunsOn != runner || job.If != wantCondition || len(job.Steps) != 5 || job.Steps[0].Uses != actions.Checkout {
 			return e.New(e.CodeInvalidCatalog, "GitHub runner bootstrap %q is incomplete", jobID)
 		}
 		// The bootstrap must provision the Go toolchain via the pinned setup-go action rather
@@ -274,9 +295,9 @@ func ValidateGitHubBundle(ctx context.Context, plan *Plan, bundle *GeneratedBund
 				return e.New(e.CodeEngineCapability, "GitHub container job %q does not bind its target platform", jobID)
 			}
 		}
-		wantCondition := stage.condition()
+		wantCondition := stage.condition(plan)
 		if job.If != wantCondition {
-			return e.New(e.CodeEngineCapability, "GitHub execution job %q must require dispatch on the default branch", jobID)
+			return e.New(e.CodeEngineCapability, "GitHub execution job %q must require dispatch on an admitted branch", jobID)
 		}
 		if node.Kind == NodePublish {
 			target := plan.Targets[node.Target]

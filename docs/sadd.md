@@ -454,7 +454,7 @@ registration transport must consume accepted artifact references without adding 
 
 | Interface | Producer → consumer | Contract and failure boundary |
 |---|---|---|
-| Git/source transport | Upstream or mirror → fetch step | Retrieve pinned source and check commit/tree before build; credentials limited to fetching |
+| Git/source transport | Upstream or mirror → source fetch or pin-set revalidation step | Retrieve pinned Git trees and check commit/tree; repository-scoped credentials limited to source retrieval and pin-set revalidation |
 | Container runtime | Helper → pinned toolchain container | Apply declared platform/network/privilege; qualified execution additionally requires runtime receipts |
 | CI artifact transport | Producer job → dependent job | Carry declared artifact edges; graph admission and identity checks remain NKD responsibilities |
 | OCI distribution | Packager/publisher ↔ registry | Content selected by digest; layout/manifest integrity checked; remote failure cannot imply successful publication |
@@ -733,9 +733,12 @@ ADR-18 §8's event policy is the admission contract for production rendering:
 | Fork pull request | Regeneration/schema checks | None |
 | In-repository pull request | Build and package | Read-only credential on fetch steps; no publish or OIDC access |
 | Default-branch push / manual dispatch on default ref | Publish, sign, attest and verify in a protected environment | Phase-scoped registry and OIDC access |
+| Explicitly allowed branch manual dispatch | Full publication after branch-policy admission | Same scoped credentials; exact workflow identity |
 | Git tag | No v1 signing trigger | No signing authorization from the tag |
 
-The current generated Run workflow is manual-only, with execution restricted to the default branch.
+The current generated Run workflow is manual-only. It admits the default branch and optional exact branch
+exceptions in `Environment.githubDispatchBranches`; publication also requires deployment-environment and
+signing-identity policies that admit the selected workflow ref. Other branches and tag/PR refs remain closed.
 Repository Merge Gate performs PR regeneration checks when generator inputs or outputs change.
 
 A renderer unable to express the required guards must reject the affected lane. This table states the contract;
