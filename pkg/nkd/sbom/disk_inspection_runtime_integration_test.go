@@ -52,13 +52,8 @@ func TestDiskInspectionRuntimeInventoryReal(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := os.Getenv("NKD_TEST_DISK_QCOW2")
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := capability.AdmitSubject(ctx, info.Size()); err != nil {
-		t.Fatal(err)
-	}
+	// This retained-disk diagnostic owns its input independently. It exercises
+	// the existing held-input API, not the original-Run Packer snapshot handoff.
 	subject, err := heldfile.OpenContext(ctx, path, heldfile.Options{Label: "inventory-runtime-test", MaxBytes: MaxDiagnosticDiskBytes,
 		ExpectedDigest: os.Getenv("NKD_TEST_DISK_SHA256")})
 	if err != nil {

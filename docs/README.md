@@ -24,7 +24,7 @@
 | Inspect artifact dependencies and SBOM scope | [Dependency SBOMs](dependency-sboms.md) |
 | Understand the internal staged disk-material tracing contract and its gaps | [Local disk material tracing](nke-os-material-trace.md) |
 | Check guest package capture bytes and understand their diagnostic scope | [APT capture contract](nke-os-acquisition-contract.md), [retained byte-correspondence evidence](evidence/2026-10-03-apt-capture-correspondence.md) |
-| Review installed-package inspection of a local QCOW2 (diagnostic API, no lifecycle command or full SBOM yet) | [Diagnostic inspector runtime](../toolchains/nkd-disk-inspect/README.md), [recorded local inspection](evidence/2026-10-02-nke-os-disk-inspection.md) |
+| Inspect installed packages before a local Run exports its QCOW2 (optional SDK path, not a full SBOM) | [Live disk inspection](nke-os-live-inspection.md), [diagnostic inspector runtime](../toolchains/nkd-disk-inspect/README.md), [recorded runtime-only inspection](evidence/2026-10-02-nke-os-disk-inspection.md) |
 | Build or contribute | [Development](../DEVELOPMENT.md), [contribution guide](../CONTRIBUTING.md) |
 | Triage repository vulnerabilities | [CVE management](cve-management.md), [security reporting](../SECURITY.md) |
 | Manage GitHub issues, discussions, and pull requests | [GitHub issue and PR management](github-issue-pr-management.md) |

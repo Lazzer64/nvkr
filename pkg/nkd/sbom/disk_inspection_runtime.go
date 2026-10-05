@@ -47,27 +47,12 @@ func (runtime *DiskInspectionRuntime) Close() error {
 	return runtime.container.Close()
 }
 
-// AdmitSubject provides a fail-before-copy capacity gate for a future or separate
-// live factory join; this runtime module does not invoke that join.
-func (runtime *DiskInspectionRuntime) AdmitSubject(ctx context.Context, size int64) error {
-	if runtime == nil {
-		return e.New(e.CodeEngineCapability, "disk inspection runtime is absent")
-	}
-	return runtime.container.AdmitSubject(ctx, size)
-}
-
 // InspectHeldInstalledPackages accepts only held subject authority. The fixed
 // container helper uses the existing exact held probe/inspector boundary; this
 // owner authenticates its returned metadata against the opaque container result.
 func (runtime *DiskInspectionRuntime) InspectHeldInstalledPackages(ctx context.Context, subject *heldfile.File, format, encryption string) (*DiskInstalledInventory, error) {
-	if err := validateSBOMContext(ctx); err != nil {
+	if err := validateContainerInspection(ctx, format, encryption); err != nil {
 		return nil, err
-	}
-	if encryption != "none" {
-		return nil, e.New(e.CodeEncryptedArtifact, "disk inspection requires unencrypted content")
-	}
-	if format != "qcow2" {
-		return nil, e.New(e.CodeEngineCapability, "disk inspection supports only QCOW2")
 	}
 	if runtime == nil {
 		return nil, e.New(e.CodeEngineCapability, "disk inspection runtime is absent")
@@ -77,6 +62,36 @@ func (runtime *DiskInspectionRuntime) InspectHeldInstalledPackages(ctx context.C
 		return nil, err
 	}
 	return inventoryFromContainerObservation(observation)
+}
+
+// InspectPackerInstalledPackages owns before-copy admission, inspection and
+// temporary snapshot cleanup. Only the original opaque Packer artifact enters
+// this operation; neither its snapshot nor its capacity permit escapes.
+func (runtime *DiskInspectionRuntime) InspectPackerInstalledPackages(ctx context.Context, artifact *pipeline.PackerArtifact, format, encryption string) (*DiskInstalledInventory, error) {
+	if err := validateContainerInspection(ctx, format, encryption); err != nil {
+		return nil, err
+	}
+	if runtime == nil {
+		return nil, e.New(e.CodeEngineCapability, "disk inspection runtime is absent")
+	}
+	observation, err := runtime.container.InspectPackerArtifact(ctx, artifact)
+	if err != nil {
+		return nil, err
+	}
+	return inventoryFromContainerObservation(observation)
+}
+
+func validateContainerInspection(ctx context.Context, format, encryption string) error {
+	if err := validateSBOMContext(ctx); err != nil {
+		return err
+	}
+	if encryption != "none" {
+		return e.New(e.CodeEncryptedArtifact, "disk inspection requires unencrypted content")
+	}
+	if format != "qcow2" {
+		return e.New(e.CodeEngineCapability, "disk inspection supports only QCOW2")
+	}
+	return nil
 }
 
 type diskInspectionReport struct {

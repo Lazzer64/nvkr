@@ -17,6 +17,56 @@ type cancelDiskInspectionCapture struct {
 	cancel context.CancelFunc
 }
 
+func TestContainerInspectionAPIGates(t *testing.T) {
+	for _, capability := range []struct {
+		name    string
+		inspect func(context.Context, string, string) (*DiskInstalledInventory, error)
+		close   func() error
+	}{
+		{name: "nil runtime", inspect: func(ctx context.Context, format, encryption string) (*DiskInstalledInventory, error) {
+			return (*DiskInspectionRuntime)(nil).InspectHeldInstalledPackages(ctx, nil, format, encryption)
+		}, close: (*DiskInspectionRuntime)(nil).Close},
+		{name: "zero runtime", inspect: func(ctx context.Context, format, encryption string) (*DiskInstalledInventory, error) {
+			return (&DiskInspectionRuntime{}).InspectHeldInstalledPackages(ctx, nil, format, encryption)
+		}, close: (&DiskInspectionRuntime{}).Close},
+		{name: "nil Packer runtime", inspect: func(ctx context.Context, format, encryption string) (*DiskInstalledInventory, error) {
+			return (*DiskInspectionRuntime)(nil).InspectPackerInstalledPackages(ctx, nil, format, encryption)
+		}, close: (*DiskInspectionRuntime)(nil).Close},
+		{name: "zero Packer runtime", inspect: func(ctx context.Context, format, encryption string) (*DiskInstalledInventory, error) {
+			return (&DiskInspectionRuntime{}).InspectPackerInstalledPackages(ctx, nil, format, encryption)
+		}, close: (&DiskInspectionRuntime{}).Close},
+	} {
+		t.Run(capability.name, func(t *testing.T) {
+			canceled, cancel := context.WithCancel(t.Context())
+			cancel()
+			for _, test := range []struct {
+				name               string
+				ctx                context.Context
+				format, encryption string
+				want               e.Code
+			}{
+				{name: "nil context", format: "qcow2", encryption: "none", want: e.CodeUsage},
+				{name: "canceled", ctx: canceled, format: "qcow2", encryption: "none", want: e.CodeTimeout},
+				{name: "encrypted", ctx: t.Context(), format: "qcow2", encryption: "luks2", want: e.CodeEncryptedArtifact},
+				{name: "raw", ctx: t.Context(), format: "raw", encryption: "none", want: e.CodeEngineCapability},
+				{name: "plain but unissued", ctx: t.Context(), format: "qcow2", encryption: "none", want: e.CodeEngineCapability},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					inventory, err := capability.inspect(test.ctx, test.format, test.encryption)
+					if inventory != nil || sbomCode(err) != test.want {
+						t.Fatalf("inventory=%v error=%v, want %s", inventory, err, test.want)
+					}
+				})
+			}
+			for range 2 {
+				if err := capability.close(); err != nil {
+					t.Fatalf("nil/zero Close must be idempotent: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func (reader cancelDiskInspectionCapture) Read(raw []byte) (int, error) {
 	reader.cancel()
 	raw[0] = 'x'
@@ -74,8 +124,8 @@ func TestDiskInspectionRuntimeRejectsDescriptions(t *testing.T) {
 	if _, _, _, err := capability.BindingContext(t.Context()); sbomCode(err) != e.CodeEngineCapability {
 		t.Fatalf("absent runtime: %v", err)
 	}
-	if err := capability.AdmitSubject(t.Context(), 1); sbomCode(err) != e.CodeEngineCapability {
-		t.Fatalf("absent runtime admits subject: %v", err)
+	if inventory, err := capability.InspectPackerInstalledPackages(t.Context(), nil, "qcow2", "none"); inventory != nil || sbomCode(err) != e.CodeEngineCapability {
+		t.Fatalf("absent runtime inspects Packer artifact: %v", err)
 	}
 	if err := capability.Close(); err != nil {
 		t.Fatal(err)

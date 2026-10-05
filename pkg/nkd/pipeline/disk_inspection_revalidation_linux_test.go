@@ -16,6 +16,102 @@ import (
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/internal/heldfile"
 )
 
+// This regression uses a controlled runtime ELF and a real held-inode snapshot,
+// not a Docker daemon or QCOW2 bake. It exercises capacity admission and the
+// reserved scan/cleanup boundary before another runtime may allocate a snapshot.
+func TestDiskInspectionOwnsPackerSnapshotAndPermit(t *testing.T) {
+	for _, mode := range []string{"unchanged", "daemon", "snapshot failure", "admission failure"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			container, root := newReservedDiskInspectionFixture(t, ctx, mode)
+			raw := []byte("controlled held subject")
+			path := filepath.Join(t.TempDir(), "payload")
+			if err := os.WriteFile(path, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			file, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			artifact := &PackerArtifact{file: file, size: int64(len(raw)), digest: FileDigest(raw)}
+			defer artifact.Close()
+			want := e.Code("")
+			switch mode {
+			case "daemon":
+				want = e.CodeEngineCapability
+			case "snapshot failure":
+				artifact.digest = "tag"
+				want = e.CodeVerifyFailed
+			case "admission failure":
+				container.runtime = nil
+				artifact.mu.Lock() // A snapshot would block: admission must reject before copy.
+				defer artifact.mu.Unlock()
+				want = e.CodeEngineCapability
+			}
+			observation, err := container.InspectPackerArtifact(ctx, artifact)
+			if code(err) != want || (observation != nil) != (want == "") {
+				t.Fatalf("owned scan: %v, %v", observation, err)
+			}
+			if mode == "unchanged" || mode == "daemon" {
+				if _, err := os.Stat(filepath.Join(root, "removed")); err != nil {
+					t.Fatalf("scan returned before container cleanup: %v", err)
+				}
+			} else if _, err := os.Stat(filepath.Join(root, "consumed")); !os.IsNotExist(err) {
+				t.Fatalf("failed admission/snapshot reached child input: %v", err)
+			}
+			if !diskInspectionCapacity.TryLock() {
+				t.Fatal("owned operation leaked capacity after snapshot cleanup")
+			}
+			diskInspectionCapacity.Unlock()
+			if mode == "unchanged" {
+				digest, size, _, _, _ := observation.Binding()
+				if digest != artifact.Digest() || size != artifact.Size() {
+					t.Fatal("observation differs from original Packer subject")
+				}
+			}
+		})
+	}
+}
+
+func newReservedDiskInspectionFixture(t *testing.T, ctx context.Context, mode string) (*DiskInspectionContainer, string) {
+	t.Helper()
+	selection := testDiskInspectionSelection(t)
+	selection.Platform = "linux/" + runtime.GOARCH
+	selection.Resources = execution.ResourceRequest{CPUMillis: 1000, MemoryMiB: 2050, EphemeralStorageMiB: 1}
+	selection.TimeoutSeconds = 20
+	facts, err := execution.ObserveLocalHost(ctx, selection.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateDiskInspectionResources(selection, facts, 128, true); err != nil {
+		if os.Getenv("CI") == "true" {
+			t.Fatalf("controlled runtime fixture cannot validate required CI host capacity: %v", err)
+		}
+		t.Skipf("controlled runtime fixture requires its real host capacity: %v", err)
+	}
+	root := t.TempDir()
+	path, _ := copyTestExecutable(t, "docker")
+	held, err := snapshotRuntimeExecutableContext(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.capability.Close() })
+	held.environment = append(held.environment,
+		"NKD_DISK_INSPECTION_FIXTURE_ROOT="+root, "NKD_DISK_INSPECTION_FIXTURE_MODE="+mode)
+	held.identity, err = observeHeldRuntimeIdentity(ctx, held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection.Image = "example.test/inspection@sha256:" + strings.Repeat("1", 64)
+	container := &DiskInspectionContainer{runtime: held, selection: selection}
+	t.Cleanup(func() { _ = container.Close() })
+	if err := container.observeBinding(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return container, root
+}
+
 // The controlled ELF fixture drives the exact InspectHeld boundary, including
 // deterministic host admission and held subprocesses. It proves revalidation and cleanup
 // contracts, not a Docker daemon, QCOW2 inspection or package-discovery result.
