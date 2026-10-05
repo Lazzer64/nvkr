@@ -277,6 +277,13 @@ separate identity. Release content binds the exact named payload membership, and
 that content with its output and evidence bindings. Using the outer root as one of its own
 content members would create a circular identity and is forbidden.
 
+Release navigation opens the complete held publication closure and projects its derived output references,
+component subjects and evidence memberships into readable or diagram views. Locators derive from the supplied
+root namespace; the detached description makes no registry-availability claim. Selecting an output changes only
+the presentation. These views establish structural/content integrity, explicitly leave signatures and consumer
+policy unverified, and cannot restore a live verification capability. [Release navigation](release-navigation.md)
+documents the registry and local entry points and their validation scope.
+
 | Identity or record | Owner and purpose | Boundary |
 |---|---|---|
 | Definition | Product author → definition admission → compiler | Named output intent; the single product-authoring input |
