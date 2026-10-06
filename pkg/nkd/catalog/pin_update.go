@@ -25,7 +25,8 @@ type SourcePinRequest struct {
 	// identities must keep their source/artifact bytes; provenance may advance.
 	RejectRepublishedVersions bool
 	Tag                       string
-	Runtime                   string // Container executable for acquired image members; defaults to docker.
+	Commit                    string // Exact source revision; mutually exclusive with Tag and Bump.
+	Runtime                   string // Retained maintenance API compatibility; image pins use native registry metadata.
 	Bump                      bool
 	All                       bool
 	Check                     bool
@@ -58,8 +59,22 @@ func updateSourcePins(ctx context.Context, request SourcePinRequest,
 	listTags func(context.Context, string) ([]string, error),
 	resolvePin func(context.Context, Source, string) (Pin, error),
 ) (SourcePinUpdate, error) {
+	return updateSourcePinsWithArtifacts(ctx, request, listTags, resolvePin, resolvePrebuiltTarget)
+}
+
+func updateSourcePinsWithArtifacts(ctx context.Context, request SourcePinRequest,
+	listTags func(context.Context, string) ([]string, error),
+	resolvePin func(context.Context, Source, string) (Pin, error),
+	resolveArtifact func(context.Context, PrebuiltTarget, string) (ArtifactPin, error),
+) (SourcePinUpdate, error) {
 	// Read one snapshot and select the independent sources to update.
 	var update SourcePinUpdate
+	if err := validatePinRuntime(request.Runtime); err != nil {
+		return update, err
+	}
+	if request.Commit != "" && (request.Tag != "" || request.Bump || !fullSHA.MatchString(request.Commit)) {
+		return update, e.New(e.CodeUsage, "pin --commit requires one full Git commit and cannot be combined with --tag or bump")
+	}
 	if request.Runtime == "" {
 		request.Runtime = "docker"
 	}
@@ -93,6 +108,9 @@ func updateSourcePins(ctx context.Context, request SourcePinRequest,
 			return update, e.New(e.CodeUsage, "source %q selected more than once", n)
 		}
 		selected[n] = true
+		if pin, exists := lock.Pins[n]; request.Bump && exists && fullSHA.MatchString(pin.Commit) && pin.Tag == pin.Commit {
+			return update, e.New(e.CodeUnsupported, "source %q has an exact commit-mode pin; use explicit pin --commit or --tag instead of bump", n)
+		}
 		if src, ok := reg.Sources[n]; ok && src.PinnedBy != "" {
 			return update, pinSetMemberError(n, src.PinnedBy)
 		}
@@ -118,7 +136,8 @@ func updateSourcePins(ctx context.Context, request SourcePinRequest,
 		if !ok {
 			return e.New(e.CodeInvalidCatalog, "unknown source %q", name)
 		}
-		if tag == "" {
+		useCommit := request.Commit != "" && owner == ""
+		if tag == "" && !useCommit {
 			tags, err := listTags(ctx, src.Repo)
 			if err != nil {
 				return err
@@ -128,7 +147,13 @@ func updateSourcePins(ctx context.Context, request SourcePinRequest,
 				return err
 			}
 		}
-		pin, err := resolvePin(ctx, src, tag)
+		var pin Pin
+		var err error
+		if useCommit {
+			pin, err = ResolveCommitPin(ctx, src, request.Commit)
+		} else {
+			pin, err = resolvePin(ctx, src, tag)
+		}
 		if err != nil {
 			return err
 		}
@@ -157,7 +182,7 @@ func updateSourcePins(ctx context.Context, request SourcePinRequest,
 				raw := reg.Components[member.Artifact]
 				versionPin := pin
 				versionPin.Tag = versions[key]
-				if err := updateDerivedArtifact(ctx, raw, member.Artifact, versionPin, provenance, versions[key], request.Runtime, lock, &update); err != nil {
+				if err := updateDerivedArtifact(ctx, raw, member.Artifact, versionPin, provenance, versions[key], request.Runtime, lock, &update, resolveArtifact); err != nil {
 					return err
 				}
 			}
@@ -167,11 +192,11 @@ func updateSourcePins(ctx context.Context, request SourcePinRequest,
 		if owner != "" {
 			for _, component := range sortedRawNames(reg.Components) {
 				raw := reg.Components[component]
-				if raw.Source != name || raw.Prebuilt == nil {
+				if raw.Source != name || raw.Prebuilt == nil || raw.Prebuilt.ReleaseExecutable {
 					continue
 				}
 				raw.PinnedBy = src.PinnedBy
-				if err := updateDerivedArtifact(ctx, raw, component, pin, owner, declaredVersion, request.Runtime, lock, &update); err != nil {
+				if err := updateDerivedArtifact(ctx, raw, component, pin, owner, declaredVersion, request.Runtime, lock, &update, resolveArtifact); err != nil {
 					return err
 				}
 			}
@@ -240,6 +265,9 @@ type ArtifactPinUpdate struct {
 // contacting an upstream and commits every resolved pin against one lock snapshot.
 func UpdateArtifactPins(ctx context.Context, request ArtifactPinRequest) (ArtifactPinUpdate, error) {
 	var update ArtifactPinUpdate
+	if err := validatePinRuntime(request.Runtime); err != nil {
+		return update, err
+	}
 	reg, lock, err := pinUpdateInputs(ctx, request.Directory)
 	if err != nil {
 		return update, err
@@ -320,7 +348,15 @@ func UpdateArtifactPins(ctx context.Context, request ArtifactPinRequest) (Artifa
 	return update, WriteLockContext(ctx, request.Directory, lock)
 }
 
-func updateDerivedArtifact(ctx context.Context, raw rawComponent, name string, version Pin, provenance, chartVersion, runtime string, lock *PinLock, update *SourcePinUpdate) error {
+// Legacy flags do not select daemon credentials for anonymous native pinning.
+func validatePinRuntime(runtime string) error {
+	if runtime != "" && runtime != "docker" {
+		return e.New(e.CodeUsage, "catalog pin runtime is a legacy default-only option; image pins use anonymous HTTPS, not %q credentials", runtime)
+	}
+	return nil
+}
+
+func updateDerivedArtifact(ctx context.Context, raw rawComponent, name string, version Pin, provenance, chartVersion, runtime string, lock *PinLock, update *SourcePinUpdate, resolveArtifact func(context.Context, PrebuiltTarget, string) (ArtifactPin, error)) error {
 	acquisition, err := prebuiltTargetFor(name, raw, version)
 	if err != nil {
 		return err
@@ -333,7 +369,7 @@ func updateDerivedArtifact(ctx context.Context, raw rawComponent, name string, v
 		}
 		acquisition.Tag = chartVersion
 	}
-	pin, err := resolvePrebuiltTarget(ctx, acquisition, runtime)
+	pin, err := resolveArtifact(ctx, acquisition, runtime)
 	if err != nil {
 		return err
 	}
