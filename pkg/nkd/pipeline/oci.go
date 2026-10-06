@@ -176,6 +176,12 @@ func verifyOCILayout(ctx context.Context, root, want string) error {
 	return err
 }
 
+// VerifyOfflineOCILayout validates a complete local closure using the same
+// offline owner as acquisition. It issues no execution or publication receipt.
+func VerifyOfflineOCILayout(ctx context.Context, root, want string) error {
+	return verifyOCILayout(ctx, root, want)
+}
+
 func verifyOCILayoutAndSize(ctx context.Context, root, want string) (int64, error) {
 	if ctx == nil {
 		return 0, e.New(e.CodeUsage, "offline OCI verification requires a non-nil context")
@@ -315,7 +321,7 @@ func recursiveOCIDescriptorVerifier(
 				if ctx.Err() != nil {
 					return e.Wrap(e.CodeTimeout, ctx.Err(), "offline OCI verification canceled")
 				}
-				return err
+				return e.Wrap(e.CodeVerifyFailed, err, "reading OCI index blob %s", desc.Digest)
 			}
 			var index ociIndexDocument
 			if err := decodeOCIJSON(raw, &index); err != nil || index.SchemaVersion != 2 || index.MediaType != desc.MediaType {
@@ -332,7 +338,7 @@ func recursiveOCIDescriptorVerifier(
 				if ctx.Err() != nil {
 					return e.Wrap(e.CodeTimeout, ctx.Err(), "offline OCI verification canceled")
 				}
-				return err
+				return e.Wrap(e.CodeVerifyFailed, err, "reading OCI image manifest blob %s", desc.Digest)
 			}
 			var manifest ociManifestDocument
 			if err := decodeOCIJSON(raw, &manifest); err != nil || manifest.SchemaVersion != 2 || manifest.MediaType != desc.MediaType {
