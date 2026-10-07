@@ -2,13 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/delivery"
 	e "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/lifecycle"
 	"github.com/urfave/cli/v2"
 )
 
@@ -38,5 +42,122 @@ func TestReleaseBrowseRejectsInvalidReferencesWithoutEffects(t *testing.T) {
 				t.Fatalf("invalid reference touched workspace: %v", err)
 			}
 		})
+	}
+}
+
+func TestReleaseVerifyRequiresCompleteExactInputSetBeforeAcquisition(t *testing.T) {
+	for _, flags := range [][]string{
+		{"--definition", "definition.yaml"},
+		{"--environment", "environment.yaml"},
+		{"--plan", "plan.json"},
+		{"--definition", "definition.yaml", "--environment", "environment.yaml"},
+		{"--definition", "definition.yaml", "--plan", "plan.json"},
+		{"--environment", "environment.yaml", "--plan", "plan.json"},
+		{"--definition", "", "--environment", "", "--plan", ""},
+	} {
+		workspace := filepath.Join(t.TempDir(), "must-not-exist")
+		args := []string{"nkdctl", "release", "verify",
+			"--reference", "127.0.0.1:1/releases@sha256:" + strings.Repeat("a", 64),
+			"--lane", "pipeline-attested", "--scope", "artifact-publication",
+			"--identity", "^builder$", "--issuer", "issuer", "--workspace", workspace,
+		}
+		app := &cli.App{Commands: []*cli.Command{cmdRelease()}}
+		err := app.RunContext(t.Context(), append(args, flags...))
+		if cliErrorCode(err) != e.CodeUsage {
+			t.Fatalf("partial exact-input flags reached acquisition: flags=%v error=%v", flags, err)
+		}
+	}
+}
+
+func TestReleaseVerifyReportsUnsupportedExactInputPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		flags []string
+	}{
+		{name: "qualified release", flags: []string{"--lane", "qualified", "--scope", "release"}},
+		{name: "pipeline release", flags: []string{"--lane", "pipeline-attested", "--scope", "release",
+			"--identity", "^builder$", "--issuer", "issuer"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			args := []string{"nkdctl", "release", "verify",
+				"--reference", "registry.example.test/releases@sha256:" + strings.Repeat("a", 64),
+				"--definition", "definition.yaml", "--environment", "environment.yaml", "--plan", "plan.json",
+			}
+			app := &cli.App{Commands: []*cli.Command{cmdRelease()}}
+			err := app.RunContext(t.Context(), append(args, test.flags...))
+			if cliErrorCode(err) != e.CodeEngineCapability {
+				t.Fatalf("unsupported exact-input policy returned %v", err)
+			}
+		})
+	}
+}
+
+func TestReleaseVerifyLoadsCompleteExactInputsBeforeAcquisition(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "must-not-exist")
+	missing := filepath.Join(t.TempDir(), "missing-definition.yaml")
+	args := []string{"nkdctl", "release", "verify",
+		"--reference", "registry.example.test/releases@sha256:" + strings.Repeat("a", 64),
+		"--lane", "pipeline-attested", "--scope", "artifact-publication",
+		"--identity", "^builder$", "--issuer", "issuer", "--workspace", workspace,
+		"--definition", missing, "--environment", "environment.yaml", "--plan", "plan.json",
+	}
+	app := &cli.App{Commands: []*cli.Command{cmdRelease()}}
+	err := app.RunContext(t.Context(), args)
+	if cliErrorCode(err) != e.CodeInvalidCatalog {
+		t.Fatalf("complete exact-input load returned %v", err)
+	}
+	if _, err := os.Stat(workspace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("invalid exact inputs touched workspace: %v", err)
+	}
+}
+
+func TestReleaseVerifyForwardsCompleteExactInputsToLifecycleUseCase(t *testing.T) {
+	lifecycleCommandRepo(t)
+	const reference = "registry.example.test/releases@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const policyDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	const planDigest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	called := false
+	verify := func(_ context.Context, gotReference string, policy lifecycle.VerificationPolicy,
+		options lifecycle.ConsumerOptions, expectation *lifecycle.ExactInputExpectation,
+	) (releaseVerificationResult, error) {
+		called = true
+		if gotReference != reference || policy.Lane != lifecycle.LanePipeline ||
+			policy.Scope != lifecycle.ScopeArtifactPublication || expectation == nil {
+			t.Fatalf("exact verification was not forwarded: reference=%q policy=%+v expectation=%v",
+				gotReference, policy, expectation)
+		}
+		if options.Registry != (delivery.RegistryOptions{Anonymous: true}) {
+			t.Fatalf("consumer options were not forwarded: %+v", options)
+		}
+		exact := lifecycle.ExactInputDescription{ReleaseSubject: reference, PolicyDigest: policyDigest,
+			DefinitionDigest:  "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+			EnvironmentDigest: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+			PlanDigest:        planDigest, ContentSubject: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}
+		return releaseVerificationResult{Release: lifecycle.Release{SchemaVersion: lifecycle.ReleaseSchemaVersion,
+			Subject: reference, Lane: policy.Lane, Scope: policy.Scope, PolicyDigest: policyDigest,
+			ContentSubject: exact.ContentSubject}, ExactInputs: &exact}, nil
+	}
+	args := []string{"nkdctl", "release", "verify",
+		"--reference", reference,
+		"--lane", "pipeline-attested", "--scope", "artifact-publication",
+		"--identity", "^builder$", "--issuer", "issuer", "--anonymous",
+		"--definition", "definitions/nke-m2/definition.yaml",
+		"--environment", "definitions/nke-m2/environment-github.yaml",
+		"--plan", ".github/nkd-run/plan.json",
+	}
+	app := &cli.App{Commands: []*cli.Command{cmdReleaseWithVerify(verify)}}
+	raw, err := runCLIWithCapturedStdout(t, app, args...)
+	if err != nil || !called {
+		t.Fatalf("complete exact-input path did not reach the lifecycle use case: called=%v error=%v", called, err)
+	}
+	var result releaseVerificationResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.SchemaVersion != releaseVerificationResultSchemaVersion ||
+		result.Release.Subject != reference || result.ExactInputs == nil ||
+		result.ExactInputs.ReleaseSubject != reference || result.ExactInputs.PolicyDigest != policyDigest ||
+		result.ExactInputs.PlanDigest != planDigest {
+		t.Fatalf("exact-input description was not serialized in the versioned result: %+v", result)
 	}
 }
