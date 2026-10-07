@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NVIDIA/nke-recipes/internal/testutil"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/catalog"
 	authored "github.com/NVIDIA/nke-recipes/pkg/nkd/definition"
 
@@ -169,6 +170,7 @@ func TestGitHubSourceRefusesEmptyCredential(t *testing.T) {
 }
 
 func TestMaintainedPinSetCatalogCredentials(t *testing.T) {
+	testutil.RequireExtended(t)
 	plan, err := LoadPlanContext(t.Context(), "../../../.github/nkd-run/plan.json")
 	if err != nil {
 		t.Fatal(err)

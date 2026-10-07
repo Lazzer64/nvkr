@@ -88,17 +88,24 @@ vulncheck: go-version-check ## Check reachable Go vulnerabilities using the pinn
 	"$(CURDIR)/bin/govulncheck" ./...
 
 .PHONY: test
-test: ## Unit tests with race + coverage (pure logic; no docker required).
-	# Full factory race/coverage contracts exceed Go's default 10m package budget on hosted runners.
+test: ## Fast default tests for CI and agents (no extended fixtures or instrumentation).
+	go test $(GO_TEST_FLAGS) $(PKG)
+
+.PHONY: test-race
+test-race: ## Opt-in race detection and coverage for the default suite.
 	go test -timeout 20m -race -covermode=atomic -coverprofile=coverage.out $(GO_TEST_FLAGS) $(PKG)
 	@go tool cover -func=coverage.out | tail -1
+
+.PHONY: test-full
+test-full: ## Include extended capacity/integration fixtures with race + coverage.
+	NKD_TEST_EXTENDED=1 $(MAKE) test-race
 
 .PHONY: test-ci-tools
 test-ci-tools: ## Check CI timing report parsing and failure diagnostics.
 	python3 -B -m unittest discover -s scripts -p ci_test_summary_test.py
 
 .PHONY: cover
-cover: test ## Open the HTML coverage report in a browser.
+cover: test-race ## Open the HTML coverage report in a browser.
 	go tool cover -html=coverage.out
 
 .PHONY: tidy

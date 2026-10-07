@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/NVIDIA/nke-recipes/internal/testutil"
 	e "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 )
 
@@ -22,6 +23,9 @@ func TestCompleteDocumentBytePolicy(t *testing.T) {
 		{name: "complete inventory refused without truncation", size: MaxDocumentBytes + 1, code: e.CodeVerifyFailed},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			if test.size > 64 {
+				testutil.RequireExtended(t)
+			}
 			bom, err := NewSubject("sha256:"+strings.Repeat("a", 64), "component", "sha256:"+strings.Repeat("b", 64))
 			if err != nil {
 				t.Fatal(err)
