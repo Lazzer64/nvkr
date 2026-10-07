@@ -48,6 +48,34 @@ func TestReleaseBrowseRejectsInvalidReferencesWithoutEffects(t *testing.T) {
 	}
 }
 
+func TestReleaseVerifyExposesAndValidatesDiskEvidencePolicy(t *testing.T) {
+	var out bytes.Buffer
+	app := &cli.App{Commands: []*cli.Command{cmdRelease()}, Writer: &out}
+	err := app.RunContext(t.Context(), []string{"nkdctl", "release", "verify", "--help"})
+	if err != nil || !strings.Contains(out.String(), "minimum-disk-evidence") || !strings.Contains(out.String(), "build-provenance-v1") {
+		t.Fatalf("release verify help omitted disk evidence policy: err=%v output=%q", err, out.String())
+	}
+	if !strings.Contains(out.String(), "build-provenance-v1 for pipeline-attested; strict for qualified") {
+		t.Fatalf("release verify help omitted lane-specific defaults: %q", out.String())
+	}
+
+	out.Reset()
+	app = &cli.App{Commands: []*cli.Command{cmdRelease()}, Writer: &out}
+	err = app.RunContext(t.Context(), []string{"nkdctl", "release", "verify", "--reference", "registry.example.test/product@sha256:" + strings.Repeat("a", 64),
+		"--lane", "qualified", "--scope", "release", "--minimum-disk-evidence", "build-provenance-v1"})
+	if cliErrorCode(err) != e.CodeTrustPolicyMissing || out.Len() != 0 {
+		t.Fatalf("qualified producer-only policy was not rejected before adapters: err=%v output=%q", err, out.String())
+	}
+
+	out.Reset()
+	app = &cli.App{Commands: []*cli.Command{cmdRelease()}, Writer: &out}
+	err = app.RunContext(t.Context(), []string{"nkdctl", "release", "verify", "--reference", "registry.example.test/product@sha256:" + strings.Repeat("a", 64),
+		"--lane", "qualified", "--scope", "release"})
+	if cliErrorCode(err) != e.CodeEngineCapability || out.Len() != 0 {
+		t.Fatalf("qualified default was weakened or reached an adapter: err=%v output=%q", err, out.String())
+	}
+}
+
 func TestReleaseVerifyRequiresCompleteExactInputSetBeforeAcquisition(t *testing.T) {
 	for _, flags := range [][]string{
 		{"--definition", "definition.yaml"},
@@ -162,5 +190,39 @@ func TestReleaseVerifyForwardsCompleteExactInputsToLifecycleUseCase(t *testing.T
 		result.ExactInputs.ReleaseSubject != reference || result.ExactInputs.PolicyDigest != policyDigest ||
 		result.ExactInputs.PlanDigest != planDigest {
 		t.Fatalf("exact-input description was not serialized in the versioned result: %+v", result)
+	}
+}
+
+func TestReleaseVerifyForwardsDiskEvidencePolicyWithExactInputs(t *testing.T) {
+	lifecycleCommandRepo(t)
+	for _, minimum := range []lifecycle.DiskEvidenceRequirement{"", lifecycle.DiskEvidenceBuildProvenance, lifecycle.DiskEvidenceStrict} {
+		t.Run(string(minimum), func(t *testing.T) {
+			called := false
+			verify := func(_ context.Context, _ string, policy lifecycle.VerificationPolicy,
+				_ lifecycle.ConsumerOptions, expectation *lifecycle.ExactInputExpectation,
+			) (releaseVerificationResult, error) {
+				called = true
+				if expectation == nil || policy.Lane != lifecycle.LanePipeline || policy.Scope != lifecycle.ScopeArtifactPublication || policy.MinimumDiskEvidence != minimum {
+					t.Fatalf("exact-input disk policy was not forwarded together: policy=%+v expectation=%v", policy, expectation)
+				}
+				return releaseVerificationResult{}, e.New(e.CodeGateUnmet, "controlled verification boundary")
+			}
+			args := []string{"nkdctl", "release", "verify",
+				"--reference", "registry.example.test/releases@sha256:" + strings.Repeat("a", 64),
+				"--lane", "pipeline-attested", "--scope", "artifact-publication",
+				"--identity", "^builder$", "--issuer", "issuer",
+				"--definition", "definitions/nke-m2/definition.yaml",
+				"--environment", "definitions/nke-m2/environment-github.yaml",
+				"--plan", ".github/nkd-run/plan.json",
+			}
+			if minimum != "" {
+				args = append(args, "--minimum-disk-evidence", string(minimum))
+			}
+			app := &cli.App{Commands: []*cli.Command{cmdReleaseWithVerify(verify)}}
+			err := app.RunContext(t.Context(), args)
+			if !called || cliErrorCode(err) != e.CodeGateUnmet {
+				t.Fatalf("combined policy did not reach the lifecycle boundary: called=%v error=%v", called, err)
+			}
+		})
 	}
 }

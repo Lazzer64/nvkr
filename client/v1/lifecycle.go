@@ -18,7 +18,13 @@ type Run = lifecycle.Run
 type Artifact = lifecycle.Artifact
 type Release = lifecycle.Release
 type VerificationPolicy = lifecycle.VerificationPolicy
+type DiskEvidenceRequirement = lifecycle.DiskEvidenceRequirement
 type ReleaseConsumerOptions = lifecycle.ConsumerOptions
+
+const (
+	DiskEvidenceStrict          = lifecycle.DiskEvidenceStrict
+	DiskEvidenceBuildProvenance = lifecycle.DiskEvidenceBuildProvenance
+)
 
 type LocalRunOptions = lifecycle.LocalOptions
 type PreparedRun = lifecycle.PreparedRun

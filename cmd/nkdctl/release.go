@@ -135,6 +135,7 @@ func cmdReleaseWithVerify(verify releaseVerifyOperation) *cli.Command {
 				Name: "verify", Usage: "verify one pinned reference under an explicit Verification Policy scope",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "reference", Required: true}, &cli.StringFlag{Name: "lane", Required: true}, &cli.StringFlag{Name: "scope", Required: true},
+					&cli.StringFlag{Name: "minimum-disk-evidence", Usage: "minimum accepted disk evidence: strict or build-provenance-v1 (default: build-provenance-v1 for pipeline-attested; strict for qualified)"},
 					&cli.StringFlag{Name: "identity"}, &cli.StringFlag{Name: "issuer"}, &cli.StringFlag{Name: "cosign"}, &cli.StringFlag{Name: "cosign-digest"},
 					&cli.StringFlag{Name: "definition", Usage: "exact authored Definition to require with --environment and --plan"},
 					&cli.StringFlag{Name: "environment", Usage: "exact selected Environment to require with --definition and --plan"},
@@ -155,7 +156,8 @@ func cmdReleaseWithVerify(verify releaseVerifyOperation) *cli.Command {
 					if exactInputCount != 0 && exactInputCount != 3 {
 						return e.New(e.CodeUsage, "release verification requires --definition, --environment, and --plan together")
 					}
-					policy := lifecycle.VerificationPolicy{Lane: c.String("lane"), Scope: c.String("scope"), IdentityRegexp: c.String("identity"), Issuer: c.String("issuer")}
+					policy := lifecycle.VerificationPolicy{Lane: c.String("lane"), Scope: c.String("scope"), IdentityRegexp: c.String("identity"), Issuer: c.String("issuer"),
+						MinimumDiskEvidence: lifecycle.DiskEvidenceRequirement(c.String("minimum-disk-evidence"))}
 					if err := policy.Validate(); err != nil {
 						return err
 					}

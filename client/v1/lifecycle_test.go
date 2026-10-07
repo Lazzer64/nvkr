@@ -88,6 +88,18 @@ func TestSDKRejectsUnsupportedGenerationBeforeInputsAndUnconfiguredConsumer(t *t
 	requireLifecycleCode(t, err, nkderr.CodeEngineCapability)
 }
 
+func TestSDKExposesTypedDiskEvidencePolicy(t *testing.T) {
+	runtimeValue := string(client.DiskEvidenceBuildProvenance)
+	policy := client.VerificationPolicy{Lane: "pipeline-attested", Scope: "artifact-publication",
+		IdentityRegexp: "^builder$", Issuer: "issuer", MinimumDiskEvidence: client.DiskEvidenceRequirement(runtimeValue)}
+	if err := policy.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if client.DiskEvidenceStrict != "strict" || client.DiskEvidenceBuildProvenance != "build-provenance-v1" {
+		t.Fatalf("disk evidence policy constants = %q, %q", client.DiskEvidenceStrict, client.DiskEvidenceBuildProvenance)
+	}
+}
+
 func requireLifecycleCode(t *testing.T, err error, expected nkderr.Code) {
 	t.Helper()
 	var coded *nkderr.Error
