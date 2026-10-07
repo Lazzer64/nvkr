@@ -13,7 +13,7 @@ script now executes the combined CLI/image/Helm Definition; see the [walkthrough
 |---|---|---|
 | M1 — Vertical slice | One pinned NKE CLI build through a generated GitHub workflow | A green default-branch Run builds from the pinned source entrypoint, publishes to OCI, keyless-signs and attaches production provenance; independent cosign verification succeeds |
 | M2 — Breadth | The complete in-scope artifact set, including the NKE OS image | One Run delivers the required artifacts and exact output membership, with signatures, source-lane provenance and consumer verification; recorded fallbacks remain visible |
-| M3 — Qualification | Automated build and evidence checks under a separate qualification identity | Schema, pin consistency, signature/provenance and tooling smoke checks pass; signed evidence records verdicts and approved waivers; tampering or missing evidence fails closed |
+| M3 — Qualification | Automated build and evidence checks under a separate qualification identity | Schema, pin consistency, signature/provenance and tooling smoke checks and disk inventory reconciliation pass; signed evidence records verdicts and approved waivers; tampering or missing evidence fails closed |
 | M4 — Automated releases | Reviewed pin updates produce immutable, qualified v1 Release manifests | Scheduled detection opens a reviewable update; merging produces a signed manifest and immutable tag; manual dispatch re-verifies an existing manifest without rebuilding; overlapping and interrupted release runs never move an immutable tag; a signed revocation withdraws a release from the channel |
 
 M3 qualification does not establish cluster conformance or byte-identical reproduction. M4's Release manifest
@@ -23,7 +23,8 @@ verification is narrower than M3/M4 acceptance.
 Evidence remains scoped to exact producer outputs. A package with independently demonstrated exact-byte
 reproduction evidence or a digest-verified acquisition may feed the wrapped NKE OS build without making the
 aggregate disk reproducible. M2 accepts the disk's exact delivered digest, source-lane provenance, traced
-materials, and reconciled read-only inventory. A later build with different QCOW2 bytes is a different Artifact
+materials, and complete release membership. Deep disk inventory and material-to-filesystem
+reconciliation are deferred to M3; M2 evidence explicitly identifies that scope. A later build with different QCOW2 bytes is a different Artifact
 even if the same content checks pass.
 
 ## Artifact scope
@@ -49,8 +50,9 @@ separate required outputs or let one output's evidence satisfy another.
 | NKE Helm charts | Pinned chart sources | OCI packages / M2 |
 | Operator tooling | Acquired kubectl and Helm | OCI package / M2 |
 
-The NKE OS build team owns embedded-software correctness and runtime validation. NKD's deferred disk delivery
-requires an inventory reconciling traced materials with read-only inspection of the exact disk. Embedded components retain matrix rows for
+The NKE OS build team owns embedded-software correctness and runtime validation. M3 qualification
+requires an inventory reconciling traced materials with read-only inspection of the exact disk;
+that inventory is not required for M2 delivery. Embedded components retain matrix rows for
 traceability, but do not imply separate NKD builds or delivery. A deferred member stays explicit in authored
 requirements and planned qualification waivers; it must never disappear because a build failed.
 That inventory proves composition for the exact disk subject. It does not establish qualified reproduction of

@@ -86,7 +86,8 @@ vulncheck: go-version-check ## Check reachable Go vulnerabilities using the pinn
 
 .PHONY: test
 test: ## Unit tests with race + coverage (pure logic; no docker required).
-	go test -race -covermode=atomic -coverprofile=coverage.out $(GO_TEST_FLAGS) $(PKG)
+	# Full factory race/coverage contracts exceed Go's default 10m package budget on hosted runners.
+	go test -timeout 20m -race -covermode=atomic -coverprofile=coverage.out $(GO_TEST_FLAGS) $(PKG)
 	@go tool cover -func=coverage.out | tail -1
 
 .PHONY: test-ci-tools
@@ -121,8 +122,8 @@ workflows-check: ## Verify the committed Run generation matches the catalog (ADR
 		-ldflags '-X main.version=dev -X main.commit=unknown' \
 		-o bin/nkd-exec ./cmd/nkdctl
 	bin/nkd-exec run generate --engine github \
-		--definition definitions/nke-deploy/definition.yaml \
-		--environment definitions/nke-deploy/environment-github.yaml \
+		--definition definitions/nke-m2/definition.yaml \
+		--environment definitions/nke-m2/environment-github.yaml \
 		--root . --check
 
 .PHONY: check

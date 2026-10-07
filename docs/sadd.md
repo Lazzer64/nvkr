@@ -259,9 +259,9 @@ NKE OS producer owns its embedded contents. IR/Plan lowering binds the exact sou
 projects the root QCOW2 without binary-bundle packaging. A process-local held-QCOW2 observer has contract coverage
 for exact delivery bytes and producer/Plan bindings; it grants no execution authority or qualified reproduction
 verdict. Production VM execution and held-result population remain capability-gated; direct producer selection
-does not introduce independently built OS layers. Before
-disk delivery is admitted, ADR-13 also requires a full inventory reconciling traced materials with read-only
-inspection of the exact disk. That composition claim does not establish NKE-owned runtime correctness.
+does not introduce independently built OS layers. M2 disk delivery uses exact live producer and material
+evidence with explicit deferred-inspection scope. ADR-13's strict mode and M3 qualification require a full
+inventory reconciling traced materials with read-only inspection of the exact disk. That composition claim does not establish NKE-owned runtime correctness.
 It also does not establish disk reproduction. The exact QCOW2 digest names the delivered artifact; matching
 material identities and inspected contents establish a controlled, content-validated rebuild. Only an
 independent exact comparison of ADR-14's qualified canonical disk subject may establish `Reproduced`.
@@ -613,6 +613,13 @@ as a subject-bound CycloneDX attestation bundle. Attestations are created and ve
 the final release index, so its signature covers each exact bundle and document digest. Helm source-archive and final bound-package
 inventories are separate claims; Run completion is not signed. See the [registry graph](publication-architecture.md). Build-only and dry-run outputs gain no signature.
 
+For the M2 GitHub Environment, each output is published, signed and fully verified separately. Release
+assembly and finalization authenticate only bounded metadata and signed evidence from that same Plan and
+workflow run attempt. This avoids gathering all payloads on one runner while preserving one signed release
+entry point and exact output completeness. Failed provider jobs, mismatched attempt bindings or rejected
+signatures prevent completion. Independent consumption still verifies the complete payload closure
+(ADR-18/20); this does not add qualified reproduction or cross-run publication reuse.
+
 Independent artifact consumption uses a signature and subject-bound production attestation on each deliverable
 manifest in its own repository. The release signature remains the authority for membership and SBOM coverage;
 standalone artifact verification does not establish those release-wide claims (ADR-04/20). The pinned cosign 3.1.3
@@ -841,13 +848,18 @@ The material manifest is derived from authenticated producer observations; an au
 projection can change only its schema and per-binding kind vocabulary. Bounded in-process cleanup owns ordinary
 completion and cancellation; authenticated
 cross-process orphan recovery after a hard process or host failure remains deferred. Command/Make, encrypted-disk,
-hosted and qualified VM adapters remain closed.
+general hosted and qualified VM adapters remain closed. ADR-18 defines the explicit native ARC disk exception, including exact Environment-authored manual
+dispatch branches matched by deployment policies and signing identity.
 
 The local adapter does not apply subordinate container IDs or Docker user-namespace remapping. An escape from the
 Packer/QEMU consumer would therefore retain the invoking user's access to host resources. The read-only root,
 default-none network mode, dropped capabilities and no-new-privileges setting reduce exposure but do not establish a
-hosted or qualified identity boundary. Those lanes require an authenticated subordinate identity, user namespace
-or stronger provider sandbox plus recorded interoperability evidence.
+hosted or qualified identity boundary. The qualified lane requires an authenticated subordinate identity, user namespace
+or stronger provider sandbox plus recorded interoperability evidence. The explicit pipeline-attested ARC policy
+trusts the operator-managed ephemeral runner/daemon, with observed native capacity and bounded execution.
+Internal candidate toolchains use a separate packages:read preparation step. Its temporary registry
+credentials are deleted before source/producer execution; the held runtime independently revalidates
+the exact locally prepared image. Package Actions access is configured separately from workflow scopes.
 
 The local capability and driver result are unqualified current-availability evidence, not authenticated provider
 allocation, reservation, pipeline attestation or qualification evidence. Holding a validated KVM descriptor proves
@@ -857,8 +869,8 @@ For Docker's separate daemon namespace, a fixed device projection additionally c
 admitted character-device numbers before Packer runs. Committed-head Docker/Packer/NKE ARM64 and AMD64 bakes and
 source-owned boot smoke passed through the local adapter on ARC, as recorded in
 [the 2026-10-01 evidence](evidence/2026-10-01-nke-arc-os-builds.md). This diagnostic execution does not establish
-generated hosted VM admission or qualification. Hosted admission, provider proof, and VM
-topology beyond the required-KVM same-architecture invariant remain deferred. Arbitrary devices, privilege beyond
+generated hosted VM admission or qualification. The native ARC grouped executor is separately contract-tested; a complete generated M2 production run remains
+unexercised. Provider allocation proof and VM topology beyond the required-KVM same-architecture invariant remain deferred. Arbitrary devices, privilege beyond
 the scoped input-extraction and ownership stage, nested virtualization, NUMA, accelerators, and provider-specific lowering remain
 deferred.
 Produced-artifact size remains an artifact and transport budget.

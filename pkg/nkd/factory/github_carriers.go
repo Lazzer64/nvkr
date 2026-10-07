@@ -43,6 +43,9 @@ func RestoreGitHubInputs(ctx context.Context, plan *Plan, stageID string, option
 			if err := transportarchive.Unpack(ctx, carrierPath(id), ".", []string{artifacts[id].Path}); err != nil {
 				return err
 			}
+			if err := removeFactoryCarrier(carrierPath(id)); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -104,12 +107,27 @@ func RecoverGitHubArtifacts(ctx context.Context, plan *Plan, providerResults str
 	if err != nil {
 		return err
 	}
+	if PerOutputPublication(plan) {
+		status := "restored:success"
+		for _, job := range jobs {
+			if results[job] != "success" {
+				status = "job-failed"
+				break
+			}
+		}
+		if err := writeGitHubRestoreOutcome(ctx, "all-provider-jobs", status); err != nil {
+			return err
+		}
+	}
 	carriers := append([]Artifact(nil), plan.Graph.Artifacts...)
 	sort.Slice(carriers, func(i, j int) bool { return carriers[i].ID < carriers[j].ID })
 	return githubProgress(ctx, options, "Recover artifacts for finalization", []string{
 		"Transport outcomes are diagnostic; the finalizer authenticates completeness.",
 	}, func(progress *githubStepProgress) error {
 		for _, artifact := range carriers {
+			if !finalizerArtifact(plan, artifact) {
+				continue
+			}
 			if err := githubCarrierContext(ctx); err != nil {
 				return err
 			}
