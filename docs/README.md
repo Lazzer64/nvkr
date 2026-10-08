@@ -20,6 +20,11 @@ Example-specific inputs and commands live beside their Definitions: [three-outpu
 [six-output deploy example](../definitions/nke-deploy/README.md), [34-output M2 candidate and committed workflow](../definitions/nke-m2/README.md),
 and [OS-image routes](../definitions/nke-os/README.md). The [demo index](../demos/README.md) lists presentations, runnable journeys, and prerequisites.
 
+Experimental [public OS source producers](../definitions/nke-os-source/README.md) and the
+[OVN source-build option](../definitions/nke-ovn-source/README.md) are separate candidates, not full OS
+migration or maintained M2 membership. The [v0.21.0 dependency inventory](nke-v0.21.0-os-dependency-inventory.md)
+records source availability and remaining gaps.
+
 ## Detailed references
 
 | Topic | Reference |
