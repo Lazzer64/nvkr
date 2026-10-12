@@ -15,12 +15,14 @@ usage() {
   printf '%s\n' \
     'Usage: bash scripts/nke-full-arm64-local.sh ATTEMPT [JOBS] [all|components|os|providers|simulator|site|tools|profiles]' \
     '       bash scripts/nke-full-arm64-local.sh --check [all|components|os|providers|simulator|site|tools|profiles]' \
+    'Explicit upstream alternative: add --network upstream-ovn before ATTEMPT (all selection only).' \
+    'NVIDIA OVN remains the default. This alternative does not validate the NVIDIA fork.' \
     'all: one Run with 29 outputs; components: 22; os: one disk; providers: two source-built images.' \
     'simulator: one executable bundle with the source-built Linux ARM64 NICoSim server and CLI.' \
     'simulator bootstraps the same pinned Go/GCC Docker toolchain.' \
     'site: four source-aligned installer outputs (controller, CLI, controller chart and NKTP chart).' \
     'tools: one source-built Linux ARM64 bundle (Helm, kubectl, clusterctl, ORAS and Kind).' \
-    'profiles: one diagnostic ARM64 plain Ubuntu 26.04 NICoSim profiles data bundle, not fleet profiles.' \
+    'profiles: one native OCI image containing diagnostic ARM64 plain Ubuntu 26.04 NICoSim profiles, not fleet profiles.' \
     'This subset is NOT a full source-built NKE distribution.' \
     'No host Go/Make or installed nkdctl needed: bootstrap uses the pinned utility image.' \
     'Docker is required (native Linux ARM64 / explicitly selected Colima).' \
@@ -34,7 +36,23 @@ usage() {
 }
 if [[ $# == 1 && ( "$1" == --help || "$1" == -h ) ]]; then usage; exit 0; fi
 check_only=0
+prepare_only=0
+network=ovn
+# Private Go-demo handoff: no activity descriptor is inherited by this shell.
+# It prepares the same selected inputs, but the Go process launches the final
+# unchanged run-local vector directly so only that child receives telemetry.
+if [[ "${1:-}" == --prepare-only ]]; then
+  prepare_only=1
+  shift
+fi
+if [[ "${1:-}" == --network ]]; then
+  [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+  network="$2"
+  case "${network}" in ovn|upstream-ovn) ;; *) echo 'Build network must be ovn or upstream-ovn.' >&2; exit 2 ;; esac
+  shift 2
+fi
 if [[ "${1:-}" == --check ]]; then
+  [[ "${prepare_only}" == 0 ]] || { usage >&2; exit 2; }
   [[ $# -le 2 ]] || { usage >&2; exit 2; }
   check_only=1
   attempt=prerequisites-only
@@ -50,6 +68,18 @@ if [[ ! "${attempt}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ || ! "${jobs}" =~ ^[1
   echo 'Supply a fresh attempt name and positive job count.' >&2; exit 2
 fi
 case "${lane}" in all|components|os|providers|simulator|site|tools|profiles) ;; *) echo 'Select all, components, os, providers, simulator, site, tools or profiles.' >&2; exit 2 ;; esac
+if [[ "${network}" == upstream-ovn && "${lane}" != all ]]; then
+  echo 'Upstream OVN requires the complete all selection so chart, image and QCOW2 inputs stay aligned.' >&2; exit 2
+fi
+# Keep invocation-local redirects when a second local repository is selected.
+# Bound the scalar before arithmetic, host diagnostics or any producer work.
+git_config_count="${GIT_CONFIG_COUNT-0}"
+if [[ ! "${git_config_count}" =~ ^(0|[1-9]|1[0-6])$ ]]; then
+  echo 'GIT_CONFIG_COUNT must be a decimal integer from 0 through 16.' >&2; exit 2
+fi
+if [[ -n "${NKE_LOCAL_CLONE:-}" && "${git_config_count}" -gt 14 ]]; then
+  echo 'NKE_LOCAL_CLONE requires two free Git configuration entries (total limit 16).' >&2; exit 2
+fi
 runtime="${CONTAINER_RUNTIME:-docker}"
 [[ "${runtime}" == docker ]] || { echo 'CONTAINER_RUNTIME must be docker for this local demo.' >&2; exit 2; }
 host_system="$(uname -s)"
@@ -60,6 +90,7 @@ if [[ "${host_system}" != Darwin ]] && ! command -v docker >/dev/null; then
   exit 1
 fi
 if [[ "${host_system}" == Darwin ]]; then
+  [[ "${prepare_only}" == 0 ]] || { echo 'Private preparation requires native Linux execution.' >&2; exit 1; }
   [[ "$(uname -m)" == arm64 ]] || { echo 'The macOS ARM64 launcher requires Apple Silicon.' >&2; exit 1; }
   profile="${COLIMA_PROFILE:-}"
   if [[ -z "${profile}" ]]; then
@@ -82,12 +113,25 @@ if [[ "${host_system}" == Darwin ]]; then
   # Execute beside the daemon: host-side Docker socket forwarding does not
   # give NKD access to the Linux workspace/kernel used by nested producers.
   # Do not inherit a Mac Docker context/endpoint into the selected VM.
+  # SSH does not forward the invocation environment. Preserve only this bounded
+  # redirect vector; the Linux sourcegit owner still validates its keys/values.
+  printf -v remote_redirects ' %q' "GIT_CONFIG_COUNT=${git_config_count}"
+  for ((index = 0; index < git_config_count; index++)); do
+    key="GIT_CONFIG_KEY_${index}"
+    value="GIT_CONFIG_VALUE_${index}"
+    if [[ -z "${!key-}" || -z "${!value-}" ]]; then
+      echo 'Each invocation-local Git entry needs a nonempty key and value.' >&2
+      exit 2
+    fi
+    printf -v remote_entry ' %q %q' "${key}=${!key}" "${value}=${!value}"
+    remote_redirects+="${remote_entry}"
+  done
   if [[ "${check_only}" == 1 ]]; then
-    printf -v remote_command 'cd %q && exec env -u DOCKER_HOST -u DOCKER_CONTEXT CONTAINER_RUNTIME=docker NKE_LOCAL_CLONE=%q bash scripts/nke-full-arm64-local.sh --check %q' \
-      "${repo_root}" "${NKE_LOCAL_CLONE:-}" "${lane}"
+    printf -v remote_command 'cd %q && exec env -u DOCKER_HOST -u DOCKER_CONTEXT CONTAINER_RUNTIME=docker NKE_LOCAL_CLONE=%q%s bash scripts/nke-full-arm64-local.sh --check %q' \
+      "${repo_root}" "${NKE_LOCAL_CLONE:-}" "${remote_redirects}" "${lane}"
   else
-    printf -v remote_command 'cd %q && exec env -u DOCKER_HOST -u DOCKER_CONTEXT CONTAINER_RUNTIME=docker NKE_LOCAL_CLONE=%q bash scripts/nke-full-arm64-local.sh %q %q %q' \
-      "${repo_root}" "${NKE_LOCAL_CLONE:-}" "${attempt}" "${jobs}" "${lane}"
+    printf -v remote_command 'cd %q && exec env -u DOCKER_HOST -u DOCKER_CONTEXT CONTAINER_RUNTIME=docker NKE_LOCAL_CLONE=%q%s bash scripts/nke-full-arm64-local.sh %q %q %q' \
+      "${repo_root}" "${NKE_LOCAL_CLONE:-}" "${remote_redirects}" "${attempt}" "${jobs}" "${lane}"
   fi
   exec colima ssh --profile "${profile}" -- bash -c "${remote_command}"
 fi
@@ -117,8 +161,10 @@ if [[ -n "${NKE_LOCAL_CLONE:-}" ]]; then
   [[ "${NKE_LOCAL_CLONE}" == /* ]] || { echo 'NKE_LOCAL_CLONE must be an absolute path.' >&2; exit 2; }
   git -C "${NKE_LOCAL_CLONE}" rev-parse --git-dir >/dev/null || { echo 'NKE_LOCAL_CLONE must be an accessible Git checkout.' >&2; exit 1; }
   nke_clone="$(cd "${NKE_LOCAL_CLONE}" && pwd -P)"
-  export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0="url.${nke_clone}.insteadOf" GIT_CONFIG_VALUE_0=https://github.com/dsx-ai-factory/nke.git
-  export GIT_CONFIG_KEY_1="url.${nke_clone}.insteadOf" GIT_CONFIG_VALUE_1=https://github.com/dsx-ai-factory/nke
+  export "GIT_CONFIG_KEY_${git_config_count}=url.${nke_clone}.insteadOf" "GIT_CONFIG_VALUE_${git_config_count}=https://github.com/dsx-ai-factory/nke.git"
+  git_config_count=$((git_config_count + 1))
+  export "GIT_CONFIG_KEY_${git_config_count}=url.${nke_clone}.insteadOf" "GIT_CONFIG_VALUE_${git_config_count}=https://github.com/dsx-ai-factory/nke"
+  export GIT_CONFIG_COUNT=$((git_config_count + 1))
   # Git insteadOf is prefix-based; pinned commit/tree verification still owns
   # source identity. The bare NKE form also prefix-matches sibling repository
   # names, so use this override only for this maintained NKE selection.
@@ -186,6 +232,7 @@ fi
 runner="${tools}/nkdctl"
 [[ -f "${runner}" && -x "${runner}" && ! -L "${runner}" ]] || { echo 'Bootstrap did not produce a regular executable.' >&2; exit 1; }
 definition="definitions/nke-local-dev-arm64/definition.json"
+if [[ "${network}" == upstream-ovn ]]; then definition="definitions/nke-local-dev-arm64/definition-upstream-ovn.json"; fi
 if [[ "${lane}" != all ]]; then definition="definitions/nke-local-dev-arm64/definition-${lane}.json"; fi
 if [[ "${lane}" == all || "${lane}" == os || "${lane}" == simulator || "${lane}" == site ]]; then
   # Admit the compiled selection before building/loading/probing a replacement
@@ -248,10 +295,39 @@ if [[ "${lane}" == all || "${lane}" == os || "${lane}" == simulator || "${lane}"
   definition="${bootstrap}/definition.json"
   fi
 fi
+selected_plan_command=("${runner}" run plan --definition "${definition}" --environment "${environment}" --json)
+print_nkdctl_command "${selected_plan_command[@]}"
+"${selected_plan_command[@]}" >"${bootstrap}/selected-plan.json"
+selected_graph_command=("${runner}" run graph --plan "${bootstrap}/selected-plan.json" --view complete --format json)
+print_nkdctl_command "${selected_graph_command[@]}"
+"${selected_graph_command[@]}" >"${bootstrap}/graph.json"
+# This bounded display projection describes the selected Plan, not execution or
+# verification. Preserve owner keys/edges; omit route refs and producer duplicates.
+jq -r '
+  [.vertices[] | select(.kind == "operation")] as $operations |
+  [.vertices[] | select(.kind == "artifact" or .kind == "output")] as $artifacts |
+  ($operations[:512] + $artifacts[:1024] |
+    map(select(([.key, .reference, (.build // "")] | all(type == "string" and length <= 256)) and
+      (.label | type == "string" and length <= 512)))) as $vertices |
+  ($vertices | map({key: .key, value: true}) | from_entries) as $keys |
+  [.edges[] | select($keys[.from] and $keys[.to])] as $displayEdges |
+  ($displayEdges | map(select(.relation | type == "string" and length <= 64))) as $edges |
+  ($vertices[] | "Build vertex: " + tojson),
+  ($edges[:4096][] | "Build edge: " + tojson),
+  "Build display: " + ({vertices: ($vertices | length), edges: ($edges[:4096] | length),
+    truncated: (($operations | length) + ($artifacts | length) > ($vertices | length) or
+      ($displayEdges | length) > ($edges | length) or ($edges | length) > 4096)} | tojson)
+' "${bootstrap}/graph.json" >&2
 preview_command=("${runner}" run local --definition "${definition}" --environment "${environment}" --attempt "${attempt}-preview" --dry-run)
 print_nkdctl_command "${preview_command[@]}"
 "${preview_command[@]}"
 build_command=("${runner}" run local --definition "${definition}" --environment "${environment}" \
   --attempt "${attempt}" --attempts-root .nkd/runs --runner-source . --jobs "${jobs}" --runtime "${runtime}")
+if [[ "${prepare_only}" == 1 ]]; then
+  # This is a private description, not executable authority or source evidence.
+  # Preserve the exact final argv selected above; never pass it through eval.
+  (umask 077; set -o noclobber; jq -cn --args '$ARGS.positional' -- "${build_command[@]}" >"${bootstrap}/build-invocation.json")
+  exit 0
+fi
 print_nkdctl_command "${build_command[@]}"
 exec "${build_command[@]}"

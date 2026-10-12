@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/NVIDIA/nke-recipes/internal/buildactivity"
 	e "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/ir"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/pipeline"
@@ -25,6 +26,7 @@ type localVMPackerExecutor struct {
 	stdout      io.Writer
 	stderr      io.Writer
 	diagnostics *pipeline.PackerDiagnosticSink
+	activity    *buildactivity.Sink
 }
 
 func (localVMPackerResolver) Admit(
@@ -88,7 +90,9 @@ func (localVMPackerResolver) Admit(
 			return nil, err
 		}
 		sourceRoots[request.Subject] = sourceRoot
-		selections = append(selections, pipeline.VMImagePackerSelection{Subject: request.Subject, Node: instruction})
+		selection := pipeline.VMImagePackerSelection{Subject: request.Subject, Node: instruction}
+		selection.ActivityOperation = packerActivityOperation(selected.ID, config.Activity != nil)
+		selections = append(selections, selection)
 	}
 	if len(selections) == 0 {
 		return nil, e.New(e.CodeEngineCapability,
@@ -111,7 +115,18 @@ func (localVMPackerResolver) Admit(
 	return &localVMPackerExecutor{
 		inner: admitted, subjects: subjects, sourceRoots: sourceRoots,
 		stdout: config.Stdout, stderr: config.Stderr, diagnostics: config.Diagnostics,
+		activity: config.Activity,
 	}, nil
+}
+
+// Descriptive labels must not narrow executable Plan admission. A producer can
+// have a valid node ID outside the finite telemetry vocabulary; in that case
+// omit its optional observer without changing its execution selection.
+func packerActivityOperation(nodeID string, enabled bool) string {
+	if enabled && (buildactivity.Record{Version: buildactivity.Version, Operation: nodeID}).Validate() == nil {
+		return nodeID
+	}
+	return ""
 }
 
 // plannedPackerSourceRoot resolves the source route already authored into the
@@ -176,6 +191,7 @@ func (executor *localVMPackerExecutor) RunPacker(
 			"local Packer subject %q has no admitted source route", subject)
 	}
 	return executor.inner.Run(ctx, subject, node, pipeline.VMImagePackerRun{
+		Activity:    executor.activity,
 		SourceRoot:  sourceRoot,
 		Manifest:    materials.manifest,
 		Materials:   materials.inputs,

@@ -47,7 +47,8 @@ admits only `main`; the temporary PR #97 branch-test exception has been removed 
 cancelled attempt. Candidate execution is not organizational publication acceptance. Native disk
 execution classes select the two ARC KVM pools under `githubARC: native-kvm-v1`. They describe requested
 capacity, not observed allocation. `native-toolchains.yaml` substitutes the exact published native
-Packer pins for the nine selected producers per architecture, retaining the separate BuildKit pin.
+Packer pin for the nine selected AMD64 producers only, retaining the separate BuildKit pin.
+The OS catalog directly retains its published ARM64 Docker Packer pin.
 The two inspector profiles use measured executable hashes and published native image manifests.
 Their bounded budgets cover up to an 8 GiB subject and 16 GiB filesystem: 28 GiB inspection memory,
 224 GiB private scratch and a ten-minute deadline. Execution classes request 36 GiB memory to
@@ -129,8 +130,10 @@ cannot substitute for those gates or establish qualified reproduction.
 budgets, not observed allocation or general runner-capacity guarantees. Docker uses the typed runtime
 and producer-declared build-network controls; no ambient storage-driver workaround is selected.
 
-`native-toolchains.yaml` substitutes measured published Packer pins for each architecture's nine selected
-source-map consumers, preserving OVN's separate BuildKit pin. Internal Packer/inspector images were
+`os-catalog` directly retains the historical published ARM64 Docker Packer candidate.
+`native-toolchains.yaml` substitutes the measured published AMD64 Packer pin for its nine selected
+source-map consumers, preserving OVN's separate BuildKit pin. These historical images do not establish
+reproduction of the current Dockerfile or bootstrap compiler. Internal Packer/inspector images were
 published under the user's scoped candidate exception. Their source locks retain unresolved general
 license/security approval gates; the exception does not mark those reviews complete. See
 [Packer preparation and selection](../../toolchains/nkd-packer/README.md#native-preparation-and-catalog-selection)

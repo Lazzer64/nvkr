@@ -600,11 +600,31 @@ retained origin. Before operational Git work, Git's own bounded local-configurat
 include/includeIf, local URL rewriting and delegated worktree/promisor/callback configuration. The query has no
 source token, reads no included configuration, and cancellation remains a timeout. Directory identity rechecks
 do not claim immutable configuration bytes against a concurrent hostile host writer. Unsupported held Git/SSH transports fail capability
-admission before work; the general catalog and ordinary Local route retain their existing Git/SSH behavior.
+admission before work. Ordinary Local retains HTTPS/SSH and local/file transport under the closed configuration
+and bounded credential projection described below, not unrestricted ambient Git behavior.
 Original checkout and receipt directories are rechecked
 through the held workspace before receipt reuse or commit. This capability grants filesystem access only, not
-producer observation, installed-content, publication or qualification authority. Ordinary Local fetch remains
-the existing developer route without these additional guarantees.
+producer observation, installed-content, publication or qualification authority. Ordinary Local fetch retains
+developer HTTPS/SSH transport without the held workspace guarantees. Cleartext HTTP and Git transports are
+not admitted. Clone and ref discovery fix the upload-pack program; clone disables local-path optimization
+with `--no-local` so transferred-object checks also apply to local installer copies, and
+disables recursive submodules; neither receives developer credentials. Its shared Git-command owner excludes
+ambient global callbacks, templates and line-ending conversion, projects selected developer credential and
+proxy/TLS trust settings into network fetch, and admits explicit absolute local-repository redirects. Arbitrary
+SSH command overrides remain excluded. Checkout/status receive no
+developer HOME or helper. The projected global credential keys are helper, username and useHttpPath;
+system helpers, GH/GCM/keyring environment, arbitrary SSH commands and global SSH/URL configuration are
+not inherited. This is bounded helper compatibility, not a claim that every developer login works.
+Explicit redirects admit canonical absolute filesystem paths (including one terminal slash), not file URIs.
+Repository-local filters, includes, HTTP/SSH callbacks, delegated worktrees and object sources fail admission.
+Ordinary local source roots refuse nonempty, untracked, missing, symlinked or mismatched `.gitmodules`
+descriptors and indexed gitlinks. A regular tracked empty descriptor is admitted only when bounded Git
+queries confirm its empty HEAD blob and matching index and worktree; it grants no nested-source acceptance.
+Git owns the bounded nonrecursive index-mode query, whose `ls-files --format` capability requires Git 2.38+;
+a failed capability query names that floor without interpreting private Git output. Disabling
+submodule recursion or ignoring submodules during status does not authenticate nested source cleanliness.
+Real Git fixtures exercise exact checkout bytes, callback exclusion, authenticated fetch and local redirects;
+they do not establish current private-source access or a held workspace receipt.
 
 Dependency vendoring authenticates the selected runtime/daemon and exact native pinned image before source work.
 A bounded, Git-metadata-free archive enters a fresh private volume; the pinned entrypoint, exact vendor arguments

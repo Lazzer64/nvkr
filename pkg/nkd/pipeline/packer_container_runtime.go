@@ -41,6 +41,12 @@ func runPackerContainer(ctx context.Context, request packerContainerRunRequest) 
 func runPackerContainerWithDiagnosticTimeout(ctx context.Context, request packerContainerRunRequest,
 	diagnosticTimeout time.Duration,
 ) (artifact *PackerArtifact, returnErr error) {
+	return runPackerContainerWithTimeouts(ctx, request, diagnosticTimeout, packerContainerCleanupTimeout)
+}
+
+func runPackerContainerWithTimeouts(ctx context.Context, request packerContainerRunRequest,
+	diagnosticTimeout, observerTimeout time.Duration,
+) (artifact *PackerArtifact, returnErr error) {
 	if ctx == nil {
 		return nil, e.New(e.CodeUsage, "running containerized Packer requires a non-nil context")
 	}
@@ -238,7 +244,19 @@ func runPackerContainerWithDiagnosticTimeout(ctx context.Context, request packer
 	if err := createPackerContainer(ctx, request.runtime, build); err != nil {
 		return nil, err
 	}
+	activity := startPackerActivity(ctx, request, resources, workVolume, "nkd-packer-"+attempt+"-activity",
+		[]string{nodeLabel, attemptLabel, "nkd.dev/role=log-activity"})
 	buildErr := startPackerBuildContainer(ctx, request.runtime, buildName, request.stdout, request.stderr, kvmProjection != nil)
+	observerErr := activity.stopWithTimeout(ctx, observerTimeout)
+	var recoveryErr error
+	if activity.unjoined() {
+		resources.mu.Lock()
+		retained := resources.retainedObserver
+		resources.mu.Unlock()
+		recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), packerContainerCleanupTimeout)
+		recoveryErr = diagnosticTarget.recordObserverRetention(recoveryCtx, retained)
+		cancel()
+	}
 	var diagnosticErr error
 	if request.bindings.buildLogDirectoryVariable != "" {
 		diagnosticCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), diagnosticTimeout)
@@ -258,6 +276,14 @@ func runPackerContainerWithDiagnosticTimeout(ctx context.Context, request packer
 			diagnosticErr = errors.Join(diagnosticErr, markerErr)
 		}
 	}
+	if activity.unjoined() {
+		// A live observer never authorizes artifact collection, but its stop
+		// failure must not suppress bounded diagnostics from the build.
+		return nil, errors.Join(buildErr, observerErr, recoveryErr, diagnosticErr)
+	}
+	// A joined observer's failed removal remains registered with resources.
+	// The final reaper owns its retry and rejects the artifact if removal
+	// still fails; a transient metadata cleanup error is not a build failure.
 	if buildErr != nil {
 		return nil, errors.Join(buildErr, diagnosticErr)
 	}
@@ -560,12 +586,14 @@ func packerAttemptID() (string, error) {
 }
 
 type packerContainerResources struct {
-	runtime    packerContainerRuntime
-	mu         sync.Mutex
-	containers []string
-	volumes    []string
-	held       []*heldfile.File
-	workspace  *packerContainerWorkspace
+	runtime          packerContainerRuntime
+	mu               sync.Mutex
+	containers       []string
+	privateObservers map[string]struct{}
+	retainedObserver *packerActivityRetention
+	volumes          []string
+	held             []*heldfile.File
+	workspace        *packerContainerWorkspace
 }
 
 func (resources *packerContainerResources) removeContainer(ctx context.Context, name string) error {
@@ -589,19 +617,41 @@ func (resources *packerContainerResources) cleanup() error {
 
 func (resources *packerContainerResources) cleanupWithTimeout(timeout time.Duration) error {
 	resources.mu.Lock()
+	retained := resources.retainedObserver
 	containers := append([]string(nil), resources.containers...)
+	privateObservers := resources.privateObservers
 	volumes := append([]string(nil), resources.volumes...)
 	held := append([]*heldfile.File(nil), resources.held...)
 	workspace := resources.workspace
 	resources.containers, resources.volumes = nil, nil
+	resources.privateObservers = nil
 	resources.held, resources.workspace = nil, nil
+	if retained != nil {
+		// Only the observer's exact dependency closure must remain. Other
+		// containers and the input volume still receive bounded reaping; the
+		// completed staging archives are not inputs to either observer client.
+		resources.containers = []string{retained.container}
+		resources.privateObservers = map[string]struct{}{retained.container: {}}
+		resources.volumes = []string{retained.work}
+		resources.workspace = workspace
+	}
 	resources.mu.Unlock()
 	var cleanupErrors []error
+	if retained != nil {
+		cleanupErrors = append(cleanupErrors, retained.err())
+	}
 	containerCtx, cancelContainers := context.WithTimeout(context.Background(), timeout)
 	for index := len(containers) - 1; index >= 0; index-- {
+		if retained != nil && containers[index] == retained.container {
+			continue
+		}
 		if err := resources.runtime.Cleanup(containerCtx, packerContainerTerminationGrace, io.Discard, io.Discard,
 			"rm", "-fv", containers[index]); err != nil {
-			cleanupErrors = append(cleanupErrors, err)
+			if _, private := privateObservers[containers[index]]; private {
+				cleanupErrors = append(cleanupErrors, e.New(e.CodeInternal, "owned Packer log observer cleanup failed"))
+			} else {
+				cleanupErrors = append(cleanupErrors, err)
+			}
 		}
 	}
 	cancelContainers()
@@ -609,6 +659,9 @@ func (resources *packerContainerResources) cleanupWithTimeout(timeout time.Durat
 	// teardown cannot consume the entire cleanup budget and strand volumes.
 	volumeCtx, cancelVolumes := context.WithTimeout(context.Background(), timeout)
 	for index := len(volumes) - 1; index >= 0; index-- {
+		if retained != nil && volumes[index] == retained.work {
+			continue
+		}
 		if err := resources.runtime.Cleanup(volumeCtx, packerContainerTerminationGrace, io.Discard, io.Discard,
 			"volume", "rm", "-f", volumes[index]); err != nil {
 			cleanupErrors = append(cleanupErrors, err)
@@ -620,8 +673,10 @@ func (resources *packerContainerResources) cleanupWithTimeout(timeout time.Durat
 			cleanupErrors = append(cleanupErrors, err)
 		}
 	}
-	if err := workspace.cleanup(); err != nil {
-		cleanupErrors = append(cleanupErrors, err)
+	if retained == nil {
+		if err := workspace.cleanup(); err != nil {
+			cleanupErrors = append(cleanupErrors, err)
+		}
 	}
 	return errors.Join(cleanupErrors...)
 }

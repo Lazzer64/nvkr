@@ -46,6 +46,20 @@ var networkSysctls = []string{"net.ipv4.ip_forward", "net.ipv4.fib_multipath_has
 var networkCapabilities = map[string]string{"dnsmasq": "cap_net_bind_service,cap_net_admin,cap_net_raw=ep", "nico-sim": "cap_net_admin=ep"}
 var networkTools = []string{"sudo", "timeout", "ip", "iptables", "dnsmasq", "setcap", "getcap", "virsh", "ps", "sysctl", "cp", "chmod", "install", "mv", "sha256sum", "unlink", "stat"}
 
+const networkSudoProbe = "sudo -n -k timeout --signal=TERM --kill-after=5 25 true"
+
+// Unattended commands ignore cached credentials without invalidating the user's
+// timestamp. Interactive commands use the caller's preauthenticated session;
+// sudo -n refuses expired credentials or a denied policy without replay.
+func networkSudoCommand(args []string, interactive bool) []string {
+	prefix := []string{"sudo", "-n"}
+	if !interactive {
+		prefix = append(prefix, "-k")
+	}
+	prefix = append(prefix, "timeout", "--signal=TERM", "--kill-after=5", "25")
+	return append(prefix, args...)
+}
+
 type networkFileID struct {
 	Device uint64 `json:"device"`
 	Inode  uint64 `json:"inode"`
@@ -76,6 +90,7 @@ type networkState struct {
 	PID           int                 `json:"pid"`
 	Owner         string              `json:"owner"`
 	KindCIDR      string              `json:"kindCIDR"`
+	KindGateway   string              `json:"kindGateway,omitempty"`
 	BridgeMAC     string              `json:"bridgeMAC"`
 	BridgeID      string              `json:"bridgeID"`
 	BridgeIntent  bool                `json:"bridgeIntent"`
@@ -113,6 +128,7 @@ type NetworkGuard struct {
 	sysctls                                    map[string]string
 	sysctlIntents                              []string
 	rules                                      []networkRule
+	kindGateway                                string
 	caps                                       []networkCapability
 	dns                                        *OwnedProcess
 	cleaning, journal, finished                bool
@@ -124,6 +140,7 @@ type NetworkGuard struct {
 	stopDNSHook            func(context.Context) error
 	helperPath, policyPath string
 	lockPath               string
+	probeExecutable        string
 }
 
 func networkPlatform() error {
@@ -187,11 +204,22 @@ func validateNetworkKind(kindCIDR string) error {
 
 // NewNetworkGuard admits the host, resources, private workspace and kernel lock,
 // then durably records an empty intent ledger before returning a Start obligation.
-func NewNetworkGuard(ctx context.Context, runner Runner, kindCIDR string) (*NetworkGuard, error) {
+func NewNetworkGuard(ctx context.Context, runner Runner, kindCIDR, demoExecutable string) (result *NetworkGuard, resultErr error) {
+	boundary := beginProgress(runner.Progress, "network-preflight", PhaseStarted, PhaseFinished, PhaseFailed)
+	defer func() {
+		if resultErr != nil {
+			resultErr = fmt.Errorf("network preflight: %w", resultErr)
+		}
+		boundary.finish(resultErr)
+	}()
 	if err := requireContext(ctx); err != nil {
 		return nil, err
 	}
 	if err := networkPlatform(); err != nil {
+		return nil, err
+	}
+	probeExecutable, err := admitNetworkProbeExecutable(ctx, demoExecutable)
+	if err != nil {
 		return nil, err
 	}
 	for _, name := range networkTools {
@@ -203,11 +231,143 @@ func NewNetworkGuard(ctx context.Context, runner Runner, kindCIDR string) (*Netw
 	if err != nil {
 		return nil, err
 	}
+	g.probeExecutable = probeExecutable
 	if err = g.admit(ctx); err != nil {
 		g.releaseHandles()
 		return nil, err
 	}
 	return g, nil
+}
+
+func admitNetworkProbeExecutable(ctx context.Context, path string) (string, error) {
+	if ctx == nil {
+		return "", nkderr.New(nkderr.CodeUsage, "network probe executable requires a context")
+	}
+	if err := requireContext(ctx); err != nil {
+		return "", nkderr.Wrap(nkderr.CodeTimeout, err, "network probe executable context")
+	}
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return "", nkderr.New(nkderr.CodeEngineCapability, "require explicitly selected absolute native demo executable for network admission")
+	}
+	resolved, err := resolveExisting(path)
+	if err != nil {
+		return "", nkderr.Wrap(nkderr.CodeEngineCapability, err, "resolve network probe executable")
+	}
+	held, info, err := holdNetworkProbeExecutable(ctx, resolved)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return "", nkderr.Wrap(nkderr.CodeTimeout, err, "network probe executable context")
+		}
+		return "", nkderr.Wrap(nkderr.CodeEngineCapability, err, "open network probe executable")
+	}
+	defer held.Close()
+	var st unix.Stat_t
+	if err = unix.Fstat(int(held.Fd()), &st); err != nil {
+		return "", nkderr.Wrap(nkderr.CodeEngineCapability, err, "inspect network probe executable")
+	}
+	if info.Mode().Perm()&0o111 == 0 || st.Mode&0o6022 != 0 || st.Uid != 0 && st.Uid != uint32(os.Getuid()) {
+		return "", nkderr.New(nkderr.CodeEngineCapability, "network probe requires an executable owned by root/current user without set-ID or group/other write permissions")
+	}
+	if err = ctx.Err(); err != nil {
+		return "", nkderr.Wrap(nkderr.CodeTimeout, err, "network probe executable context")
+	}
+	return resolved, nil
+}
+
+// Reuse securepath's descriptor-relative O_NOFOLLOW walk, as the existing
+// source-vendor helper admission does. The sudo child later executes by path;
+// reject ancestors another principal could rename. This is trusted-host path
+// admission, not immutable executable authority against root/the same user.
+func holdNetworkProbeExecutable(ctx context.Context, path string) (*os.File, os.FileInfo, error) {
+	current, _, err := securepath.OpenDirectory(string(filepath.Separator))
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() {
+		if current != nil {
+			_ = current.Close()
+		}
+	}()
+	parts := strings.Split(strings.TrimPrefix(path, string(filepath.Separator)), string(filepath.Separator))
+	for index, part := range parts {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		var stat unix.Stat_t
+		if err := unix.Fstat(int(current.Fd()), &stat); err != nil {
+			return nil, nil, err
+		}
+		if err := networkProbeDirectoryProtection(stat.Uid, stat.Mode); err != nil {
+			return nil, nil, err
+		}
+		directory := index != len(parts)-1
+		next, info, err := securepath.OpenChild(current, part, directory)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := current.Close(); err != nil {
+			_ = next.Close()
+			return nil, nil, err
+		}
+		current = next
+		if !directory {
+			current = nil // Transfer the exact final descriptor to its caller.
+			return next, info, nil
+		}
+	}
+	return nil, nil, errors.New("network probe path has no executable member")
+}
+
+// Native Stat_t mode is uint16 on Darwin and uint32 on Linux. Keep that
+// existing representation; the permission predicate is identical on both.
+func networkProbeDirectoryProtection[T ~uint16 | ~uint32](uid uint32, mode T) error {
+	trustedOwner := uid == 0 || uid == uint32(os.Getuid())
+	// Root-owned sticky temporary directories protect each accepted root/user
+	// child against other users' rename/unlink. Non-sticky writable ancestors
+	// and foreign-owned intermediate children are never admitted.
+	stickyRoot := uid == 0 && mode&unix.S_ISVTX != 0
+	if mode&unix.S_IFMT != unix.S_IFDIR || !trustedOwner || mode&0o111 == 0 || mode&0o022 != 0 && !stickyRoot {
+		return errors.New("network probe ancestors must be root/current-user owned and not replaceable by other principals")
+	}
+	return nil
+}
+
+// ProbeNetworkPrivilegedPorts is the fixed native helper: it accepts no target,
+// configuration or workspace and performs no durable host mutation. The guard
+// invokes it through its existing bounded sudo child before recording intent.
+func ProbeNetworkPrivilegedPorts(ctx context.Context) error {
+	if err := requireContext(ctx); err != nil {
+		return nkderr.Wrap(nkderr.CodePreflightFailed, err, "network port probe context")
+	}
+	if err := networkPlatform(); err != nil {
+		return err
+	}
+	return probeNetworkPrivilegedPorts(ctx, networkProbePort)
+}
+
+func probeNetworkPrivilegedPorts(ctx context.Context, probe func(bool, int) error) error {
+	for _, row := range []struct {
+		udp  bool
+		port int
+	}{{false, 53}, {true, 53}, {true, 67}} {
+		if err := requireContext(ctx); err != nil {
+			return nkderr.Wrap(nkderr.CodePreflightFailed, err, "network port probe context")
+		}
+		if err := probe(row.udp, row.port); err != nil {
+			return nkderr.Wrap(nkderr.CodePreflightFailed, err, "bind demo port %d (UDP=%t)", row.port, row.udp)
+		}
+	}
+	return nil
+}
+
+func (g *NetworkGuard) probePrivilegedPorts(ctx context.Context) error {
+	if g.probeExecutable == "" {
+		return nkderr.New(nkderr.CodeEngineCapability, "network port probe executable was not admitted")
+	}
+	if _, err := g.Command(ctx, []string{g.probeExecutable, "network-port-probe"}, true); err != nil {
+		return fmt.Errorf("privileged DNS/DHCP port admission: %w", err)
+	}
+	return nil
 }
 
 func (g *NetworkGuard) acquireLock() error {
@@ -253,7 +413,10 @@ func (g *NetworkGuard) admit(ctx context.Context) error {
 		return fmt.Errorf("network journal exists or cannot be inspected; recover original work directory")
 	}
 	if _, err := g.Command(ctx, []string{"true"}, true); err != nil {
-		return err
+		if g.runner.sudoAuthentication() != nil {
+			return fmt.Errorf("interactive networking authorization failed; authenticate in the original terminal and retry network recovery if controls remain; see docs/local-nke-demo.md: %w", err)
+		}
+		return fmt.Errorf("required unattended networking authorization failed; check `%s` (ignores temporary cached credentials without clearing them); see docs/local-nke-demo.md#2-install-prerequisites-on-the-ubuntu-execution-host: %w", networkSudoProbe, err)
 	}
 	var links []networkLink
 	if err := g.inventory(ctx, []string{"ip", "-j", "link", "show"}, &links); err != nil {
@@ -315,10 +478,13 @@ func (g *NetworkGuard) admit(ctx context.Context) error {
 			}
 		}
 	}
+	if err = g.probePrivilegedPorts(ctx); err != nil {
+		return err
+	}
 	for _, row := range []struct {
 		udp  bool
 		port int
-	}{{false, 53}, {true, 53}, {true, 67}, {false, 18080}, {false, 7777}, {false, 10179}} {
+	}{{false, 18080}, {false, 7777}, {false, 10179}} {
 		if err = networkProbePort(row.udp, row.port); err != nil {
 			return err
 		}
@@ -355,10 +521,21 @@ func (g *NetworkGuard) Command(ctx context.Context, args []string, privileged bo
 		}
 		return raw, err
 	}
-	if privileged {
-		args = append([]string{"sudo", "-n", "timeout", "--signal=TERM", "--kill-after=5", "25"}, args...)
-	}
 	runner := g.runner
+	if privileged {
+		interactive, err := runner.authenticateSudo(ctx)
+		if err != nil {
+			if errors.Is(err, ErrUnjoined) {
+				g.unjoined.Store(true)
+			}
+			return nil, fmt.Errorf("network sudo authentication: %w", err)
+		}
+		args = networkSudoCommand(args, interactive)
+	}
+	// Inventory and absence checks legitimately return nonzero status. Keep
+	// their private numbered logs and errors, but report progress at the owning
+	// setup/cleanup boundary only, after that status has been interpreted.
+	runner.Progress = nil
 	if g.cleaning {
 		runner.Work = ""
 	}
@@ -416,7 +593,7 @@ func networkFile(ctx context.Context, path string, private bool) (networkFileID,
 }
 
 func (g *NetworkGuard) snapshot() networkState {
-	return networkState{Version: 2, Work: g.Work, UID: uint32(os.Getuid()), Boot: g.boot, PID: g.pid, Owner: g.Owner, KindCIDR: g.KindCIDR, BridgeMAC: g.BridgeMAC, BridgeID: g.BridgeID, BridgeIntent: g.BridgeIntent, PolicyID: g.policyID, Staging: g.staging, HelperID: g.helperID, HelperHash: g.helperHash, HelperGranted: g.helperGranted, Sysctls: g.sysctls, SysctlIntents: g.sysctlIntents, Rules: g.rules, Caps: g.caps, Finished: g.finished, BGPIntent: g.BGPIntent}
+	return networkState{Version: 2, Work: g.Work, UID: uint32(os.Getuid()), Boot: g.boot, PID: g.pid, Owner: g.Owner, KindCIDR: g.KindCIDR, KindGateway: g.kindGateway, BridgeMAC: g.BridgeMAC, BridgeID: g.BridgeID, BridgeIntent: g.BridgeIntent, PolicyID: g.policyID, Staging: g.staging, HelperID: g.helperID, HelperHash: g.helperHash, HelperGranted: g.helperGranted, Sysctls: g.sysctls, SysctlIntents: g.sysctlIntents, Rules: g.rules, Caps: g.caps, Finished: g.finished, BGPIntent: g.BGPIntent}
 }
 
 func (g *NetworkGuard) Checkpoint(ctx context.Context) error {
@@ -443,7 +620,7 @@ func (g *NetworkGuard) checkpoint(ctx context.Context) error {
 		if readErr != nil {
 			return readErr
 		}
-		if old.Owner != g.Owner || old.Boot != g.boot || old.PID != g.pid || old.KindCIDR != g.KindCIDR || old.BridgeMAC != g.BridgeMAC || old.HelperID != g.helperID || old.HelperHash != g.helperHash || !maps.Equal(old.Sysctls, g.sysctls) {
+		if old.Owner != g.Owner || old.Boot != g.boot || old.PID != g.pid || old.KindCIDR != g.KindCIDR || old.KindGateway != "" && old.KindGateway != g.kindGateway || old.BridgeMAC != g.BridgeMAC || old.HelperID != g.helperID || old.HelperHash != g.helperHash || !maps.Equal(old.Sysctls, g.sysctls) {
 			return fmt.Errorf("network journal ownership or original host binding changed")
 		}
 		if err = g.checkDirectory(); err != nil {
@@ -563,7 +740,14 @@ func (g *NetworkGuard) BridgeBinding(ctx context.Context) (string, error) {
 	return strconv.Itoa(row.Index), nil
 }
 
-func (g *NetworkGuard) Start(ctx context.Context) error {
+func (g *NetworkGuard) Start(ctx context.Context) (resultErr error) {
+	boundary := beginProgress(g.runner.Progress, "network-setup", PhaseStarted, PhaseFinished, PhaseFailed)
+	defer func() {
+		if resultErr != nil {
+			resultErr = fmt.Errorf("network setup: %w", resultErr)
+		}
+		boundary.finish(resultErr)
+	}()
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.cleaning || g.finished || g.BridgeIntent {
@@ -762,6 +946,71 @@ func (g *NetworkGuard) grant(ctx context.Context, path, capabilities string) err
 func guestTCPRule(owner, address string, port int) networkRule {
 	return networkRule{"raw", "PREROUTING", []string{"-m", "comment", "--comment", owner, "-i", BridgeName, "-s", GuestCIDR, "-d", address, "-p", "tcp", "--dport", strconv.Itoa(port), "-j", "ACCEPT"}}
 }
+
+func kindSimulatorRule(owner, kind, gateway string) networkRule {
+	return networkRule{"filter", "INPUT", []string{"-m", "comment", "--comment", owner, "-s", kind, "-d", gateway + "/32", "-p", "tcp", "--dport", strconv.Itoa(simulatorAPIPort), "-j", "ACCEPT"}}
+}
+
+func admittedKindGateway(kind, gateway string) error {
+	if err := validateNetworkKind(kind); err != nil {
+		return err
+	}
+	prefix := netip.MustParsePrefix(kind)
+	target, err := netip.ParseAddr(gateway)
+	if err != nil || !target.Is4() || target.String() != gateway || !prefix.Contains(target) || target == prefix.Addr() || target == networkLast(prefix) {
+		return fmt.Errorf("simulator grant requires the exact admitted Kind IPv4 gateway")
+	}
+	return nil
+}
+
+// AllowKindSimulator grants only the admitted Kind subnet's access to the
+// simulator on its admitted host gateway. The caller supplies the gateway from
+// the same Docker network admission as KindCIDR; no host-wide INPUT policy changes.
+func (g *NetworkGuard) AllowKindSimulator(ctx context.Context, gateway string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err := requireContext(ctx); err != nil {
+		return err
+	}
+	if err := admittedKindGateway(g.KindCIDR, gateway); err != nil {
+		return err
+	}
+	if g.cleaning || g.finished || !g.BridgeIntent || g.kindGateway != "" {
+		return fmt.Errorf("simulator grant requires a fresh active owned bridge")
+	}
+	binding, err := g.BridgeBinding(ctx)
+	if err != nil {
+		return err
+	}
+	if binding == "" {
+		return fmt.Errorf("owned bridge absent")
+	}
+	row := kindSimulatorRule(g.Owner, g.KindCIDR, gateway)
+	exists, err := g.ruleExists(ctx, row)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("fresh simulator rule exists")
+	}
+	g.kindGateway = gateway
+	g.rules = append(g.rules, row)
+	if err = g.checkpoint(ctx); err != nil {
+		return err
+	}
+	if err = g.ruleCommand(ctx, row, "-I"); err != nil {
+		return err
+	}
+	exists, err = g.ruleExists(ctx, row)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("simulator insert did not survive readback")
+	}
+	return nil
+}
+
 func admittedGuestTCP(kind, address string, ports []int) error {
 	prefix, err := netip.ParsePrefix(kind)
 	if err != nil {
@@ -943,7 +1192,14 @@ func (g *NetworkGuard) SetCleaning(value bool) { g.mu.Lock(); defer g.mu.Unlock(
 
 // Close stops/joins DNS first, verifies all guest producers are idle, and restores
 // only exact held controls. Restoration does not require successful log writes.
-func (g *NetworkGuard) Close(ctx context.Context) error {
+func (g *NetworkGuard) Close(ctx context.Context) (resultErr error) {
+	boundary := beginProgress(g.runner.Progress, "network-cleanup", PhaseStarted, PhaseFinished, PhaseFailed)
+	defer func() {
+		if resultErr != nil {
+			resultErr = fmt.Errorf("network cleanup: %w", resultErr)
+		}
+		boundary.finish(resultErr)
+	}()
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.finished {

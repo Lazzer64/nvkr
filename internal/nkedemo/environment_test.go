@@ -87,20 +87,35 @@ func TestSimulatorEnvironmentExcludesAmbientAuthority(t *testing.T) {
 	}
 }
 func TestDemoAdmissionHasNoPartialOutput(t *testing.T) {
-	parent := t.TempDir()
-	out := filepath.Join(parent, "new")
-	var progress bytes.Buffer
-	err := Run(context.Background(), Config{Out: out, Timeout: 300 * time.Second, Progress: &progress})
-	if nkderr.ExitCode(err) != 17 {
-		t.Fatalf("expected coded preflight error,got %v", err)
-	}
-	if strings.Contains(err.Error(), "tenant budget") {
-		t.Fatal("invalid timeout masked the remaining admission checks")
-	}
-	if _, statErr := os.Lstat(out); !os.IsNotExist(statErr) {
-		t.Fatal("failed admission created output")
-	}
-	if strings.Contains(progress.String(), "PASS:") {
-		t.Fatal("failed admission emittedPASS")
+	// No host Docker invocation or gateway bind belongs in a default contract
+	// test. In-range budgets reach a deterministic missing-tool boundary only;
+	// this does not prove later disk-space or libvirt admission checks.
+	t.Setenv("PATH", t.TempDir())
+	for _, budget := range []time.Duration{5 * time.Minute, time.Hour, 2 * time.Hour, 299 * time.Second, 7201 * time.Second, time.Duration(9223372036854775807)} {
+		t.Run(budget.String(), func(t *testing.T) {
+			out := filepath.Join(t.TempDir(), "new")
+			var progress bytes.Buffer
+			cfg := Config{Out: out, Timeout: budget, Progress: &progress}
+			// Exercise the owning admission directly so macOS's earlier platform
+			// check cannot hide invalid budgets from this boundary test.
+			_, admissionErr := admitDemo(t.Context(), cfg)
+			invalid := budget < 5*time.Minute || budget > 2*time.Hour
+			if admissionErr == nil || strings.Contains(admissionErr.Error(), "tenant budget") != invalid {
+				t.Fatalf("budget validation masked other checks or accepted invalid input: %v", admissionErr)
+			}
+			if !invalid && !strings.Contains(admissionErr.Error(), `executable "docker" absent from explicit PATH`) {
+				t.Fatalf("valid budget did not reach the hermetic missing-Docker boundary: %v", admissionErr)
+			}
+			err := Run(context.Background(), cfg)
+			if nkderr.ExitCode(err) != 17 {
+				t.Fatalf("expected coded preflight error, got %v", err)
+			}
+			if _, statErr := os.Lstat(out); !os.IsNotExist(statErr) {
+				t.Fatal("failed admission created output")
+			}
+			if strings.Contains(progress.String(), "PASS:") {
+				t.Fatal("failed admission emitted PASS")
+			}
+		})
 	}
 }

@@ -19,16 +19,22 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/canonical"
+	nkderr "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/lifecycle"
 	"go.yaml.in/yaml/v3"
 )
 
 const registryImage = "docker.io/library/registry@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8"
-const registryPort = 15501
-const registryBytes int64 = 1 << 30
+
+// The full site image closure can exceed 1 GiB once the largest in-flight
+// upload and metadata headroom are included. Keep admission and the ephemeral
+// registry's tmpfs on the same bounded 2 GiB ceiling.
+const registryBytes int64 = 2 << 30
 
 var chartOutputs = map[string]string{"controller": "controller-chart", "nktp": "nktp", "postgresql": "postgresql", "spire": "spire", "spire-crds": "spire-crds", "temporal": "temporal"}
 var runtimeImages = []string{"csi-node-driver-registrar", "postgresql", "spiffe-csi", "spire-agent", "spire-bash", "spire-controller-manager", "spire-oidc", "spire-server", "spire-tpm-server", "temporal-admin-tools", "temporal-server", "temporal-ui"}
@@ -41,25 +47,34 @@ type SelectedOutput struct {
 	Observation lifecycle.Artifact
 }
 type SiteMaterials struct {
-	Outputs                       map[string]SelectedOutput
-	Gateway, RegistryID, KindCIDR string
+	Outputs                                      map[string]SelectedOutput
+	Gateway, RegistryID, KindCIDR, KindNetworkID string
 }
 type SiteConnection struct{ Token, Endpoint, Org string }
 
-// Profiles use the source-owned chart's existing directory interface. The path
-// is inside the owned Kind container, not a mount of the workstation filesystem.
-func profilesVolumeValues() map[string]any {
+// The source-owned chart copies the selected content image into its emptyDir.
+func profilesImageValues(reference string) map[string]any {
+	repository, digest, _ := strings.Cut(reference, "@")
 	return map[string]any{
-		"profiles":     map[string]any{"path": "/profiles", "image": map[string]any{"enabled": false}},
-		"volumes":      []any{map[string]any{"name": "local-profiles", "hostPath": map[string]string{"path": "/var/nkd-local-profiles/profiles", "type": "Directory"}}},
-		"volumeMounts": []any{map[string]any{"name": "local-profiles", "mountPath": "/profiles", "readOnly": true}},
+		"profiles": map[string]any{"path": "/profiles", "image": map[string]any{
+			"enabled": true, "repository": repository, "digest": digest, "tag": ""}},
 	}
 }
 
 func imageKeys() []string {
-	keys := []string{"cwe", "profiles", "provider"}
+	keys := []string{"cwe", "profiles", "provider", "ovn"}
 	for _, name := range runtimeImages {
 		keys = append(keys, "runtime-"+name)
+	}
+	return keys
+}
+
+// OVN is selected only for the OVN diagnostic. All other site images remain
+// mandatory in both modes, including the source-owned profiles image.
+func selectedImageKeys(outputs map[string]SelectedOutput) []string {
+	keys := imageKeys()
+	if _, selected := outputs["ovn"]; !selected {
+		keys = slices.DeleteFunc(keys, func(key string) bool { return key == "ovn" })
 	}
 	return keys
 }
@@ -83,7 +98,7 @@ func selectSiteOutput(ctx context.Context, root, name, kind string) (SelectedOut
 
 func registryCapacity(outputs map[string]SelectedOutput) (int64, error) {
 	blobs := make(map[string]int64)
-	for _, key := range imageKeys() {
+	for _, key := range selectedImageKeys(outputs) {
 		selected, ok := outputs[key]
 		if !ok {
 			return 0, errors.New("missing registry input: " + key)
@@ -127,6 +142,10 @@ func registryCapacity(outputs map[string]SelectedOutput) (int64, error) {
 // AdmitSite validates the entire host, source, tools and site selection before
 // creating outputs or granting simulator/registry/network controls.
 func AdmitSite(ctx context.Context, cfg Config) (*SiteMaterials, error) {
+	profilesName, err := selectedProfilesOutput(cfg.Network)
+	if err != nil {
+		return nil, err
+	}
 	admitted, err := admitManagement(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -154,7 +173,7 @@ func AdmitSite(ctx context.Context, cfg Config) (*SiteMaterials, error) {
 		}
 		outputs[item] = selected
 	}
-	for _, item := range []struct{ key, root, name, kind string }{{"cwe", cfg.Runs.Site, "cwe", "oci"}, {"profiles", cfg.Runs.Profiles, "controller-profiles", "executable"}, {"provider", cfg.Runs.Providers, "capnico-controller-arm64", "oci"}, {"nkectl", cfg.Runs.Site, "nkectl", "executable"}} {
+	for _, item := range []struct{ key, root, name, kind string }{{"cwe", cfg.Runs.Site, "cwe", "oci"}, {"profiles", cfg.Runs.Profiles, profilesName, "oci"}, {"provider", cfg.Runs.Providers, "capnico-controller-arm64", "oci"}, {"nkectl", cfg.Runs.Site, "nkectl", "executable"}} {
 		selected, readErr := selectSiteOutput(ctx, item.root, item.name, item.kind)
 		if readErr != nil {
 			return nil, readErr
@@ -167,6 +186,26 @@ func AdmitSite(ctx context.Context, cfg Config) (*SiteMaterials, error) {
 			return nil, readErr
 		}
 		outputs["runtime-"+name] = selected
+	}
+	mode, err := normalizeNetwork(cfg.Network)
+	if err != nil {
+		return nil, err
+	}
+	if mode != "kind-calico" {
+		_, imageName, chartName, selectionErr := selectedOVNOutputs(mode)
+		if selectionErr != nil {
+			return nil, selectionErr
+		}
+		for _, item := range []struct{ key, name, kind string }{{"ovn", imageName, "oci"}, {"ovn-chart", chartName, "helm-oci"}} {
+			selected, readErr := selectSiteOutput(ctx, cfg.Runs.Components, item.name, item.kind)
+			if readErr != nil {
+				return nil, readErr
+			}
+			outputs[item.key] = selected
+		}
+		if err = admitSiteOVNChartForNetwork(ctx, mode, outputs["ovn-chart"], outputs["ovn"]); err != nil {
+			return nil, err
+		}
 	}
 	if _, err = registryCapacity(outputs); err != nil {
 		return nil, err
@@ -183,49 +222,101 @@ func AdmitSite(ctx context.Context, cfg Config) (*SiteMaterials, error) {
 	if len(images) != 1 || images[0].Architecture != "arm64" || images[0].ID == "" {
 		return nil, errors.New("cache exact ARM64 registry service before site execution")
 	}
+	network, err := admitKindNetwork(ctx, runner)
+	if err != nil {
+		return nil, err
+	}
+	if err = admitSiteCIDRs(network.CIDR); err != nil {
+		return nil, err
+	}
+	return &SiteMaterials{Outputs: outputs, Gateway: network.Gateway, RegistryID: images[0].ID, KindCIDR: network.CIDR, KindNetworkID: network.ID}, nil
+}
+
+type kindNetwork struct{ Gateway, CIDR, ID string }
+
+// The build and deployment preflights inspect the same native Docker network;
+// neither assumes a default subnet or accepts a caller-supplied gateway.
+func admitKindNetwork(ctx context.Context, runner Runner) (kindNetwork, error) {
 	type networkDescription struct {
-		Driver string
-		IPAM   struct {
+		ID, Driver string
+		IPAM       struct {
 			Config []struct{ Gateway, Subnet string }
 		}
 	}
 	networks, err := captureJSON[[]networkDescription](ctx, runner, []string{"docker", "network", "inspect", "kind"}, "admit-kind-network")
 	if err != nil {
-		return nil, err
+		return kindNetwork{}, err
 	}
-	if len(networks) != 1 || networks[0].Driver != "bridge" {
-		return nil, errors.New("require existing Kind bridge network")
+	if len(networks) != 1 || networks[0].Driver != "bridge" || networks[0].ID == "" {
+		return kindNetwork{}, errors.New("require existing Kind bridge network")
 	}
 	gateway, cidr := "", ""
 	for _, config := range networks[0].IPAM.Config {
 		address, readErr := netip.ParseAddr(config.Gateway)
 		if readErr != nil {
-			return nil, errors.New("invalid Kind gateway")
+			return kindNetwork{}, errors.New("invalid Kind gateway")
 		}
 		if !address.Is4() {
 			continue
 		}
 		if gateway != "" || !address.IsPrivate() {
-			return nil, errors.New("ambiguous private Kind IPv4 gateway")
+			return kindNetwork{}, errors.New("ambiguous private Kind IPv4 gateway")
 		}
 		prefix, readErr := netip.ParsePrefix(config.Subnet)
 		if readErr != nil || !prefix.Contains(address) {
-			return nil, errors.New("invalid Kind subnet")
+			return kindNetwork{}, errors.New("invalid Kind subnet")
 		}
 		gateway, cidr = address.String(), prefix.String()
 	}
 	if gateway == "" {
-		return nil, errors.New("missing private Kind IPv4 gateway")
+		return kindNetwork{}, errors.New("missing private Kind IPv4 gateway")
 	}
-	var listen net.ListenConfig
-	listener, err := listen.Listen(ctx, "tcp4", net.JoinHostPort(gateway, fmt.Sprint(registryPort)))
+	if err = validateNetworkKind(cidr); err != nil {
+		return kindNetwork{}, err
+	}
+	if err = admitSiteCIDRs(cidr); err != nil {
+		return kindNetwork{}, err
+	}
+	return kindNetwork{Gateway: gateway, CIDR: cidr, ID: networks[0].ID}, nil
+}
+
+func admitSimulatorEndpoint(ctx context.Context, runner Runner) error {
+	network, err := admitKindNetwork(ctx, runner)
 	if err != nil {
-		return nil, err
+		return err
+	}
+	return admitSimulatorPort(ctx, network.Gateway)
+}
+
+// This admission is a point-in-time availability check, not port ownership or
+// cleanup authorization. The owning simulator still has to bind at launch.
+const simulatorAPIPort = 18089
+
+func admitSimulatorPort(ctx context.Context, gateway string) error {
+	return admitSimulatorPortAt(ctx, gateway, simulatorAPIPort)
+}
+
+// Only socket fixtures select another port. Production callers use the fixed
+// wrapper above; this is not a configuration override or fallback endpoint.
+func admitSimulatorPortAt(ctx context.Context, gateway string, port int) error {
+	if ctx == nil || port < 1 || port > 65535 {
+		return nkderr.New(nkderr.CodeUsage, "simulator port admission requires a context and valid TCP port")
+	}
+	if err := ctx.Err(); err != nil {
+		return nkderr.Wrap(nkderr.CodeTimeout, err, "simulator port admission canceled")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	address := net.JoinHostPort(gateway, strconv.Itoa(port))
+	var config net.ListenConfig
+	listener, err := config.Listen(ctx, "tcp4", address)
+	if err != nil {
+		return nkderr.Wrap(nkderr.CodePreflightFailed, err, "NICoSim API endpoint %s is unavailable; inspect its listener with `sudo ss -ltnp 'sport = :%d'`; use the original retained session with `nke-demo status --session` and `nke-demo cleanup --session` if its owner is connected; after a forced exit see docs/nkd-to-nke-demo.md#recover-network-controls-after-a-crash; unrelated listeners are never stopped automatically", address, port)
 	}
 	if err = listener.Close(); err != nil {
-		return nil, err
+		return nkderr.Wrap(nkderr.CodePreflightFailed, err, "close NICoSim API preflight listener %s", address)
 	}
-	return &SiteMaterials{Outputs: outputs, Gateway: gateway, RegistryID: images[0].ID, KindCIDR: cidr}, nil
+	return nil
 }
 
 func validateEndpoint(value string) (string, error) {
@@ -234,8 +325,8 @@ func validateEndpoint(value string) (string, error) {
 		return "", errors.New("invalid NICoSim endpoint")
 	}
 	address, err := netip.ParseAddr(parsed.Hostname())
-	if err != nil || parsed.Scheme != "http" || parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" || !address.Is4() || !address.IsPrivate() || address.IsLoopback() || address.IsUnspecified() || parsed.Port() != "18089" {
-		return "", errors.New("require private non-loopback NICoSim HTTP endpoint on port18089")
+	if err != nil || parsed.Scheme != "http" || parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" || !address.Is4() || !address.IsPrivate() || address.IsLoopback() || address.IsUnspecified() || parsed.Port() != strconv.Itoa(simulatorAPIPort) {
+		return "", fmt.Errorf("require private non-loopback NICoSim HTTP endpoint on port %d", simulatorAPIPort)
 	}
 	return strings.TrimRight(value, "/"), nil
 }
@@ -316,22 +407,123 @@ func validateRegistryOwnership(rows []dockerContainer, ids []string, name, owner
 	return nil
 }
 
-func waitRegistry(ctx context.Context, runner Runner, name, host string) error {
+func admitRegistryIdentity(rows []dockerContainer, id, name, owner string, materials *SiteMaterials) (netip.Prefix, netip.Addr, error) {
+	if materials == nil || id == "" || materials.RegistryID == "" || materials.KindNetworkID == "" {
+		return netip.Prefix{}, netip.Addr{}, errors.New("registry omits its admitted container or network identity")
+	}
+	if err := validateRegistryOwnership(rows, []string{id}, name, owner, materials.RegistryID); err != nil {
+		return netip.Prefix{}, netip.Addr{}, err
+	}
+	prefix, err := netip.ParsePrefix(materials.KindCIDR)
+	if err != nil || prefix != prefix.Masked() || prefix.String() != materials.KindCIDR || !prefix.Addr().Is4() || !prefix.Addr().IsPrivate() || !networkLast(prefix).IsPrivate() {
+		return netip.Prefix{}, netip.Addr{}, errors.New("registry requires the admitted private Kind subnet")
+	}
+	gateway, err := netip.ParseAddr(materials.Gateway)
+	if err != nil || !gateway.Is4() || gateway.String() != materials.Gateway || !prefix.Contains(gateway) {
+		return netip.Prefix{}, netip.Addr{}, errors.New("registry requires the admitted Kind gateway")
+	}
+	return prefix, gateway, nil
+}
+
+func registryAddress(rows []dockerContainer, id, name, owner string, materials *SiteMaterials) (string, error) {
+	prefix, gateway, err := admitRegistryIdentity(rows, id, name, owner, materials)
+	if err != nil {
+		return "", err
+	}
+	row := rows[0]
+	if !row.State.Running {
+		return "", errors.New("owned registry container is stopped; private startup diagnostics retained")
+	}
+	network, present := row.NetworkSettings.Networks["kind"]
+	address, err := netip.ParseAddr(network.IPAddress)
+	if len(row.NetworkSettings.Networks) != 1 || !present || network.NetworkID != materials.KindNetworkID ||
+		err != nil || !address.Is4() || !address.IsPrivate() || address.String() != network.IPAddress ||
+		!prefix.Contains(address) || address == gateway || address == prefix.Addr() || address == networkLast(prefix) {
+		return "", errors.New("owned registry requires its exact running Kind-network IPv4 address")
+	}
+	return net.JoinHostPort(address.String(), "5000"), nil
+}
+
+func startSiteRegistry(ctx context.Context, runner Runner, name, owner, node string, materials *SiteMaterials) (host string, err error) {
+	boundary := beginProgress(runner.Progress, "registry-admission", PhaseStarted, PhaseFinished, PhaseFailed)
+	defer func() { boundary.finish(err) }()
+	raw, err := runner.Capture(ctx, []string{"docker", "run", "-d", "--name", name, "--label", "dev.nkd.demo.owner=" + owner, "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--network", "kind", "--tmpfs", fmt.Sprintf("/var/lib/registry:rw,size=%d", registryBytes), registryImage}, "start-registry", 60*time.Second)
+	if err != nil {
+		return "", err
+	}
+	ids := strings.Fields(string(raw))
+	if len(ids) != 1 {
+		return "", errors.New("registry start did not return one container identity")
+	}
+	host, err = waitRegistry(ctx, runner, ids[0], name, owner, materials)
+	if err != nil {
+		return "", err
+	}
+	if err = probeNodeRegistry(ctx, runner, node, host); err != nil {
+		return "", err
+	}
+	return host, nil
+}
+
+func probeNodeRegistry(ctx context.Context, runner Runner, node, host string) error {
+	// Use the node's real proxy environment, as pinned NKE readiness and staging
+	// do. A forced bypass here would admit a route those later stages cannot use.
+	raw, err := runner.Capture(ctx, []string{"docker", "exec", node, "curl", "--fail", "--silent", "--show-error", "--max-time", "10", "http://" + host + "/v2/"}, "node-registry-connectivity", 15*time.Second)
+	if err != nil {
+		return fmt.Errorf("owned Kind node cannot reach the admitted registry; private node-registry-connectivity diagnostics retained: %w", err)
+	}
+	if !bytes.Equal(bytes.TrimSpace(raw), []byte("{}")) {
+		return errors.New("owned Kind node registry probe did not return the exact empty v2 response")
+	}
+	return nil
+}
+
+// The host-side health response does not establish the controller's network
+// path. Probe from the already admitted Kind node before installing the site.
+func probeNodeSimulator(ctx context.Context, runner Runner, node, endpoint string) error {
+	endpoint, err := validateEndpoint(endpoint)
+	if err != nil {
+		return nkderr.Wrap(nkderr.CodePreflightFailed, err, "Kind-to-simulator endpoint admission")
+	}
+	// Keep the node's real proxy environment. A forced proxy bypass here could
+	// admit a route that the subsequent controller deployment cannot use.
+	raw, err := runner.Capture(ctx, []string{"docker", "exec", node, "curl", "-q", "--fail", "--silent", "--show-error", "--connect-timeout", "3", "--max-time", "10", "--max-filesize", "4096", endpoint + "/healthz"}, "node-simulator-connectivity", 15*time.Second)
+	if err != nil {
+		return nkderr.Wrap(nkderr.CodePreflightFailed, err, "owned Kind node cannot reach the simulator; host health alone is insufficient; check host firewall and proxy routing; private node-simulator-connectivity diagnostics retained")
+	}
+	var health struct {
+		Status string `json:"status"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if len(raw) > 4096 || canonical.ValidateJSONDocument(raw) != nil || decoder.Decode(&health) != nil || health.Status != "ok" {
+		return nkderr.New(nkderr.CodePreflightFailed, "owned Kind node simulator probe did not return the required health response; private node-simulator-connectivity diagnostics retained")
+	}
+	return nil
+}
+
+func waitRegistry(ctx context.Context, runner Runner, id, name, owner string, materials *SiteMaterials) (string, error) {
 	budget, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	probe := runner
 	probe.Work = ""
 	for budget.Err() == nil {
-		rows, err := captureJSON[[]dockerContainer](budget, probe, []string{"docker", "inspect", name}, "registry-startup-state")
-		if errors.Is(err, ErrUnjoined) {
-			return err
+		rows, err := captureJSON[[]dockerContainer](budget, probe, []string{"docker", "inspect", id}, "registry-startup-state")
+		if err != nil {
+			// An unjoined inspection retains its original child obligation;
+			// do not start another diagnostic child in that state.
+			if errors.Is(err, ErrUnjoined) {
+				return "", err
+			}
+			return "", registryStartupDiagnostics(ctx, runner, id, name, owner, materials, err)
 		}
-		if err != nil || len(rows) != 1 || !rows[0].State.Running {
-			break
+		host, err := registryAddress(rows, id, name, owner, materials)
+		if err != nil {
+			return "", registryStartupDiagnostics(ctx, runner, id, name, owner, materials, err)
 		}
 		var response map[string]json.RawMessage
 		if err = localJSONRequest(budget, "http://"+host+"/v2/", 2*time.Second, &response); err == nil && response != nil && len(response) == 0 {
-			return nil
+			return host, nil
 		}
 		timer := time.NewTimer(200 * time.Millisecond)
 		select {
@@ -340,12 +532,29 @@ func waitRegistry(ctx context.Context, runner Runner, name, host string) error {
 		case <-timer.C:
 		}
 	}
+	err := fmt.Errorf("registry failed startup budget;private diagnostics retained: %w", budget.Err())
+	return "", registryStartupDiagnostics(ctx, runner, id, name, owner, materials, err)
+}
+
+// Retain bounded logs before deferred cleanup, including an already exited
+// registry. Re-admit its exact identity without granting authority over a name.
+func registryStartupDiagnostics(ctx context.Context, runner Runner, id, name, owner string, materials *SiteMaterials, cause error) error {
+	if materials == nil {
+		return cause
+	}
 	diagnosticCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer stop()
-	if err := runner.Run(diagnosticCtx, []string{"docker", "logs", "--tail", "100", name}, "registry-startup-diagnostics", 30*time.Second); errors.Is(err, ErrUnjoined) {
-		return err
+	probe := runner
+	probe.Work = ""
+	rows, err := captureJSON[[]dockerContainer](diagnosticCtx, probe, []string{"docker", "inspect", id}, "registry-diagnostic-identity")
+	if err != nil {
+		return errors.Join(cause, err)
 	}
-	return errors.New("registry failed startup budget;private diagnostics retained")
+	if _, _, err = admitRegistryIdentity(rows, id, name, owner, materials); err != nil {
+		return errors.Join(cause, err)
+	}
+	err = runner.Run(diagnosticCtx, []string{"docker", "logs", "--tail", "100", id}, "registry-startup-diagnostics", 30*time.Second)
+	return errors.Join(cause, err)
 }
 
 type pinnedImage struct {
@@ -507,14 +716,26 @@ func prepareRuntimeValues(ctx context.Context, checkout, deploy, host string, ou
 
 func copySiteImages(ctx context.Context, session ManagementSession, host string, outputs map[string]SelectedOutput) (map[string]string, error) {
 	refs := make(map[string]string)
-	for _, key := range imageKeys() {
+	address, _, err := net.SplitHostPort(host)
+	if err != nil {
+		return nil, err
+	}
+	runner := session.Runner
+	for _, key := range []string{"NO_PROXY", "no_proxy"} {
+		value := environmentValue(runner.Env, key)
+		if value != "" {
+			value += ","
+		}
+		runner.Env = SetEnv(runner.Env, map[string]string{key: value + address})
+	}
+	for _, key := range selectedImageKeys(outputs) {
 		selected := outputs[key]
 		target := host + "/nkd-local/" + strings.TrimPrefix(key, "runtime-") + ":" + session.Name
-		if err := session.Runner.Run(ctx, []string{filepath.Join(session.Tools, "oras"), "cp", "--concurrency", "1", "--from-oci-layout", selected.Layout + "@" + selected.Observation.Digest, target, "--to-plain-http"}, "copy-"+key, 180*time.Second); err != nil {
+		if err := runner.Run(ctx, []string{filepath.Join(session.Tools, "oras"), "cp", "--concurrency", "1", "--from-oci-layout", selected.Layout + "@" + selected.Observation.Digest, target, "--to-plain-http"}, "copy-"+key, 180*time.Second); err != nil {
 			return nil, err
 		}
 		var descriptor struct{ Digest string }
-		raw, err := session.Runner.Capture(ctx, []string{filepath.Join(session.Tools, "oras"), "manifest", "fetch", "--plain-http", "--descriptor", target}, "readback-"+key, 30*time.Second)
+		raw, err := runner.Capture(ctx, []string{filepath.Join(session.Tools, "oras"), "manifest", "fetch", "--plain-http", "--descriptor", target}, "readback-"+key, 30*time.Second)
 		if err != nil {
 			return nil, err
 		}
@@ -529,92 +750,9 @@ func copySiteImages(ctx context.Context, session ManagementSession, host string,
 	return refs, nil
 }
 
-// ORAS transports the existing NKD bundle; nkdctl verifies and extracts it.
-// Only an already-owned Kind node receives the validated data. Its lifetime
-// and cleanup stay with the existing management session.
-func prepareSiteProfiles(ctx context.Context, session ManagementSession, tool, node, reference string, selected SelectedOutput) error {
-	layout := filepath.Join(session.Work, "profiles-layout")
-	if err := session.Runner.Run(ctx, []string{filepath.Join(session.Tools, "oras"), "cp", "--from-plain-http", reference, "--to-oci-layout", layout + ":profiles"}, "pull-profiles", 120*time.Second); err != nil {
-		return err
-	}
-	if err := restoreBundleTransportIndex(ctx, selected.Layout, layout, selected.Observation.Digest); err != nil {
-		return err
-	}
-	publication, bundle := filepath.Join(session.Work, "profiles-publication"), filepath.Join(session.Work, "profiles-bundle")
-	for _, step := range []struct {
-		args  []string
-		phase string
-	}{
-		{[]string{tool, "publish", "root", "--bundle", "controller-profiles=" + layout, "--out", publication}, "verify-profiles"},
-		{[]string{tool, "publish", "extract", "--layout", publication, "--bundle", "controller-profiles", "--out", bundle}, "extract-profiles"},
-	} {
-		if err := session.Runner.Run(ctx, step.args, step.phase, 120*time.Second); err != nil {
-			return err
-		}
-	}
-	archive := filepath.Join(bundle, "nke-local-profiles")
-	expected, err := DigestFile(ctx, archive)
-	if err != nil {
-		return err
-	}
-	validated := filepath.Join(session.Work, "validated-profiles")
-	if err = os.Mkdir(validated, 0o700); err != nil {
-		return err
-	}
-	if err = safeExtractAssets(ctx, archive, validated, []string{
-		"profiles/osProfiles/metadata.yaml",
-		"profiles/osProfiles/nke-local-26-04-arm64-plain/userData.tmpl",
-		"profiles/osProfiles/nke-local-26-04-arm64-plain/ipxeScript",
-		"profiles/configProfiles/nico-vms-cp.yaml",
-		"profiles/configProfiles/nico-vms-worker.yaml",
-	}); err != nil {
-		return err
-	}
-	after, err := DigestFile(ctx, archive)
-	if err != nil || after != expected {
-		return errors.Join(err, errors.New("profiles archive changed during validation"))
-	}
-	const nodeArchive = "/var/nkd-local-profiles.tar.gz"
-	if err = session.Runner.Run(ctx, []string{"docker", "exec", node, "sh", "-euc", "test ! -e /var/nkd-local-profiles.tar.gz; test ! -e /var/nkd-local-profiles; mkdir /var/nkd-local-profiles"}, "admit-node-profiles", 30*time.Second); err != nil {
-		return err
-	}
-	if err = session.Runner.Run(ctx, []string{"docker", "cp", archive, node + ":" + nodeArchive}, "copy-profiles-data", 30*time.Second); err != nil {
-		return err
-	}
-	readback, err := session.Runner.Capture(ctx, []string{"docker", "exec", node, "sha256sum", nodeArchive}, "verify-node-profiles", 30*time.Second)
-	if err != nil {
-		return err
-	}
-	if string(readback) != strings.TrimPrefix(expected, "sha256:")+"  "+nodeArchive+"\n" {
-		return errors.New("node profiles archive changed during transfer")
-	}
-	return session.Runner.Run(ctx, []string{"docker", "exec", node, "tar", "--no-same-owner", "-xzf", nodeArchive, "-C", "/var/nkd-local-profiles"}, "materialize-profiles-data", 30*time.Second)
-}
-
-// ORAS preserves the selected manifest but writes a generic local index wrapper.
-// Preserve the exact original NKD bootstrap description, never reconstruct it.
-// This grants no authority: nkdctl must still verify every imported blob and
-// recompute the binary bundle's semantic binding before extraction.
-func restoreBundleTransportIndex(ctx context.Context, original, imported, digest string) error {
-	if err := requireContext(ctx); err != nil {
-		return err
-	}
-	if err := diagnosticIndexMatches(imported, digest); err != nil {
-		return err
-	}
-	raw, err := readRunFile(ctx, original, "index.json", diagnosticLimit)
-	if err != nil {
-		return err
-	}
-	if err := privateReplace(filepath.Join(imported, "index.json"), raw); err != nil {
-		return err
-	}
-	return diagnosticIndexMatches(imported, digest)
-}
-
 type podMetadata struct {
-	UID, Namespace string
-	Labels         map[string]string
+	UID, Namespace, Name string
+	Labels               map[string]string
 }
 type profileMount struct {
 	Name, MountPath string
@@ -623,6 +761,7 @@ type profileMount struct {
 type profileVolume struct {
 	Name     string
 	HostPath *struct{ Path, Type string }
+	EmptyDir *json.RawMessage
 }
 type podContainer struct {
 	Name, Image  string
@@ -641,6 +780,7 @@ type sitePod struct {
 	Spec     struct {
 		Containers, InitContainers []podContainer
 		Volumes                    []profileVolume
+		HostNetwork                bool
 	}
 	Status struct {
 		ContainerStatuses, InitContainerStatuses []podContainerState
@@ -743,7 +883,7 @@ func validateRuntimePods(rows podList, refs map[string]string) (map[string]obser
 						ready = (state.Ready && state.State.Running != nil) || (completed && pod.Status.Phase == "Succeeded")
 					}
 					if !ready {
-						return nil, errors.New("deployed dependency not ready or completed: " + key)
+						return nil, &runtimeReadinessError{dependency: key, pod: pod.Metadata, container: container.Name, state: state}
 					}
 					if pod.Metadata.UID == "" {
 						return nil, errors.New("missing deployed pod UID")
@@ -783,10 +923,10 @@ func deployedSiteImages(ctx context.Context, session ManagementSession, refs map
 			return nil, errors.New("expected one exact deployed image pod")
 		}
 		if item.key == "cwe" {
-			if err := validateProfilesVolume(rows.Items[0], item.container); err != nil {
+			if err := validateProfilesImage(rows.Items[0], item.container, refs["profiles"]); err != nil {
 				return nil, err
 			}
-			observed["profiles"] = map[string]string{"podUID": rows.Items[0].Metadata.UID, "bundle": refs["profiles"], "path": "/profiles"}
+			observed["profiles"] = map[string]string{"podUID": rows.Items[0].Metadata.UID, "imageID": refs["profiles"], "path": "/profiles"}
 		}
 		states := rows.Items[0].Status.ContainerStatuses
 		var selected []podContainerState
@@ -809,7 +949,7 @@ func deployedSiteImages(ctx context.Context, session ManagementSession, refs map
 	}
 	runtime, err := validateRuntimePods(rows, refs)
 	if err != nil {
-		return nil, err
+		return nil, retainRuntimeFailure(ctx, session, err)
 	}
 	for key, value := range runtime {
 		observed[key] = value
@@ -817,36 +957,78 @@ func deployedSiteImages(ctx context.Context, session ManagementSession, refs map
 	return observed, nil
 }
 
-func validateProfilesVolume(pod sitePod, controller string) error {
+func validateProfilesImage(pod sitePod, controller, reference string) error {
+	inits, states, volumes, mounts := 0, 0, 0, 0
+	overlaps := func(mountPath, root string) bool {
+		mountPath = filepath.Clean(mountPath)
+		return mountPath == "/" || mountPath == root || strings.HasPrefix(mountPath, root+"/")
+	}
 	for _, init := range pod.Spec.InitContainers {
-		if init.Name == "materialize-profiles" {
-			return errors.New("profiles image materializer must be disabled")
+		if init.Name != "materialize-profiles" {
+			for _, mount := range init.VolumeMounts {
+				if mount.Name == "profiles" {
+					return errors.New("profiles volume must not be mounted by another init container")
+				}
+			}
+			continue
+		}
+		inits++
+		if init.Image != reference {
+			return errors.New("profiles init container differs from the selected image or copy destination")
+		}
+		destinations := 0
+		for _, mount := range init.VolumeMounts {
+			if mount.Name == "profiles" || overlaps(mount.MountPath, "/profiles-out") {
+				destinations++
+				if mount.Name != "profiles" || mount.MountPath != "/profiles-out" || mount.ReadOnly {
+					return errors.New("profiles init container differs from the selected copy destination")
+				}
+			} else if overlaps(mount.MountPath, "/profiles") {
+				return errors.New("profiles init source is masked by another volume")
+			}
+		}
+		if destinations != 1 {
+			return errors.New("profiles init requires exactly one writable copy destination")
 		}
 	}
-	volumes, mounts := 0, 0
+	for _, state := range pod.Status.InitContainerStatuses {
+		if state.Name != "materialize-profiles" {
+			continue
+		}
+		states++
+		if state.ImageID != reference || state.State.Terminated == nil ||
+			state.State.Terminated.ExitCode == nil || *state.State.Terminated.ExitCode != 0 {
+			return errors.New("selected profiles image has not completed materialization successfully")
+		}
+	}
 	for _, volume := range pod.Spec.Volumes {
-		if volume.Name == "local-profiles" {
+		if volume.Name == "profiles" {
 			volumes++
-			if volume.HostPath == nil || volume.HostPath.Path != "/var/nkd-local-profiles/profiles" || volume.HostPath.Type != "Directory" {
-				return errors.New("deployed profiles volume differs from the prepared Kind directory")
+			if volume.EmptyDir == nil || volume.HostPath != nil {
+				return errors.New("profiles must use the chart-owned emptyDir, not a host directory")
 			}
 		}
 	}
 	for _, container := range pod.Spec.Containers {
 		if container.Name != controller {
+			for _, mount := range container.VolumeMounts {
+				if mount.Name == "profiles" {
+					return errors.New("profiles volume must not be mounted by another app container")
+				}
+			}
 			continue
 		}
 		for _, mount := range container.VolumeMounts {
-			if mount.Name == "local-profiles" || mount.MountPath == "/profiles" {
+			if mount.Name == "profiles" || overlaps(mount.MountPath, "/profiles") {
 				mounts++
-				if mount.Name != "local-profiles" || mount.MountPath != "/profiles" || !mount.ReadOnly {
-					return errors.New("deployed profiles mount must be the exact read-only data volume")
+				if mount.Name != "profiles" || mount.MountPath != "/profiles" || !mount.ReadOnly {
+					return errors.New("deployed profiles must be mounted read-only at the exact controller path")
 				}
 			}
 		}
 	}
-	if volumes != 1 || mounts != 1 {
-		return errors.New("deployed controller requires exactly one prepared profiles volume and mount")
+	if inits != 1 || states != 1 || volumes != 1 || mounts != 1 {
+		return errors.New("controller requires exactly one completed profiles init container and shared mount")
 	}
 	return nil
 }
@@ -902,6 +1084,16 @@ type siteConfiguration struct {
 	} `yaml:"tenant"`
 }
 
+// checkoutSiteInstaller materializes the full pinned tree in this private copy.
+// Sparse checkout writes extensions.worktreeConfig, which the shared source Git
+// owner deliberately rejects. Keep that policy and the original source intact.
+func checkoutSiteInstaller(ctx context.Context, runner Runner, source, checkout, commit string) error {
+	if err := runner.Run(ctx, []string{"git", "clone", "--no-hardlinks", "--no-checkout", source, checkout}, "clone-installer", 120*time.Second); err != nil {
+		return err
+	}
+	return runner.Run(ctx, []string{"git", "-C", checkout, "checkout", "--detach", commit}, "checkout-installer", 60*time.Second)
+}
+
 // ConsumeSite installs a site from exact selected outputs, retaining its private
 // registry through the callback. No success is emitted before owned cleanup.
 func ConsumeSite(ctx context.Context, cfg Config, materials *SiteMaterials, connection SiteConnection, session ManagementSession, consumer func(context.Context, ManagementSession) error) (result error) {
@@ -952,6 +1144,9 @@ func ConsumeSite(ctx context.Context, cfg Config, materials *SiteMaterials, conn
 	if err != nil || !address.Is4() {
 		return errors.New("invalid site node address")
 	}
+	if err = probeNodeSimulator(ctx, session.Runner, node, endpoint); err != nil {
+		return err
+	}
 	session.Runner.Env = SetEnv(session.Runner.Env, map[string]string{"STAGE_NEEDS_RELEASE": "1", "NODE_EXEC": "docker exec {node}", "PREPULL_EXTERNAL": "0"})
 	selected := make(map[string]lifecycle.Artifact)
 	for key, value := range materials.Outputs {
@@ -975,14 +1170,8 @@ func ConsumeSite(ctx context.Context, cfg Config, materials *SiteMaterials, conn
 	}
 	session.Runner.Env = SetEnv(session.Runner.Env, map[string]string{"PATH": cliTools + string(os.PathListSeparator) + environmentValue(session.Runner.Env, "PATH")})
 	checkout := filepath.Join(session.Work, "installer")
-	for _, step := range []struct {
-		args    []string
-		phase   string
-		timeout time.Duration
-	}{{[]string{"git", "clone", "--no-hardlinks", "--no-checkout", sourceCheckout, checkout}, "clone-installer", 120 * time.Second}, {[]string{"git", "-C", checkout, "sparse-checkout", "set", "deploy", "make", "controller/deploy/charts", "controller/deploy/k8s/capi-spiffe-exec-auth", "controller/hack/ci"}, "installer-membership", 60 * time.Second}, {[]string{"git", "-C", checkout, "checkout", "--detach", InstallerCommit}, "checkout-installer", 60 * time.Second}} {
-		if err = session.Runner.Run(ctx, step.args, step.phase, step.timeout); err != nil {
-			return err
-		}
+	if err = checkoutSiteInstaller(ctx, session.Runner, sourceCheckout, checkout, InstallerCommit); err != nil {
+		return err
 	}
 	charts, pins := make(map[string]string), make(map[string]string)
 	for item := range chartOutputs {
@@ -992,10 +1181,6 @@ func ConsumeSite(ctx context.Context, cfg Config, materials *SiteMaterials, conn
 	capture := sequencedChartCapture(session.Runner)
 	deploy, err := prepareChartInputs(ctx, ChartInputsConfig{NKECheckout: checkout, NKDCTL: tool, Out: filepath.Join(session.Work, "chart-inputs"), Charts: charts, Manifests: pins}, capture)
 	if err != nil {
-		return err
-	}
-	host := net.JoinHostPort(materials.Gateway, fmt.Sprint(registryPort))
-	if err = prepareRuntimeValues(ctx, checkout, deploy, host, materials.Outputs, capture); err != nil {
 		return err
 	}
 	session.Runner.Env = SetEnv(session.Runner.Env, map[string]string{"DEPLOY_PATH": deploy})
@@ -1008,21 +1193,20 @@ func ConsumeSite(ctx context.Context, cfg Config, materials *SiteMaterials, conn
 		return errors.New("fresh private registry identity exists")
 	}
 	defer func() {
-		result = cleanupAfterJoinedWork(ctx, result, 2*time.Minute, func(cleanupCtx context.Context) error {
+		result = cleanupAfterJoinedWork(ctx, result, retainedRegistryCleanupTimeout, func(cleanupCtx context.Context) error {
 			return registryCleanup(cleanupCtx, session.Runner, registryName, session.Name, materials.RegistryID)
 		})
 	}()
-	if err = session.Runner.Run(ctx, []string{"docker", "run", "-d", "--name", registryName, "--label", "dev.nkd.demo.owner=" + session.Name, "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--network", "kind", "--tmpfs", fmt.Sprintf("/var/lib/registry:rw,size=%d", registryBytes), "--publish", host + ":5000", registryImage}, "start-registry", 60*time.Second); err != nil {
+	defer recoverRetainedPanic(ctx, &result)
+	host, err := startSiteRegistry(ctx, session.Runner, registryName, session.Name, node, materials)
+	if err != nil {
 		return err
 	}
-	if err = waitRegistry(ctx, session.Runner, registryName, host); err != nil {
+	if err = prepareRuntimeValues(ctx, checkout, deploy, host, materials.Outputs, capture); err != nil {
 		return err
 	}
 	refs, err := copySiteImages(ctx, session, host, materials.Outputs)
 	if err != nil {
-		return err
-	}
-	if err = prepareSiteProfiles(ctx, session, tool, node, refs["profiles"], materials.Outputs["profiles"]); err != nil {
 		return err
 	}
 	hostConfig := filepath.Join(session.Work, "registry-hosts.toml")
@@ -1036,6 +1220,9 @@ func ConsumeSite(ctx context.Context, cfg Config, materials *SiteMaterials, conn
 	if err = session.Runner.Run(ctx, []string{"docker", "cp", hostConfig, node + ":" + certs + "/hosts.toml"}, "node-registry-config", 30*time.Second); err != nil {
 		return err
 	}
+	if err = installSelectedSiteNetwork(ctx, cfg.Network, session, tool, node, materials.Outputs, refs["ovn"], "https://"+vip+":6443", captureSiteNetwork); err != nil {
+		return err
+	}
 	if err = bootstrapCA(ctx, session); err != nil {
 		return err
 	}
@@ -1047,8 +1234,7 @@ func ConsumeSite(ctx context.Context, cfg Config, materials *SiteMaterials, conn
 	config.Spire.CACertFile = filepath.Join(session.Work, "ca.crt")
 	config.Spire.CAKeyFile = filepath.Join(session.Work, "ca.key")
 	config.Images.Controller = refs["cwe"]
-	// The legacy installer requires this reference. The final chart disables its
-	// image materializer and reads the digest-bound bundle through its volume.
+	// The source-owned chart consumes this exact native image through its init container.
 	config.Images.Profiles = refs["profiles"]
 	config.Nico.Endpoint = endpoint
 	config.Nico.OrgID = connection.Org
@@ -1099,7 +1285,7 @@ func ConsumeSite(ctx context.Context, cfg Config, materials *SiteMaterials, conn
 			return err
 		}
 		if phase == "03-describe-site" {
-			if err = appendChartValues(ctx, capture, filepath.Join(checkout, "deploy/lib/nke-deploy-items.py"), deploy, "controller", "nkd-profiles-volume.json", profilesVolumeValues()); err != nil {
+			if err = appendChartValues(ctx, capture, filepath.Join(checkout, "deploy/lib/nke-deploy-items.py"), deploy, "controller", "nkd-profiles-image.json", profilesImageValues(refs["profiles"])); err != nil {
 				return err
 			}
 		}

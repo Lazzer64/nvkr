@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,47 @@ func TestNativeEnvironmentExcludesForeignTargets(t *testing.T) {
 	}
 	if !slices.IsSorted(updated) {
 		t.Fatal("environment not sorted")
+	}
+}
+
+func TestManagementKindImageAdmissionDiagnostics(t *testing.T) {
+	for _, row := range []struct {
+		name, id, arch string
+		exit           int
+	}{
+		{name: "cached", id: kindNodeID, arch: "arm64"},
+		{name: "missing", exit: 1},
+		{name: "docker-unavailable", exit: 42},
+		{name: "wrong-image", id: "foreign-id", arch: "arm64"},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			work := privateTestDir(t)
+			script := "#!/bin/sh\n[ \"$1 $2\" = 'image inspect' ] && [ \"$3\" = \"$PIN\" ] || exit 99\nprintf '%s\\n' 'private Docker diagnostic' >&2\nprintf '%s\\n' \"$IMAGE\"\nexit \"$EXIT\"\n"
+			if err := os.WriteFile(filepath.Join(work, "docker"), []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := json.Marshal([]dockerImage{{ID: row.id, Architecture: row.arch}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			runner := Runner{Work: work, Env: []string{"PATH=" + work + ":/usr/bin:/bin", "PIN=" + kindNodeImage, "IMAGE=" + string(raw), "EXIT=" + strconv.Itoa(row.exit)}}
+			err = admitKindImage(t.Context(), runner)
+			if row.name == "cached" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "cache") || !strings.Contains(err.Error(), kindNodeImage) || !strings.Contains(err.Error(), "docs/local-nke-demo.md#4-build-and-run-the-demo") || strings.Contains(err.Error(), "private Docker diagnostic") {
+				t.Fatalf("cache prerequisite diagnostic=%v", err)
+			}
+			if row.exit != 0 {
+				var command *CommandError
+				if !errors.As(err, &command) || command.Phase != "admit-kind-image" || command.ExitCode != row.exit || !strings.Contains(err.Error(), "could not inspect") {
+					t.Fatalf("inspection cause=%v", err)
+				}
+			}
+		})
 	}
 }
 
@@ -71,11 +113,48 @@ func TestManagementConfigProjectionAdmitsExactSourceAndUsesIPv4(t *testing.T) {
 				}
 				return
 			}
-			want := strings.Replace(strings.Replace(before, socketMount, "", 1), sourceKindIPFamily, "  ipFamily: ipv4\n", 1)
+			want := strings.Replace(strings.Replace(before, socketMount, "", 1), sourceKindIPFamily, "  ipFamily: ipv4\n  disableDefaultCNI: true\n  kubeProxyMode: none\n  podSubnet: "+managementPodCIDR+"\n  serviceSubnet: "+managementServiceCIDR+"\n", 1)
 			if projectErr != nil || string(projected) != want || string(source) != before || !strings.Contains(string(projected), kindNodeImage) {
-				t.Fatal("projection changed anything except the two admitted runtime settings", projectErr)
+				t.Fatal("projection differs from the admitted IPv4 OVN topology", projectErr)
 			}
 		})
+	}
+}
+
+func TestManagementTemporaryKindProjection(t *testing.T) {
+	source, err := os.ReadFile("testdata/pinned-kind.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"kind-calico", "invalid"} {
+		t.Run(mode, func(t *testing.T) {
+			projected, err := projectManagementConfigForNetwork(source, mode)
+			if mode == "invalid" {
+				if err == nil || projected != nil {
+					t.Fatal("unknown network accepted", err)
+				}
+				return
+			}
+			want := strings.Replace(strings.Replace(string(source), socketMount, "", 1), sourceKindIPFamily, "  ipFamily: ipv4\n  podSubnet: "+managementPodCIDR+"\n  serviceSubnet: "+managementServiceCIDR+"\n", 1)
+			if err != nil || string(projected) != want {
+				t.Fatal("Kind defaults not preserved", err)
+			}
+		})
+	}
+}
+
+func TestManagementUpstreamOVNDisablesKindCNI(t *testing.T) {
+	source, err := os.ReadFile("testdata/pinned-kind.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream, err := projectManagementConfigForNetwork(source, "upstream-ovn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	maintained, err := projectManagementConfig(source)
+	if err != nil || string(upstream) != string(maintained) {
+		t.Fatal("explicit OVN options must preserve the admitted topology", err)
 	}
 }
 

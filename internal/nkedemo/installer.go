@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/NVIDIA/nke-recipes/internal/securepath"
+	"github.com/NVIDIA/nke-recipes/pkg/nkd/canonical"
 	nkderr "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 	"golang.org/x/sys/unix"
 )
@@ -21,8 +23,43 @@ import (
 // It is not NKD build-source acquisition or artifact authority; Run rechecks it.
 // An explicit checkout remains read-only. Without one, Git prepares the pinned
 // commit in a new private attempt-local directory before the expensive build.
-func PrepareInstaller(ctx context.Context, build BuildConfig, run Config) (Config, error) {
-	result, err := prepareInstaller(ctx, build, run, Runner{Env: localBuildEnvironment(), Progress: run.Progress})
+func PrepareInstaller(ctx context.Context, build BuildConfig, run Config) (result Config, err error) {
+	return prepareInstallerOnPlatform(ctx, build, run, runtime.GOOS, runtime.GOARCH)
+}
+
+// The private platform parameters let command fixtures exercise the Linux
+// boundary without misrepresenting the machine running the contract suite.
+func prepareInstallerOnPlatform(ctx context.Context, build BuildConfig, run Config, system, arch string) (result Config, err error) {
+	run.Network, err = normalizeNetwork(run.Network)
+	if err != nil {
+		return Config{}, err
+	}
+	if err = requireContext(ctx); err != nil {
+		code := nkderr.CodeUsage
+		if ctx != nil {
+			code = nkderr.CodeTimeout
+		}
+		return Config{}, nkderr.Wrap(code, err, "prepare pinned NKE installer")
+	}
+	if system != "linux" || arch != "arm64" {
+		return Config{}, nkderr.New(nkderr.CodeEngineCapability, "installer preparation requires a native Linux ARM64 execution host")
+	}
+	environment, err := localBuildEnvironment()
+	if err != nil {
+		return Config{}, nkderr.Wrap(nkderr.CodePreflightFailed, err, "prepare pinned NKE installer")
+	}
+	runner := Runner{Env: environment, Progress: run.Progress}
+	admitHost := func() error {
+		if run.Network != "kind-calico" {
+			if err := admitSiteOVNKernel(); err != nil {
+				return err
+			}
+		}
+		return admitSimulatorEndpoint(ctx, runner)
+	}
+	boundary := beginProgress(run.Progress, "installer-preparation", PhaseStarted, PhaseFinished, PhaseFailed)
+	defer func() { boundary.finish(err) }()
+	result, err = prepareInstaller(ctx, build, run, runner, admitHost)
 	if err != nil {
 		code := nkderr.CodePreflightFailed
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -33,11 +70,11 @@ func PrepareInstaller(ctx context.Context, build BuildConfig, run Config) (Confi
 	return result, nil
 }
 
-func prepareInstaller(ctx context.Context, build BuildConfig, run Config, runner Runner) (result Config, returnErr error) {
+func prepareInstaller(ctx context.Context, build BuildConfig, run Config, runner Runner, admitHost func() error) (result Config, returnErr error) {
 	if err := requireContext(ctx); err != nil {
 		return result, err
 	}
-	if !safePhase(build.AttemptPrefix) || !strings.ContainsRune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", rune(build.AttemptPrefix[0])) || build.Jobs < 1 || run.Timeout < 300*time.Second || run.Timeout > time.Hour {
+	if !safePhase(build.AttemptPrefix) || !strings.ContainsRune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", rune(build.AttemptPrefix[0])) || build.Jobs < 1 || run.Timeout < MinTenantTimeoutSeconds*time.Second || run.Timeout > MaxTenantTimeoutSeconds*time.Second {
 		return result, errors.New("require a fresh attempt, positive jobs and valid tenant budget")
 	}
 	repo, err := resolveExisting(build.Repository)
@@ -64,6 +101,15 @@ func prepareInstaller(ctx context.Context, build BuildConfig, run Config, runner
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return result, fmt.Errorf("cannot inspect attempt destination %q: %w", owned, err)
 		}
+	}
+	if err = admitInstallerImages(ctx, runner); err != nil {
+		return result, err
+	}
+	if admitHost == nil {
+		return result, errors.New("host admission required before installer preparation")
+	}
+	if err = admitHost(); err != nil {
+		return result, err
 	}
 	source := "https://github.com/dsx-ai-factory/nke.git"
 	if build.NKEClone != "" {
@@ -94,8 +140,15 @@ func prepareInstaller(ctx context.Context, build BuildConfig, run Config, runner
 	if err = runner.Run(ctx, []string{"bash", script, "--check", "all"}, "installer-build-preflight", 120*time.Second); err != nil {
 		return result, err
 	}
-	if _, err = runner.Capture(ctx, []string{"sudo", "-n", "true"}, "installer-sudo-preflight", 30*time.Second); err != nil {
-		return result, fmt.Errorf("unattended deployment requires approved non-interactive sudo: `sudo -n true` failed; ask the host administrator to arrange access before starting E2E; a temporary `sudo -v` cache can expire during the build; see docs/local-nke-demo.md: %w", err)
+	interactive, err := runner.authenticateSudo(ctx)
+	if err == nil {
+		_, err = runner.Capture(ctx, networkSudoCommand([]string{"true"}, interactive), "installer-sudo-preflight", 40*time.Second)
+	}
+	if err != nil {
+		if interactive {
+			return result, fmt.Errorf("interactive deployment networking authorization failed; authenticate in the original terminal before starting E2E; see docs/local-nke-demo.md: %w", err)
+		}
+		return result, fmt.Errorf("unattended deployment requires approved non-interactive networking authorization: `%s` failed; ask the host administrator to arrange access before starting E2E; temporary `sudo -v` credentials are deliberately ignored, not cleared; see docs/local-nke-demo.md: %w", networkSudoProbe, err)
 	}
 	if run.NKECheckout != "" {
 		return run, nil
@@ -136,4 +189,29 @@ func prepareInstaller(ctx context.Context, build BuildConfig, run Config, runner
 	}
 	run.NKECheckout = checkout
 	return run, nil
+}
+
+// E2E checks deployment-only image prerequisites before preparing sources or
+// building artifacts. BuildArtifacts deliberately does not require these images.
+func admitInstallerImages(ctx context.Context, runner Runner) error {
+	if _, err := commandPath("docker", runner.Env); err != nil {
+		return fmt.Errorf("deployment requires the Docker CLI before image admission; install Docker on the native Linux execution host; see docs/local-nke-demo.md: %w", err)
+	}
+	if _, err := runner.Capture(ctx, []string{"docker", "version", "--format", "{{.Server.Version}}"}, "installer-docker-preflight", 30*time.Second); err != nil {
+		return fmt.Errorf("deployment Docker daemon is unavailable; start it or restore this user's access before image admission; see docs/local-nke-demo.md: %w", err)
+	}
+	guidance := func(image string, cause error) error {
+		return fmt.Errorf("deployment requires a cached ARM64 image before building; run `docker pull %s` against the same native Linux Docker daemon (DOCKER_HOST=%q, DOCKER_CONTEXT=%q); see docs/local-nke-demo.md: %w", image, environmentValue(runner.Env, "DOCKER_HOST"), environmentValue(runner.Env, "DOCKER_CONTEXT"), cause)
+	}
+	if err := admitKindImage(ctx, runner); err != nil {
+		return guidance(kindNodeImage, err)
+	}
+	images, err := captureJSON[[]dockerImage](ctx, runner, []string{"docker", "image", "inspect", registryImage}, "installer-registry-image-preflight")
+	if err != nil {
+		return guidance(registryImage, err)
+	}
+	if len(images) != 1 || images[0].Architecture != "arm64" || !canonical.IsDigest(images[0].ID) {
+		return guidance(registryImage, errors.New("docker inspection did not select one ARM64 registry image with a valid image ID"))
+	}
+	return nil
 }

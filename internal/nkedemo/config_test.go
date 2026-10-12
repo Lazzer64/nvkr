@@ -69,7 +69,7 @@ func TestDemoFileTypedConversion(t *testing.T) {
 		t.Fatalf("build=%+v error=%v", build, err)
 	}
 	run, err := file.RunConfig(&progress)
-	expected := Config{NKECheckout: "/native/nke-installer", NKDCTL: "/native/nkdctl", Out: "/native/output", Timeout: 900 * time.Second, Progress: &progress, Runs: RunInputs{
+	expected := Config{Network: "ovn", NKECheckout: "/native/nke-installer", NKDCTL: "/native/nkdctl", Out: "/native/output", Timeout: 900 * time.Second, Progress: &progress, Runs: RunInputs{
 		OS: "/native/runs/os", Components: "/native/runs/components", Providers: "/native/runs/providers", Site: "/native/runs/site", Tools: "/native/runs/tools", Profiles: "/native/runs/profiles", Simulator: "/native/runs/simulator"}}
 	if err != nil || run != expected {
 		t.Fatalf("run=%+v error=%v", run, err)
@@ -83,6 +83,64 @@ func TestDemoFileTypedConversion(t *testing.T) {
 	actual, err := os.ReadFile(path)
 	if err != nil || string(actual) != fullDemoYAML || progress.Len() != 0 {
 		t.Fatal("loading and conversion must not write files or progress")
+	}
+}
+
+func TestDemoNetworkSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name, network, expected string
+	}{
+		{"default", "", "ovn"},
+		{"maintained", "ovn", "ovn"},
+		{"upstream diagnostic", "upstream-ovn", "upstream-ovn"},
+		{"temporary diagnostic", "kind-calico", "kind-calico"},
+		{"unknown", "calico", ""},
+		{"case alias", "OVN", ""},
+		{"whitespace", " ovn", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			file := DemoFile{Version: 1, Build: BuildFile{Repo: "/native/repo", Attempt: "fresh", Jobs: 1}, Run: RunFile{Network: tc.network, Out: "/native/output", TimeoutSeconds: 3600}}
+			build, run, err := file.E2EConfig(nil)
+			if tc.expected == "" {
+				assertConfigUsage(t, err)
+				return
+			}
+			if err != nil || run.Network != tc.expected || build.Network != tc.expected {
+				t.Fatalf("network=%q error=%v", run.Network, err)
+			}
+			contents := strings.Replace(fullDemoYAML, "run:\n", "run:\n  network: "+tc.expected+"\n", 1)
+			loaded, err := LoadDemoFile(t.Context(), demoConfigPath(t, contents))
+			if err != nil {
+				t.Fatal(err)
+			}
+			configured, err := loaded.RunConfig(nil)
+			if err != nil || configured.Network != tc.expected {
+				t.Fatalf("configured network=%q error=%v", configured.Network, err)
+			}
+		})
+	}
+}
+
+func TestDemoCleanupRequiresStrictBoolean(t *testing.T) {
+	for _, test := range []struct {
+		value          string
+		valid, cleanup bool
+	}{{"false", true, false}, {"true", true, true}, {"'true'", false, false}, {"1", false, false}, {"null", false, false}, {"[]", false, false}} {
+		t.Run(test.value, func(t *testing.T) {
+			contents := strings.Replace(fullDemoYAML, "run:\n", "run:\n  cleanup: "+test.value+"\n", 1)
+			file, err := LoadDemoFile(t.Context(), demoConfigPath(t, contents))
+			if !test.valid {
+				assertConfigUsage(t, err)
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := file.RunConfig(nil)
+			if err != nil || cfg.Cleanup != test.cleanup {
+				t.Fatal("cleanup intent lost", cfg.Cleanup, err)
+			}
+		})
 	}
 }
 
@@ -109,6 +167,7 @@ func TestDemoFileSchemaRejection(t *testing.T) {
 		{"sequence", "version: 1\nrestore:\n  work: [secret-config-sentinel]\n"},
 		{"integer coercion", "version: 1\nbuild:\n  jobs: '2'\n"},
 		{"float integer", "version: 1\nbuild:\n  jobs: 2.0\n"},
+		{"timeout integer overflow", "version: 1\nrun:\n  timeoutSeconds: 9223372036854775808\n"},
 		{"nonstring key", "version: 1\nrestore:\n  12: secret-config-sentinel\n"},
 		{"alias", "version: 1\nbuild:\n  repo: &path /native\n  nkeClone: *path\n"},
 		{"merge", "version: 1\nbuild: &base\n  repo: /native\nrun:\n  <<: *base\n"},
@@ -235,7 +294,7 @@ func TestDemoFileConversionRefusals(t *testing.T) {
 		{"run executable", func(f *DemoFile) { f.Run.NKDCTL = "" }, "run"},
 		{"run version", func(f *DemoFile) { f.Version = 0 }, "run"},
 		{"run low timeout", func(f *DemoFile) { f.Run.TimeoutSeconds = 299 }, "run"},
-		{"run high timeout", func(f *DemoFile) { f.Run.TimeoutSeconds = 3601 }, "run"},
+		{"run high timeout", func(f *DemoFile) { f.Run.TimeoutSeconds = 7201 }, "run"},
 		{"run newline", func(f *DemoFile) { f.Run.Runs.Site = "/native\nforeign" }, "run"},
 		{"restore missing", func(f *DemoFile) { f.Restore.Work = "" }, "restore"},
 		{"restore version", func(f *DemoFile) { f.Version = 0 }, "restore"},
@@ -266,6 +325,45 @@ func TestDemoFileConversionRefusals(t *testing.T) {
 			*fields[name] = ""
 			_, err := file.RunConfig(nil)
 			assertConfigUsage(t, err)
+		})
+	}
+}
+
+func TestDemoFileTenantBudgetBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		seconds string
+		want    time.Duration
+	}{
+		{"299", 0}, {"300", 5 * time.Minute}, {"3600", time.Hour},
+		{"7200", 2 * time.Hour}, {"7201", 0}, {"9223372036854775807", 0},
+	} {
+		t.Run(tc.seconds, func(t *testing.T) {
+			contents := strings.Replace(fullDemoYAML, "timeoutSeconds: 900", "timeoutSeconds: "+tc.seconds, 1)
+			file, err := LoadDemoFile(t.Context(), demoConfigPath(t, contents))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, operation := range []string{"run", "e2e"} {
+				t.Run(operation, func(t *testing.T) {
+					selected := file
+					var run Config
+					if operation == "e2e" {
+						selected.Run.NKDCTL = ""
+						selected.Run.Runs = RunFileInputs{}
+						_, run, err = selected.E2EConfig(nil)
+					} else {
+						run, err = selected.RunConfig(nil)
+					}
+					if tc.want == 0 {
+						assertConfigUsage(t, err)
+						if run != (Config{}) {
+							t.Fatal("invalid budget returned partial inputs")
+						}
+					} else if err != nil || run.Timeout != tc.want {
+						t.Fatalf("timeout=%s want=%s error=%v", run.Timeout, tc.want, err)
+					}
+				})
+			}
 		})
 	}
 }

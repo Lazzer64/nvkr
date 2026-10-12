@@ -6,6 +6,9 @@ package nkedemo
 import (
 	"io"
 	"sync"
+	"time"
+
+	"github.com/NVIDIA/nke-recipes/internal/buildactivity"
 )
 
 const (
@@ -18,14 +21,116 @@ const (
 	DeploymentStarted  = "deployment-started"
 	DeploymentFinished = "deployment-finished"
 	DeploymentFailed   = "deployment-failed"
+	TenantWaiting      = "tenant-waiting"
+	TenantGuests       = "tenant-guests"
+	OSBuildLogs        = "os-build-logs"
 )
+
+// Guest observations describe infrastructure and console activity only. They
+// never establish guest installation, Kubernetes readiness or artifact proof.
+type TenantGuestRole string
+type TenantDomainState string
+type TenantProvisioningFailure string
+
+const (
+	TenantGuestControlPlane    TenantGuestRole           = "control-plane"
+	TenantGuestWorker          TenantGuestRole           = "worker"
+	TenantDomainUnknown        TenantDomainState         = "unknown"
+	TenantDomainRunning        TenantDomainState         = "running"
+	TenantDomainPaused         TenantDomainState         = "paused"
+	TenantDomainShutOff        TenantDomainState         = "shut-off"
+	TenantDomainCrashed        TenantDomainState         = "crashed"
+	TenantInstanceCreateFailed TenantProvisioningFailure = "instance-create-failed"
+)
+
+type TenantGuestObservation struct {
+	Role          TenantGuestRole
+	Available     bool
+	Domain        TenantDomainState
+	ProviderReady TenantConditionStatus
+	// A source-owned provider failure can precede creation of an owned domain.
+	// Empty means no mapped failure observation, never provisioning success.
+	ProvisioningFailure TenantProvisioningFailure
+	ConsoleKnown        bool
+	ConsoleBytes        int64
+	ConsoleChanged      bool
+	// Age since this observer saw positive growth of the same console inode,
+	// not a guest timestamp. Baseline, replacement and truncation are not growth.
+	ConsoleLastChange time.Duration
+}
+
+// Process observations apply only to the opted-in public build launcher.
+// Started proves cmd.Start returned; exited proves the owner joined the
+// child and its private group. Neither describes descendant health.
+const (
+	ProcessStarted = "process-started"
+	ProcessExited  = "process-exited"
+)
+
+// TenantConditionStatus is a descriptive NKE API observation, not node readiness
+// or NKD evidence. Values follow controller/api/models.gen.go at InstallerCommit.
+type TenantConditionStatus string
+
+const (
+	TenantConditionTrue    TenantConditionStatus = "True"
+	TenantConditionFalse   TenantConditionStatus = "False"
+	TenantConditionUnknown TenantConditionStatus = "Unknown"
+)
+
+func presentedTenantCondition(status TenantConditionStatus) TenantConditionStatus {
+	switch status {
+	case TenantConditionTrue, TenantConditionFalse, TenantConditionUnknown:
+		return status
+	default:
+		return ""
+	}
+}
 
 // ProgressEvent describes an observed operation boundary, never percentage,
 // artifact verification, Release authority, arguments or private diagnostics.
 type ProgressEvent struct {
-	Kind   string
-	Name   string
-	Status string
+	Kind            string
+	Name            string
+	Status          string
+	RegisteredNodes int
+	ReadyNodes      int
+	Provisioning    TenantConditionStatus
+	Provisioned     TenantConditionStatus
+	Elapsed         time.Duration
+	Remaining       time.Duration
+	Guests          [2]TenantGuestObservation
+	BuildLogs       buildactivity.Record
+}
+
+// Tenant polling reports interpreted observations, not successful subprocess
+// exits. Repeat an unchanged wait at most once per 30 seconds; transitions are
+// immediate. No private response, node name or condition message is exposed.
+type tenantProgress struct {
+	writer                  io.Writer
+	started, deadline, last time.Time
+	previous                ProgressEvent
+	conditions              tenantConditions
+}
+
+func (p *tenantProgress) update(now time.Time, stage string, nodes []tenantNode) {
+	event := ProgressEvent{Kind: TenantWaiting, Name: stage, RegisteredNodes: len(nodes),
+		Provisioning: presentedTenantCondition(p.conditions.Provisioning.Status),
+		Provisioned:  presentedTenantCondition(p.conditions.Provisioned.Status)}
+	for _, node := range nodes {
+		for _, condition := range node.Status.Conditions {
+			if condition.Type == "Ready" && condition.Status == "True" {
+				event.ReadyNodes++
+				break
+			}
+		}
+	}
+	if event == p.previous && now.Sub(p.last) < 30*time.Second {
+		return
+	}
+	p.previous, p.last = event, now
+	event.Elapsed = max(time.Duration(0), now.Sub(p.started)).Truncate(time.Second)
+	event.Remaining = max(time.Duration(0), p.deadline.Sub(now)).Truncate(time.Second)
+	reportProgress(p.writer, event)
 }
 
 // ProgressReporter is optional on an existing progress writer. Report is called

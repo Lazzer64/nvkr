@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,15 +18,15 @@ import (
 	nkderr "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 )
 
-// Work stays synchronous: output failure cancels work without bypassing its
-// child-process joins or cleanup. No renderer, terminal mode or event queue.
-func runProgress(ctx context.Context, out io.Writer, work func(context.Context, io.Writer) error) error {
-	return progressOutput(ctx, out, nil, false, "", work)
+// Plain work stays synchronous; the terminal presenter owns and joins its one
+// worker. Neither output mode bypasses child-process joins or cleanup.
+func runProgress(ctx context.Context, out io.Writer, plain bool, work func(context.Context, io.Writer) error, auth ...func(context.Context) error) error {
+	return presentProgress(ctx, out, nil, false, "", plain, work, auth...)
 }
 
 // Allocate a private retained log only after command/configuration admission.
 // Deployment captures remain private in their existing owner, not this stream.
-func runBuildProgress(ctx context.Context, out io.Writer, verbose bool, work func(context.Context, io.Writer) error) (result error) {
+func runBuildProgress(ctx context.Context, out io.Writer, verbose, plain bool, work func(context.Context, io.Writer) error, auth ...func(context.Context) error) (result error) {
 	if err := ctx.Err(); err != nil {
 		return nkderr.Wrap(nkderr.CodeTimeout, err, "build progress canceled")
 	}
@@ -38,39 +39,128 @@ func runBuildProgress(ctx context.Context, out io.Writer, verbose bool, work fun
 			result = errors.Join(result, nkderr.Wrap(nkderr.CodePreflightFailed, err, "close build log"))
 		}
 	}()
-	return progressOutput(ctx, out, log, verbose, log.Name(), work)
+	return presentProgress(ctx, out, log, verbose, log.Name(), plain, work, auth...)
 }
 
-func progressOutput(ctx context.Context, out, raw io.Writer, verbose bool, logPath string, work func(context.Context, io.Writer) error) error {
+func progressOutput(ctx context.Context, out, raw io.Writer, verbose bool, logPath string, work func(context.Context, io.Writer) error, auth ...func(context.Context) error) error {
 	workCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	writer := &checkedWriter{out: out, raw: raw, verbose: verbose, remaining: 8 << 20, started: time.Now(), phases: make(map[string]time.Time), cancel: cancel}
+	if len(auth) > 0 {
+		writer.sudoAuth = auth[0]
+	}
 	if logPath != "" {
 		writer.emit(fmt.Sprintf("Build log (private, retained; maximum 8 MiB): %q\nUse --verbose to stream raw public build output.\n", logPath))
 		if err := writer.failure(); err != nil {
 			return err
 		}
 	}
-	err := work(workCtx, writer)
+	err := runProgressWork(workCtx, writer, work)
 	writer.mu.Lock()
 	writer.lineOutput()
+	if err != nil && writer.failedPhase != "" {
+		writer.emit(fmt.Sprintf("\nStopped at: %s\nDiagnostics: inspect the private logs in the retained demo output; build details use the private build log when listed above.\n", terminalText(writer.failedPhase)))
+	}
 	writer.mu.Unlock()
 	return errors.Join(err, writer.failure())
 }
 
 type checkedWriter struct {
-	mu        sync.Mutex
-	out       io.Writer
-	err       error
-	cancel    context.CancelFunc
-	raw       io.Writer
-	verbose   bool
-	remaining int
-	truncated bool
-	started   time.Time
-	phases    map[string]time.Time
-	line      []byte
-	discard   bool
+	mu          sync.Mutex
+	out         io.Writer
+	err         error
+	cancel      context.CancelFunc
+	raw         io.Writer
+	verbose     bool
+	remaining   int
+	truncated   bool
+	started     time.Time
+	phases      map[string]time.Time
+	line        []byte
+	discard     bool
+	failedPhase string
+	tenantStage string
+	observer    nkedemo.ProgressReporter
+	sudoAuth    func(context.Context) error
+	// One bounded latest line per public result category, independent of the
+	// dashboard's activity ring. Success statements replay only after success.
+	results        [6]string
+	operatorStatus string
+	guests         [2]nkedemo.TenantGuestObservation
+	guestsReported bool
+}
+
+// Escape controls without surrounding ordinary progress text in quoted strings.
+func terminalText(value string) string {
+	quoted := strconv.Quote(value)
+	return quoted[1 : len(quoted)-1]
+}
+
+func (w *checkedWriter) displayText(value string) string {
+	if _, dashboardOutput := w.out.(*dashboard); dashboardOutput {
+		// The dashboard's bounded activity boundary escapes raw text exactly
+		// once, including direct writes and partial lines.
+		return value
+	}
+	return terminalText(value)
+}
+
+func (w *checkedWriter) retainResult(line string) {
+	index := -1
+	switch {
+	case strings.HasPrefix(line, "Artifact builds complete;"):
+		index = 0
+	case strings.HasPrefix(line, "Deployment is separate:"):
+		index = 1
+	case strings.HasPrefix(line, "PASS:"), strings.HasPrefix(line, "PASS (NVIDIA OVN):"),
+		strings.HasPrefix(line, "PASS (upstream OVN diagnostic; NVIDIA OVN not validated):"),
+		strings.HasPrefix(line, "PASS (Kind/Calico diagnostic; NVIDIA OVN not deployed):"):
+		index = 2
+	case strings.HasPrefix(line, "Unqualified local diagnostic"):
+		index = 3
+	case strings.HasPrefix(line, "Warning:"):
+		index = 4
+	case strings.HasPrefix(line, "OS advisory"):
+		index = 5
+	}
+	if index >= 0 {
+		text := []rune(terminalText(line))
+		if len(text) > dashboardRunes {
+			text = append(text[:dashboardRunes-1], '…')
+		}
+		w.results[index] = string(text)
+	}
+}
+
+// Called with w.mu held, after the screen has restored scrolling output.
+func (w *checkedWriter) replayResults(success bool) {
+	if w.operatorStatus != "" {
+		w.emit("\nCluster snapshot observed during this invocation; historical, not a claim that services remain running.\n" + w.operatorStatus)
+	}
+	for index, line := range w.results {
+		if line != "" && (success || index >= 4) {
+			w.emit(line + "\n")
+		}
+	}
+}
+
+// The owner has already redacted and validated these rows. Do not send them
+// through the subprocess-log whitelist or parse table strings for authority.
+// Keep the bounded snapshot outside the activity ring for post-terminal replay,
+// even when subsequent cleanup fails. Plain output receives it immediately.
+func (w *checkedWriter) WriteOperatorStatus(status nkedemo.OperatorStatus) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.err != nil {
+		return w.err
+	}
+	text := status.Text()
+	if text == "" {
+		return w.fail("cluster presentation requires a bounded owner-generated observation")
+	}
+	w.operatorStatus = text
+	w.emit(text)
+	return w.err
 }
 
 func (w *checkedWriter) Write(data []byte) (int, error) {
@@ -78,6 +168,9 @@ func (w *checkedWriter) Write(data []byte) (int, error) {
 	defer w.mu.Unlock()
 	if w.err != nil {
 		return 0, w.err
+	}
+	if observer, ok := w.observer.(interface{ BuildOutput(int) }); ok && len(data) > 0 {
+		observer.BuildOutput(len(data))
 	}
 	if w.raw != nil {
 		retained := min(len(data), w.remaining)
@@ -142,14 +235,30 @@ func (w *checkedWriter) lineOutput() {
 	if w.discard || line == "" {
 		return
 	}
+	// Owner-generated graph projections use existing JSON records. Keep them
+	// out of the activity wall and plain output; only the dashboard consumes
+	// them as bounded descriptions. The retained raw log still has the trace.
+	for _, prefix := range []string{"Build vertex: ", "Build edge: ", "Build display: "} {
+		if strings.HasPrefix(line, prefix) {
+			if w.observer != nil {
+				w.emit(line + "\n")
+			}
+			return
+		}
+	}
+	if summary := dashboardGuestReport(line); summary != "" {
+		w.emit(fmt.Sprintf("[log +%s] %s%s\n", time.Since(w.started).Truncate(time.Second), dashboardGuestReportPrefix, summary))
+		return
+	}
 	if strings.HasPrefix(line, "==> ") && strings.HasSuffix(line, ": Waiting for SSH to become available...") {
-		w.emit(fmt.Sprintf("[log +%s] %q\n", time.Since(w.started).Truncate(time.Second), line))
+		w.emit(fmt.Sprintf("[log +%s] %s\n", time.Since(w.started).Truncate(time.Second), w.displayText(line)))
 		return
 	}
 	// Human subprocess markers are labeled logs, not authenticated Run events.
-	for _, prefix := range []string{"[start] ", "[done] ", "[cached] ", "nkdctl command:", "Build graph:", "  output:", "OS advisory", "Prerequisite diagnostics", "Warning:", "Build all artifacts", "Artifact builds complete;", "Deployment is separate:", "Tenant created;", "PASS:", "Unqualified local diagnostic"} {
+	for _, prefix := range []string{"[dry-run] ", "[start] ", "[done] ", "[cached] ", "nkdctl command:", "Build graph:", "  output:", "OS advisory", "Prerequisite diagnostics", "Warning:", "Build all artifacts", "Artifact builds complete;", "Deployment is separate:", "Tenant created;", "PASS:", "PASS (NVIDIA OVN):", "PASS (upstream OVN diagnostic; NVIDIA OVN not validated):", "PASS (Kind/Calico diagnostic; NVIDIA OVN not deployed):", "Unqualified local diagnostic"} {
 		if strings.HasPrefix(line, prefix) {
-			w.emit(fmt.Sprintf("[log +%s] %q\n", time.Since(w.started).Truncate(time.Second), line))
+			w.retainResult(line)
+			w.emit(fmt.Sprintf("[log +%s] %s\n", time.Since(w.started).Truncate(time.Second), w.displayText(line)))
 			return
 		}
 	}
@@ -161,10 +270,63 @@ func (w *checkedWriter) failure() error {
 	return w.err
 }
 
-// Only observed operation boundaries are presented. Quoted names cannot emit
+// Only observed operation boundaries are presented. Escaped names cannot emit
 // terminal controls; caller-supplied status text and private diagnostics are not
 // copied into this output. Report does not reparse subprocess log text.
 func (w *checkedWriter) Report(event nkedemo.ProgressEvent) {
+	if event.Kind == nkedemo.OSBuildLogs {
+		if event.BuildLogs.Validate() == nil && w.observer != nil {
+			w.observer.Report(event)
+		}
+		// No additional wall of periodic metadata in plain output. The private
+		// typed channel is presentation-only, never producer stdout or evidence.
+		return
+	}
+	if event.Kind == nkedemo.TenantGuests {
+		if !dashboardValidGuests(event.Guests) {
+			return
+		}
+		if w.observer != nil {
+			w.observer.Report(event)
+			return
+		}
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		for index, role := range [...]string{"Control plane", "Worker"} {
+			guest, previous := event.Guests[index], w.guests[index]
+			changed := !w.guestsReported || guest.Available != previous.Available || guest.Domain != previous.Domain || guest.ProviderReady != previous.ProviderReady || guest.ProvisioningFailure != previous.ProvisioningFailure || guest.ConsoleKnown != previous.ConsoleKnown
+			growth := guest.Available && previous.Available && guest.ConsoleKnown && previous.ConsoleKnown && guest.ConsoleChanged && guest.ConsoleBytes > previous.ConsoleBytes
+			if !changed && !growth {
+				continue
+			}
+			prefix := fmt.Sprintf("  Tenant guest +%s · %s: ", max(time.Duration(0), time.Since(w.started)).Truncate(time.Second), role)
+			if guest.ProvisioningFailure == nkedemo.TenantInstanceCreateFailed {
+				w.emit(prefix + "instance lookup/create failed (provider report; not a Kubernetes readiness result)\n")
+				continue
+			}
+			if !guest.Available {
+				w.emit(prefix + "guest observation unavailable\n")
+				continue
+			}
+			w.emit(fmt.Sprintf("%sVM %s; infrastructure Ready=%s (not Kubernetes Ready); console observed=%t", prefix, guest.Domain, guest.ProviderReady, guest.ConsoleKnown))
+			if growth {
+				w.emit(fmt.Sprintf("; console bytes grew to %d KiB; growth age %s at snapshot (not guest health)", guest.ConsoleBytes/1024, guest.ConsoleLastChange.Truncate(time.Second)))
+			}
+			w.emit("\n")
+		}
+		w.guests, w.guestsReported = event.Guests, true
+		return
+	}
+	if event.Kind == nkedemo.ProcessStarted || event.Kind == nkedemo.ProcessExited {
+		if w.observer != nil {
+			w.observer.Report(event)
+		}
+		return
+	}
+	if event.Kind == nkedemo.TenantWaiting {
+		w.tenantStatus(event)
+		return
+	}
 	var status string
 	switch event.Kind {
 	case nkedemo.LaneStarted, nkedemo.PhaseStarted, nkedemo.DeploymentStarted:
@@ -176,6 +338,9 @@ func (w *checkedWriter) Report(event nkedemo.ProgressEvent) {
 	default:
 		return
 	}
+	if w.observer != nil {
+		w.observer.Report(event)
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	now := time.Now()
@@ -186,5 +351,50 @@ func (w *checkedWriter) Report(event nkedemo.ProgressEvent) {
 		elapsed = now.Sub(start).Truncate(time.Second)
 		delete(w.phases, event.Name)
 	}
-	w.emit(fmt.Sprintf("[%s %s] %q\n", status, elapsed, event.Name))
+	if status == "FAIL" && w.failedPhase == "" {
+		w.failedPhase = event.Name
+	}
+	// The dashboard consumes these typed observations directly. Repeating every
+	// private mechanical step in its activity pane hides meaningful changes.
+	// Plain output retains the full trace; failures remain visible in both modes.
+	if w.observer == nil || status == "FAIL" {
+		w.emit(fmt.Sprintf("[%s %s] %s\n", status, elapsed, w.displayText(event.Name)))
+	}
+}
+
+func (w *checkedWriter) tenantStatus(event nkedemo.ProgressEvent) {
+	var message string
+	switch event.Name {
+	case "tenant-kubeconfig":
+		message = "Waiting for NKE to publish tenant kubeconfig; guest boot and node readiness not yet observed"
+	case "tenant-api":
+		message = "Tenant kubeconfig available; waiting for a successful tenant API node query (not yet Ready)"
+	case "tenant-nodes":
+		if event.RegisteredNodes < 0 || event.RegisteredNodes > 2 || event.ReadyNodes < 0 || event.ReadyNodes > event.RegisteredNodes {
+			return
+		}
+		message = fmt.Sprintf("Tenant nodes: %d/2 registered, %d/2 Ready; waiting for both control plane and worker", event.RegisteredNodes, event.ReadyNodes)
+		if event.RegisteredNodes == 2 && event.ReadyNodes == 2 {
+			message = "Tenant nodes: 2/2 registered, 2/2 Ready; workload and DNS checks still required"
+		}
+	case "tenant-workload":
+		message = "Running tenant workload and cluster DNS checks; successful completion still required"
+	default:
+		return
+	}
+	if w.observer != nil {
+		w.observer.Report(event)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.observer != nil {
+		// The live state pane owns the wait reason and budget. A repeated poll
+		// is a heartbeat, not an activity event or evidence of progress.
+		return
+	}
+	if w.tenantStage != event.Name {
+		w.tenantStage = event.Name
+		w.emit("\n  Artifacts → Site → [Tenant] → Workload/DNS → Cleanup\n")
+	}
+	w.emit(fmt.Sprintf("  Tenant  %s elapsed · %s remaining\n          %s\n", max(time.Duration(0), event.Elapsed).Truncate(time.Second), max(time.Duration(0), event.Remaining).Truncate(time.Second), message))
 }

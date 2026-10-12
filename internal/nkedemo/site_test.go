@@ -7,6 +7,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,90 +17,134 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/nke-recipes/pkg/nkd/delivery"
+	nkderr "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/lifecycle"
 )
 
-func TestProfilesTransportPreservesOriginalBundleIndex(t *testing.T) {
-	for _, scenario := range []string{"exact", "foreign-manifest", "corrupt-blob"} {
+func TestSiteInstallerFullCheckoutRealGit(t *testing.T) {
+	for _, scenario := range []string{"pinned", "canceled", "missing-pin", "sparse-regression", "delegated-worktree"} {
 		t.Run(scenario, func(t *testing.T) {
-			root := t.TempDir()
-			payload := filepath.Join(root, "profiles")
-			if err := os.WriteFile(payload, []byte("profiles data"), 0o600); err != nil {
+			work := privateTestDir(t)
+			source, checkout := filepath.Join(work, "source"), filepath.Join(work, "installer")
+			if err := os.Mkdir(source, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			original, imported := filepath.Join(root, "original"), filepath.Join(root, "imported")
-			result, err := delivery.BuildBinaryBundle(t.Context(), original, delivery.BinaryBundleRequest{
-				OS: "linux", Arch: "arm64", Purpose: "controller-profiles",
-				Files: []delivery.BinaryFileInput{{Name: "profiles", Path: payload, InstallPath: "/profiles", Mode: 0o644}},
-			})
-			if err != nil {
+			git := func(dir string, args ...string) string {
+				t.Helper()
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+				cmd.WaitDelay = time.Second
+				cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull,
+					"GIT_AUTHOR_NAME=Fixture", "GIT_AUTHOR_EMAIL=fixture@example.test", "GIT_COMMITTER_NAME=Fixture", "GIT_COMMITTER_EMAIL=fixture@example.test"}
+				raw, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("real fixture Git %v: %v: %s", args, err, raw)
+				}
+				return strings.TrimSpace(string(raw))
+			}
+			git(source, "init", "-q")
+			members := []string{"deploy/input", "make/input", "controller/deploy/charts/input", "controller/deploy/k8s/capi-spiffe-exec-auth/input", "controller/hack/ci/input", "cli/previously-excluded", "README.md"}
+			for _, name := range members {
+				path := filepath.Join(source, name)
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("pinned bytes\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			git(source, "add", ".")
+			git(source, "-c", "commit.gpgsign=false", "commit", "-qm", "pin")
+			pin := git(source, "rev-parse", "HEAD")
+			if err := os.WriteFile(filepath.Join(source, members[0]), []byte("newer source bytes\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.CopyFS(imported, os.DirFS(original)); err != nil {
-				t.Fatal(err)
-			}
-			raw, err := os.ReadFile(filepath.Join(original, "index.json"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			// ORAS creates a transport-only index without NKD bootstrap metadata.
-			var index struct {
-				SchemaVersion int    `json:"schemaVersion"`
-				MediaType     string `json:"mediaType"`
-				Manifests     []struct {
-					MediaType string `json:"mediaType"`
-					Digest    string `json:"digest"`
-					Size      int64  `json:"size"`
-				} `json:"manifests"`
-			}
-			if err := json.Unmarshal(raw, &index); err != nil {
-				t.Fatal(err)
-			}
-			digest := index.Manifests[0].Digest
-			if scenario == "foreign-manifest" {
-				index.Manifests[0].Digest = "sha256:" + strings.Repeat("a", 64)
-			}
-			generic, err := json.Marshal(index)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(imported, "index.json"), generic, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if _, _, err := delivery.InspectBinaryBundle(t.Context(), imported); err == nil {
-				t.Fatal("generic transport index unexpectedly passed the strict owner")
-			}
-			if scenario == "corrupt-blob" {
-				entries, err := os.ReadDir(filepath.Join(imported, "blobs/sha256"))
+			git(source, "add", ".")
+			git(source, "-c", "commit.gpgsign=false", "commit", "-qm", "newer source")
+			original := make(map[string][]byte)
+			for _, name := range append(append([]string{}, members...), ".git/config", ".git/index", ".git/HEAD") {
+				raw, err := os.ReadFile(filepath.Join(source, name))
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(filepath.Join(imported, "blobs/sha256", entries[0].Name()), []byte("corrupt"), 0o600); err != nil {
+				original[name] = raw
+			}
+			t.Cleanup(func() {
+				for name, want := range original {
+					raw, err := os.ReadFile(filepath.Join(source, name))
+					if err != nil || !bytes.Equal(raw, want) {
+						t.Fatalf("source checkout mutated at %s: %v", name, err)
+					}
+				}
+			})
+			runner := Runner{Work: work, Env: []string{"PATH=" + os.Getenv("PATH")}}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if scenario == "canceled" {
+				cancel()
+			}
+			if scenario == "sparse-regression" {
+				if err := runner.Run(ctx, []string{"git", "clone", "--no-hardlinks", "--no-checkout", source, checkout}, "clone-installer", time.Minute); err != nil {
 					t.Fatal(err)
 				}
+				if err := runner.Run(ctx, []string{"git", "-C", checkout, "sparse-checkout", "set", "deploy", "make", "controller/deploy/charts", "controller/deploy/k8s/capi-spiffe-exec-auth", "controller/hack/ci"}, "installer-membership", time.Minute); err != nil {
+					t.Fatal(err)
+				}
+				if git(checkout, "config", "--local", "--get", "extensions.worktreeConfig") != "true" {
+					t.Fatal("sparse fixture did not reproduce delegated configuration")
+				}
+				err := runner.Run(ctx, []string{"git", "-C", checkout, "checkout", "--detach", pin}, "checkout-installer", time.Minute)
+				var coded *nkderr.Error
+				if !errors.As(err, &coded) || coded.Code != nkderr.CodeEngineCapability {
+					t.Fatalf("sparse checkout no longer reproduces coded rejection: %v", err)
+				}
+				return
 			}
-			err = restoreBundleTransportIndex(t.Context(), original, imported, digest)
-			if scenario == "foreign-manifest" {
-				if err == nil {
-					t.Fatal("foreign manifest reached index restoration")
+			selected := pin
+			if scenario == "missing-pin" {
+				selected = strings.Repeat("0", 40)
+			}
+			err := checkoutSiteInstaller(ctx, runner, source, checkout, selected)
+			if scenario == "canceled" {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("checkout cancellation cause=%v", err)
+				}
+				if _, statErr := os.Stat(checkout); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatal("canceled checkout created destination", statErr)
+				}
+				return
+			}
+			if scenario == "missing-pin" {
+				var command *CommandError
+				if !errors.As(err, &command) || command.Phase != "checkout-installer" || command.ExitCode != 128 {
+					t.Fatalf("unpinned checkout error=%v", err)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			restored, err := os.ReadFile(filepath.Join(imported, "index.json"))
-			if err != nil || !bytes.Equal(restored, raw) {
-				t.Fatal("original bootstrap bytes were not preserved exactly")
-			}
-			_, checked, err := delivery.InspectBinaryBundle(t.Context(), imported)
-			if scenario == "corrupt-blob" {
-				if err == nil {
-					t.Fatal("restored description concealed corrupt payload bytes")
+			for _, name := range members {
+				raw, err := os.ReadFile(filepath.Join(checkout, name))
+				if err != nil || string(raw) != "pinned bytes\n" {
+					t.Fatalf("full pinned member %s=%q: %v", name, raw, err)
 				}
-			} else if err != nil || checked.RootDigest != result.RootDigest || checked.SemanticDigest != result.SemanticDigest {
-				t.Fatalf("original bundle identity was not independently verified: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(checkout, ".git/config.worktree")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("full checkout created delegated configuration", err)
+			}
+			if scenario == "delegated-worktree" {
+				git(checkout, "config", "extensions.worktreeConfig", "true")
+			}
+			raw, err := runner.Capture(ctx, []string{"git", "-C", checkout, "status", "--porcelain=v1"}, "installer-status", time.Minute)
+			if scenario == "delegated-worktree" {
+				var coded *nkderr.Error
+				if !errors.As(err, &coded) || coded.Code != nkderr.CodeEngineCapability {
+					t.Fatalf("delegated config policy relaxed: %v", err)
+				}
+			} else if err != nil || len(raw) != 0 || git(checkout, "rev-parse", "HEAD") != pin {
+				t.Fatalf("full pinned checkout not re-admitted: %q %v", raw, err)
 			}
 		})
 	}
@@ -114,34 +161,151 @@ func TestSiteEndpointAdmission(t *testing.T) {
 	}
 }
 
-func TestProfilesVolumeDisablesImageAndLimitsMount(t *testing.T) {
-	values := profilesVolumeValues()
+func TestKindNetworkAdmission(t *testing.T) {
+	for _, row := range []struct {
+		name, gateway, subnet, driver string
+		ok                            bool
+	}{
+		{"discovered-subnet", "172.29.0.1", "172.29.0.0/16", "bridge", true},
+		{"invalid-gateway", "invalid", "172.29.0.0/16", "bridge", false},
+		{"public-gateway", "8.8.8.8", "8.8.8.0/24", "bridge", false},
+		{"outside-subnet", "172.29.0.1", "172.30.0.0/16", "bridge", false},
+		{"no-ipv4", "fd00::1", "fd00::/64", "bridge", false},
+		{"wrong-driver", "172.29.0.1", "172.29.0.0/16", "host", false},
+		{"guest-overlap", "172.30.0.1", "172.30.0.0/24", "bridge", false},
+		{"vip-overlap", "172.31.0.1", "172.31.0.0/24", "bridge", false},
+		{"pod-overlap", "10.244.0.1", "10.244.0.0/16", "bridge", false},
+		{"service-overlap", "10.96.0.1", "10.96.0.0/16", "bridge", false},
+		{"noncanonical-subnet", "172.29.0.1", "172.29.0.1/16", "bridge", false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			root := privateTestDir(t)
+			output, err := json.Marshal([]map[string]any{{"Id": "exact-kind-network", "Driver": row.driver, "IPAM": map[string]any{"Config": []map[string]string{{"Gateway": row.gateway, "Subnet": row.subnet}}}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := "#!/bin/sh\n[ \"$1:$2:$3\" = network:inspect:kind ] || exit 99\nprintf '%s' '" + string(output) + "'\n"
+			if err = os.WriteFile(filepath.Join(root, "docker"), []byte(body), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			actual, err := admitKindNetwork(t.Context(), Runner{Env: []string{"PATH=" + root}})
+			if (err == nil) != row.ok {
+				t.Fatalf("network=%+v error=%v", actual, err)
+			}
+			if row.ok && actual != (kindNetwork{Gateway: row.gateway, CIDR: row.subnet, ID: "exact-kind-network"}) {
+				t.Fatalf("did not retain exact discovered network: %+v", actual)
+			}
+			if !row.ok && actual != (kindNetwork{}) {
+				t.Fatal("invalid network returned an admitted gateway")
+			}
+		})
+	}
+}
+
+func TestSimulatorPortAdmissionRejectsInvalidInputsBeforeBind(t *testing.T) {
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	for _, test := range []struct {
+		name string
+		ctx  context.Context
+		port int
+		code nkderr.Code
+	}{
+		{"nil context", nil, 18089, nkderr.CodeUsage},
+		{"zero port", t.Context(), 0, nkderr.CodeUsage},
+		{"negative port", t.Context(), -1, nkderr.CodeUsage},
+		{"overflow port", t.Context(), 65536, nkderr.CodeUsage},
+		{"canceled", canceled, 18089, nkderr.CodeTimeout},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// This non-IP locator cannot bind: the input/context boundary wins.
+			err := admitSimulatorPortAt(test.ctx, "not-an-ip", test.port)
+			var coded *nkderr.Error
+			if !errors.As(err, &coded) || coded.Code != test.code {
+				t.Fatalf("invalid input reached socket work: %v", err)
+			}
+			if test.code == nkderr.CodeTimeout && !errors.Is(err, context.Canceled) {
+				t.Fatal("cancellation cause lost", err)
+			}
+		})
+	}
+}
+
+func TestSimulatorPortAdmission(t *testing.T) {
+	if simulatorAPIPort != 18089 {
+		t.Fatal("production endpoint changed with the socket fixture seam")
+	}
+	for _, busy := range []bool{false, true} {
+		t.Run(map[bool]string{false: "free", true: "busy"}[busy], func(t *testing.T) {
+			// Only the socket helper is exercised on loopback. Production obtains
+			// its private gateway from admitKindNetwork, never from caller input.
+			listener, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			port := listener.Addr().(*net.TCPAddr).Port
+			address := listener.Addr().String()
+			if !busy {
+				if err = listener.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err = admitSimulatorPortAt(t.Context(), "127.0.0.1", port)
+			if !busy {
+				if err != nil {
+					t.Fatal(err)
+				}
+				listener, err := net.Listen("tcp4", address)
+				if err != nil {
+					t.Fatal("preflight retained listener", err)
+				}
+				listener.Close()
+				return
+			}
+			var coded *nkderr.Error
+			if !errors.As(err, &coded) || coded.Code != nkderr.CodePreflightFailed {
+				t.Fatalf("busy endpoint did not return a coded error: %v", err)
+			}
+			for _, hint := range []string{address, fmt.Sprintf("sudo ss -ltnp 'sport = :%d'", port), "status --session", "cleanup --session", "after a forced exit", "unrelated listeners"} {
+				if !strings.Contains(err.Error(), hint) {
+					t.Fatalf("missing guidance %q: %v", hint, err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			connection, err := (&net.Dialer{}).DialContext(ctx, "tcp4", listener.Addr().String())
+			if err != nil {
+				t.Fatal("preflight disturbed existing listener", err)
+			}
+			connection.Close()
+		})
+	}
+}
+
+func TestProfilesImageValuesSelectExactDigest(t *testing.T) {
+	reference := "example.invalid/profiles@sha256:" + strings.Repeat("a", 64)
+	values := profilesImageValues(reference)
 	profiles := values["profiles"].(map[string]any)
-	if profiles["path"] != "/profiles" || profiles["image"].(map[string]any)["enabled"] != false {
-		t.Fatal("data profiles must not enable the image materializer")
+	image := profiles["image"].(map[string]any)
+	if profiles["path"] != "/profiles" || image["enabled"] != true ||
+		image["repository"] != "example.invalid/profiles" || image["digest"] != "sha256:"+strings.Repeat("a", 64) || image["tag"] != "" {
+		t.Fatal("profiles must select the exact image through the chart's standard init container")
 	}
-	volumes := values["volumes"].([]any)
-	mounts := values["volumeMounts"].([]any)
-	if len(volumes) != 1 || len(mounts) != 1 {
-		t.Fatal("profiles require exactly one volume and mount")
-	}
-	host := volumes[0].(map[string]any)["hostPath"].(map[string]string)
-	mount := mounts[0].(map[string]any)
-	if host["path"] != "/var/nkd-local-profiles/profiles" || host["type"] != "Directory" ||
-		mount["mountPath"] != "/profiles" || mount["readOnly"] != true ||
-		mount["name"] != volumes[0].(map[string]any)["name"] {
-		t.Fatal("profiles must use the exact prepared read-only directory in the owned Kind node")
+	if _, found := values["volumes"]; found {
+		t.Fatal("profiles must not inject a hostPath")
 	}
 }
 
 // Optional source-owned consumer check. Supply a chart exported from the exact
 // InstallerCommit; this check renders it but creates no Kubernetes resources.
-func TestProfilesVolumeSourceChart(t *testing.T) {
+func TestProfilesImageSourceChart(t *testing.T) {
 	chart := os.Getenv("NKD_DEMO_PROFILE_CHART")
 	if chart == "" {
 		t.Skip("set NKD_DEMO_PROFILE_CHART to the pinned NKE controller chart")
 	}
-	raw, err := json.Marshal(profilesVolumeValues())
+	reference := "example.invalid/profiles@sha256:" + strings.Repeat("a", 64)
+	raw, err := json.Marshal(profilesImageValues(reference))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,39 +334,86 @@ func TestProfilesVolumeSourceChart(t *testing.T) {
 	command.WaitDelay = time.Second
 	rendered, err := command.CombinedOutput()
 	if err != nil {
-		t.Fatalf("source-owned chart rejected profiles volume: %v\n%s", err, rendered)
+		t.Fatalf("source-owned chart rejected profiles image: %v\n%s", err, rendered)
 	}
 	value := string(rendered)
-	for _, required := range []string{"mountPath: /profiles", "readOnly: true", "path: /var/nkd-local-profiles/profiles", "type: Directory", "name: PROFILES_DIR"} {
+	for _, required := range []string{"name: materialize-profiles", "image: \"" + reference + "\"", "cp -a /profiles/. /profiles-out/", "emptyDir: {}", "mountPath: \"/profiles\"", "readOnly: true", "name: PROFILES_DIR"} {
 		if !strings.Contains(value, required) {
-			t.Fatalf("missing source-owned profile volume field %q", required)
+			t.Fatalf("missing source-owned profiles image field %q", required)
 		}
 	}
-	if strings.Contains(value, "materialize-profiles") || strings.Contains(value, "cwe-profiles") {
-		t.Fatal("profiles data must not invoke a runnable profiles image")
+	if strings.Contains(value, "hostPath:") || strings.Contains(value, "/var/nkd-local-profiles") {
+		t.Fatal("profiles image must not use the retired host directory")
 	}
 }
 
-func TestDeployedProfilesVolumeRejectsSubstitution(t *testing.T) {
-	for _, scenario := range []string{"exact", "image", "path", "writable", "missing-volume", "duplicate-mount"} {
+func TestDeployedProfilesImageRejectsSubstitution(t *testing.T) {
+	for _, scenario := range []string{"exact", "api-token", "unrelated-container", "other-init-writable", "other-init-readonly", "other-app-writable", "other-app-readonly", "image", "image-id", "failed-init", "missing-exit", "running-init", "missing-init", "duplicate-init", "missing-status", "duplicate-status", "init-mount", "duplicate-init-mount", "masked-source", "masked-destination", "masked-root", "masked-controller", "path", "writable", "host-path", "missing-volume", "duplicate-mount"} {
 		t.Run(scenario, func(t *testing.T) {
+			reference := "example.invalid/profiles@sha256:" + strings.Repeat("a", 64)
+			emptyDir := json.RawMessage("{}")
+			exit := 0
 			var pod sitePod
-			pod.Spec.Volumes = []profileVolume{{Name: "local-profiles", HostPath: &struct{ Path, Type string }{"/var/nkd-local-profiles/profiles", "Directory"}}}
-			pod.Spec.Containers = []podContainer{{Name: "controller", VolumeMounts: []profileMount{{"local-profiles", "/profiles", true}}}}
+			pod.Spec.Volumes = []profileVolume{{Name: "profiles", EmptyDir: &emptyDir}}
+			pod.Spec.InitContainers = []podContainer{{Name: "materialize-profiles", Image: reference,
+				VolumeMounts: []profileMount{{"profiles", "/profiles-out", false}}}}
+			pod.Spec.Containers = []podContainer{{Name: "controller", VolumeMounts: []profileMount{{"profiles", "/profiles", true}}}}
+			pod.Status.InitContainerStatuses = []podContainerState{{Name: "materialize-profiles", ImageID: reference}}
+			pod.Status.InitContainerStatuses[0].State.Terminated = &struct{ ExitCode *int }{&exit}
 			switch scenario {
+			case "unrelated-container":
+				pod.Spec.InitContainers = append(pod.Spec.InitContainers, podContainer{Name: "unrelated-init"})
+				pod.Spec.Containers = append(pod.Spec.Containers, podContainer{Name: "unrelated-app"})
+			case "other-init-writable", "other-init-readonly":
+				pod.Spec.InitContainers = append(pod.Spec.InitContainers, podContainer{Name: "other-init", VolumeMounts: []profileMount{{"profiles", "/shared", scenario == "other-init-readonly"}}})
+			case "other-app-writable", "other-app-readonly":
+				pod.Spec.Containers = append(pod.Spec.Containers, podContainer{Name: "other-app", VolumeMounts: []profileMount{{"profiles", "/shared", scenario == "other-app-readonly"}}})
+			case "api-token":
+				pod.Spec.InitContainers[0].VolumeMounts = append(pod.Spec.InitContainers[0].VolumeMounts,
+					profileMount{"kube-api-access-test", "/var/run/secrets/kubernetes.io/serviceaccount", true})
 			case "image":
-				pod.Spec.InitContainers = []podContainer{{Name: "materialize-profiles"}}
+				pod.Spec.InitContainers[0].Image = "foreign:latest"
+			case "image-id":
+				pod.Status.InitContainerStatuses[0].ImageID = "foreign"
+			case "failed-init":
+				exit = 1
+			case "missing-exit":
+				pod.Status.InitContainerStatuses[0].State.Terminated.ExitCode = nil
+			case "running-init":
+				pod.Status.InitContainerStatuses[0].State.Terminated = nil
+			case "missing-init":
+				pod.Spec.InitContainers = nil
+			case "duplicate-init":
+				pod.Spec.InitContainers = append(pod.Spec.InitContainers, pod.Spec.InitContainers[0])
+			case "missing-status":
+				pod.Status.InitContainerStatuses = nil
+			case "duplicate-status":
+				pod.Status.InitContainerStatuses = append(pod.Status.InitContainerStatuses, pod.Status.InitContainerStatuses[0])
+			case "init-mount":
+				pod.Spec.InitContainers[0].VolumeMounts[0].MountPath = "/profiles"
+			case "duplicate-init-mount":
+				pod.Spec.InitContainers[0].VolumeMounts = append(pod.Spec.InitContainers[0].VolumeMounts, pod.Spec.InitContainers[0].VolumeMounts[0])
+			case "masked-source":
+				pod.Spec.InitContainers[0].VolumeMounts = append(pod.Spec.InitContainers[0].VolumeMounts, profileMount{"foreign", "/profiles/osProfiles", true})
+			case "masked-destination":
+				pod.Spec.InitContainers[0].VolumeMounts = append(pod.Spec.InitContainers[0].VolumeMounts, profileMount{"foreign", "/profiles-out/osProfiles", false})
+			case "masked-root":
+				pod.Spec.InitContainers[0].VolumeMounts = append(pod.Spec.InitContainers[0].VolumeMounts, profileMount{"foreign", "/", true})
+			case "masked-controller":
+				pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, profileMount{"foreign", "/profiles/osProfiles", true})
 			case "path":
-				pod.Spec.Volumes[0].HostPath.Path = "/var"
+				pod.Spec.Containers[0].VolumeMounts[0].MountPath = "/different"
 			case "writable":
 				pod.Spec.Containers[0].VolumeMounts[0].ReadOnly = false
+			case "host-path":
+				pod.Spec.Volumes[0].HostPath = &struct{ Path, Type string }{"/var", "Directory"}
 			case "missing-volume":
 				pod.Spec.Volumes = nil
 			case "duplicate-mount":
 				pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, pod.Spec.Containers[0].VolumeMounts[0])
 			}
-			if err := validateProfilesVolume(pod, "controller"); (err == nil) != (scenario == "exact") {
-				t.Fatalf("profiles volume acceptance: %v", err)
+			if err := validateProfilesImage(pod, "controller", reference); (err == nil) != (scenario == "exact" || scenario == "api-token" || scenario == "unrelated-container") {
+				t.Fatalf("profiles image acceptance: %v", err)
 			}
 		})
 	}
@@ -243,8 +454,369 @@ func TestRegistryOwnershipRejectsForeignResources(t *testing.T) {
 	}
 }
 
+func TestRegistryAddressRequiresOwnedKindIdentity(t *testing.T) {
+	for _, scenario := range []string{"exact", "id", "name", "owner", "image", "stopped", "bind", "volume", "missing", "duplicate", "no-kind", "extra-network", "network-id", "missing-network-id", "missing-image-id", "missing-gateway", "no-address", "address", "ipv6", "public", "outside", "gateway", "subnet", "broadcast", "unmasked-subnet"} {
+		t.Run(scenario, func(t *testing.T) {
+			var rows []dockerContainer
+			fixture := `[{"Id":"owned-id","Name":"/private-registry","Image":"accepted","Config":{"Labels":{"dev.nkd.demo.owner":"private-owner"}},"State":{"Running":true},"Mounts":[{"Type":"tmpfs"}],"NetworkSettings":{"Networks":{"kind":{"IPAddress":"172.18.0.2","NetworkID":"kind-id"}}}}]`
+			if err := json.Unmarshal([]byte(fixture), &rows); err != nil {
+				t.Fatal(err)
+			}
+			materials := &SiteMaterials{RegistryID: "accepted", KindNetworkID: "kind-id", Gateway: "172.18.0.1", KindCIDR: "172.18.0.0/16"}
+			row := &rows[0]
+			network := row.NetworkSettings.Networks["kind"]
+			switch scenario {
+			case "id":
+				row.ID = "foreign"
+			case "name":
+				row.Name = "/foreign"
+			case "owner":
+				row.Config.Labels["dev.nkd.demo.owner"] = "foreign"
+			case "image":
+				row.Image = "foreign"
+			case "stopped":
+				row.State.Running = false
+			case "bind", "volume":
+				row.Mounts[0].Type = scenario
+			case "missing":
+				rows = nil
+			case "duplicate":
+				rows = append(rows, rows[0])
+			case "no-kind":
+				delete(row.NetworkSettings.Networks, "kind")
+			case "extra-network":
+				row.NetworkSettings.Networks["bridge"] = network
+			case "network-id":
+				network.NetworkID = "foreign"
+			case "missing-network-id":
+				materials.KindNetworkID = ""
+			case "missing-image-id":
+				materials.RegistryID = ""
+			case "missing-gateway":
+				materials.Gateway = ""
+			case "no-address":
+				network.IPAddress = ""
+			case "address":
+				network.IPAddress = "172.018.0.2"
+			case "ipv6":
+				network.IPAddress = "fd00::2"
+			case "public":
+				network.IPAddress = "8.8.8.8"
+			case "outside":
+				network.IPAddress = "172.19.0.2"
+			case "gateway":
+				network.IPAddress = materials.Gateway
+			case "subnet":
+				network.IPAddress = "172.18.0.0"
+			case "broadcast":
+				network.IPAddress = "172.18.255.255"
+			case "unmasked-subnet":
+				materials.KindCIDR = "172.18.0.1/16"
+			}
+			if scenario != "no-kind" {
+				row.NetworkSettings.Networks["kind"] = network
+			}
+			host, err := registryAddress(rows, "owned-id", "private-registry", "private-owner", materials)
+			if scenario == "exact" {
+				if err != nil || host != "172.18.0.2:5000" {
+					t.Fatalf("owned registry address %q: %v", host, err)
+				}
+			} else if err == nil || host != "" {
+				t.Fatal("unadmitted registry address escaped")
+			}
+		})
+	}
+}
+
+func TestRegistryStartRejectsIdentityBeforeNodeProbe(t *testing.T) {
+	for _, scenario := range []string{"foreign-id", "missing-id", "multiple-ids", "canceled"} {
+		t.Run(scenario, func(t *testing.T) {
+			work := privateTestDir(t)
+			trace := filepath.Join(work, "commands")
+			tool := filepath.Join(work, "docker")
+			script := "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" >> \"$TRACE\"\ncase \"$1\" in\n run) printf '%s\\n' \"$START_ID\";;\n inspect) printf '%s\\n' '[{\"Id\":\"foreign\"}]';;\n *) exit 42;;\nesac\n"
+			if err := os.WriteFile(tool, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			id := "owned-id"
+			switch scenario {
+			case "missing-id":
+				id = ""
+			case "multiple-ids":
+				id = "one two"
+			}
+			progress := &recordedProgress{}
+			runner := Runner{Work: work, Progress: progress, Env: []string{"PATH=" + work + ":/usr/bin:/bin", "TRACE=" + trace, "START_ID=" + id}}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			if scenario == "canceled" {
+				cancel()
+			}
+			host, err := startSiteRegistry(ctx, runner, "private-registry", "private-owner", "owned-node", &SiteMaterials{RegistryID: "accepted", KindNetworkID: "kind-id", KindCIDR: "172.18.0.0/16"})
+			if err == nil || host != "" {
+				t.Fatal("unadmitted registry can reach image upload")
+			}
+			var admission []ProgressEvent
+			for _, event := range progress.events {
+				if event.Name == "registry-admission" {
+					admission = append(admission, event)
+				}
+			}
+			if len(admission) != 2 || admission[0].Kind != PhaseStarted || admission[1].Kind != PhaseFailed {
+				t.Fatalf("registry owner reported admission before validation: %+v", admission)
+			}
+			if scenario == "canceled" {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("lost cancellation: %v", err)
+				}
+				if _, err := os.Stat(trace); !os.IsNotExist(err) {
+					t.Fatal("canceled admission launched a child")
+				}
+				return
+			}
+			raw, err := os.ReadFile(trace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			commands := string(raw)
+			if strings.Contains(commands, "--publish") || strings.Contains(commands, "exec\n") || strings.Contains(commands, "15501") {
+				t.Fatal("registry start published a host port or probed an unadmitted node route")
+			}
+			for _, expected := range []string{"--network\nkind\n", "--read-only\n", "--cap-drop=ALL\n", "--tmpfs\n/var/lib/registry:rw,size=2147483648\n", registryImage} {
+				if !strings.Contains(commands, expected) {
+					t.Fatalf("registry start lost %q", expected)
+				}
+			}
+		})
+	}
+}
+
+func TestRegistryStartupRetainsOnlyAuthenticatedDiagnostics(t *testing.T) {
+	for _, scenario := range []string{"stopped", "log-failure", "inspect-failure", "foreign-owner", "foreign-id", "invalid-materials", "nil-materials", "canceled", "unjoined-original"} {
+		t.Run(scenario, func(t *testing.T) {
+			work := privateTestDir(t)
+			trace := filepath.Join(work, "commands")
+			var rows []dockerContainer
+			fixture := `[{"Id":"owned-id","Name":"/private-registry","Image":"accepted","Config":{"Labels":{"dev.nkd.demo.owner":"private-owner"}},"State":{"Running":false},"Mounts":[{"Type":"tmpfs"}]}]`
+			if err := json.Unmarshal([]byte(fixture), &rows); err != nil {
+				t.Fatal(err)
+			}
+			materials := &SiteMaterials{RegistryID: "accepted", KindNetworkID: "kind-id", Gateway: "172.18.0.1", KindCIDR: "172.18.0.0/16"}
+			wantLogs := true
+			logExit := "0"
+			switch scenario {
+			case "log-failure":
+				logExit = "7"
+			case "foreign-owner":
+				rows[0].Config.Labels["dev.nkd.demo.owner"] = "foreign"
+				wantLogs = false
+			case "foreign-id":
+				rows[0].ID = "foreign"
+				wantLogs = false
+			case "invalid-materials":
+				materials.KindCIDR = "8.8.8.0/24"
+				wantLogs = false
+			case "nil-materials":
+				materials = nil
+				wantLogs = false
+			}
+			encoded, err := json.Marshal(rows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			script := "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" >>\"$TRACE\"\ncase \"$1\" in\n inspect) if test \"$INSPECT_FAILURE\" = inspect-failure && test ! -f \"$INSPECT_ONCE\"; then : >\"$INSPECT_ONCE\"; exit 7; fi; printf '%s' \"$REGISTRY\";;\n logs) printf 'owned-startup-detail\\n'; exit \"$LOG_EXIT\";;\n *) exit 42;;\nesac\n"
+			if err = os.WriteFile(filepath.Join(work, "docker"), []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			runner := Runner{Work: work, Env: []string{"PATH=" + work + ":/usr/bin:/bin", "TRACE=" + trace, "REGISTRY=" + string(encoded), "LOG_EXIT=" + logExit, "INSPECT_FAILURE=" + scenario, "INSPECT_ONCE=" + filepath.Join(work, "inspect-once")}}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if scenario == "canceled" {
+				cancel()
+			}
+			var host string
+			if scenario == "unjoined-original" {
+				err = registryStartupDiagnostics(ctx, runner, "owned-id", "private-registry", "private-owner", materials, errors.Join(errors.New("original startup reason"), ErrUnjoined))
+				if !errors.Is(err, ErrUnjoined) || !strings.Contains(err.Error(), "original startup reason") {
+					t.Fatalf("diagnostic path lost unjoined startup failure: %v", err)
+				}
+			} else {
+				host, err = waitRegistry(ctx, runner, "owned-id", "private-registry", "private-owner", materials)
+			}
+			if err == nil || host != "" {
+				t.Fatal("failed registry was admitted")
+			}
+			if scenario == "canceled" && !errors.Is(err, context.Canceled) {
+				t.Fatalf("diagnostics lost original cancellation: %v", err)
+			}
+			if scenario == "stopped" || scenario == "log-failure" {
+				if !strings.Contains(err.Error(), "owned registry container is stopped") {
+					t.Fatalf("diagnostics lost stopped-registry reason: %v", err)
+				}
+			}
+			if scenario == "inspect-failure" && (CommandExitCode(err) != 7 || !strings.Contains(err.Error(), "registry-startup-state")) {
+				t.Fatalf("authenticated diagnostics lost initial inspection failure: %v", err)
+			}
+			if scenario == "log-failure" && CommandExitCode(err) != 7 {
+				t.Fatalf("log command failure was discarded: %v", err)
+			}
+			raw, readErr := os.ReadFile(trace)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if logged := strings.Contains(string(raw), "logs\n"); logged != wantLogs {
+				t.Fatalf("unexpected diagnostic access: %s", raw)
+			}
+			if wantLogs {
+				if !strings.Contains(string(raw), "logs\n--tail\n100\nowned-id\n") {
+					t.Fatalf("logs were not bounded to exact authenticated ID: %s", raw)
+				}
+				log, readErr := os.ReadFile(filepath.Join(work, "registry-startup-diagnostics.log"))
+				if readErr != nil || !strings.Contains(string(log), "owned-startup-detail") {
+					t.Fatalf("startup details were not retained before cleanup: %s %v", log, readErr)
+				}
+			} else if _, readErr := os.Stat(filepath.Join(work, "registry-startup-diagnostics.log")); !errors.Is(readErr, os.ErrNotExist) {
+				t.Fatal("unadmitted registry acquired a diagnostic log")
+			}
+		})
+	}
+}
+
+func TestNodeRegistryProbeUsesBoundedDirectRoute(t *testing.T) {
+	for _, scenario := range []string{"exact", "foreign-response", "null", "curl-failure", "canceled"} {
+		t.Run(scenario, func(t *testing.T) {
+			work := privateTestDir(t)
+			trace := filepath.Join(work, "commands")
+			script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$TRACE\"\nprintf '%s' \"$RESPONSE\"\nexit \"$STATUS\"\n"
+			if err := os.WriteFile(filepath.Join(work, "docker"), []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			response, status := "{}\n", "0"
+			switch scenario {
+			case "foreign-response":
+				response = `{"foreign":true}`
+			case "null":
+				response = "null"
+			case "curl-failure":
+				status = "7"
+			}
+			runner := Runner{Work: work, Env: []string{"PATH=" + work + ":/usr/bin:/bin", "TRACE=" + trace, "RESPONSE=" + response, "STATUS=" + status}}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			if scenario == "canceled" {
+				cancel()
+			}
+			err := probeNodeRegistry(ctx, runner, "owned-node", "172.18.0.2:5000")
+			if (err == nil) != (scenario == "exact") {
+				t.Fatalf("node registry response: %v", err)
+			}
+			if scenario == "canceled" {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("lost cancellation: %v", err)
+				}
+				return
+			}
+			if scenario == "curl-failure" {
+				var command *CommandError
+				if !errors.As(err, &command) || command.Phase != "node-registry-connectivity" || command.ExitCode != 7 {
+					t.Fatalf("lost owned node failure: %v", err)
+				}
+			}
+			raw, err := os.ReadFile(trace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "exec\nowned-node\ncurl\n--fail\n--silent\n--show-error\n--max-time\n10\nhttp://172.18.0.2:5000/v2/\n"
+			if string(raw) != want {
+				t.Fatalf("unexpected node probe %q", raw)
+			}
+		})
+	}
+}
+
+func TestNodeSimulatorProbeRequiresBoundedHealthFromOwnedNode(t *testing.T) {
+	for _, scenario := range []string{"exact", "whitespace", "not-ready", "unknown-field", "duplicate", "trailing", "oversized", "curl-failure", "canceled", "invalid-endpoint"} {
+		t.Run(scenario, func(t *testing.T) {
+			work := privateTestDir(t)
+			trace := filepath.Join(work, "commands")
+			script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$TRACE\"\nprintf '%s' \"$RESPONSE\"\nexit \"$STATUS\"\n"
+			if err := os.WriteFile(filepath.Join(work, "docker"), []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			response, status, endpoint := `{"status":"ok"}`, "0", "http://172.19.0.1:18089"
+			switch scenario {
+			case "whitespace":
+				response = " {\"status\": \"ok\"} \n"
+			case "not-ready":
+				response = `{"status":"starting"}`
+			case "unknown-field":
+				response = `{"status":"ok","private":"secret-marker"}`
+			case "duplicate":
+				response = `{"status":"starting","status":"ok"}`
+			case "trailing":
+				response += `{}`
+			case "oversized":
+				response = strings.Repeat(" ", 4097) + response
+			case "curl-failure":
+				status = "28"
+				response = "private-connectivity-detail"
+			case "invalid-endpoint":
+				endpoint = "http://public.example:18089"
+			}
+			writer := &recordedProgress{}
+			runner := Runner{Work: work, Env: []string{"PATH=" + work + ":/usr/bin:/bin", "TRACE=" + trace, "RESPONSE=" + response, "STATUS=" + status}, Progress: writer}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			if scenario == "canceled" {
+				cancel()
+			}
+			err := probeNodeSimulator(ctx, runner, "owned-node", endpoint)
+			if (err == nil) != (scenario == "exact" || scenario == "whitespace") {
+				t.Fatalf("node simulator response: %v", err)
+			}
+			if err != nil {
+				var coded *nkderr.Error
+				if !errors.As(err, &coded) || coded.Code != nkderr.CodePreflightFailed {
+					t.Fatalf("lost preflight code: %v", err)
+				}
+			}
+			if strings.Contains(writer.String(), "private-connectivity-detail") || strings.Contains(writer.String(), "secret-marker") {
+				t.Fatal("private simulator response reached public output")
+			}
+			if scenario == "curl-failure" {
+				log := filepath.Join(work, "node-simulator-connectivity.log")
+				info, statErr := os.Stat(log)
+				raw, readErr := os.ReadFile(log)
+				if statErr != nil || readErr != nil || info.Mode().Perm() != 0o600 || string(raw) != response {
+					t.Fatalf("private node-probe failure diagnostics were not retained: %v, %v", statErr, readErr)
+				}
+			}
+			if scenario == "canceled" || scenario == "invalid-endpoint" {
+				if scenario == "canceled" && !errors.Is(err, context.Canceled) {
+					t.Fatalf("lost cancellation: %v", err)
+				}
+				if _, readErr := os.Stat(trace); !errors.Is(readErr, os.ErrNotExist) {
+					t.Fatal("failed admission launched node probe")
+				}
+				return
+			}
+			if scenario == "curl-failure" && CommandExitCode(err) != 28 {
+				t.Fatalf("lost node connection failure: %v", err)
+			}
+			raw, readErr := os.ReadFile(trace)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			want := "exec\nowned-node\ncurl\n-q\n--fail\n--silent\n--show-error\n--connect-timeout\n3\n--max-time\n10\n--max-filesize\n4096\nhttp://172.19.0.1:18089/healthz\n"
+			if string(raw) != want {
+				t.Fatalf("unexpected simulator probe %q", raw)
+			}
+		})
+	}
+}
+
 func TestRegistryCapacityIsMeasuredAndBounded(t *testing.T) {
-	for _, name := range []string{"exact", "oversized", "combined", "symlink", "sizeMismatch", "missingInput"} {
+	for _, name := range []string{"exact", "freshUpstream", "atLimit", "overLimit", "blobLimit", "tooManyBlobs", "oversized", "combined", "symlink", "sizeMismatch", "missingInput"} {
 		t.Run(name, func(t *testing.T) {
 			base := t.TempDir()
 			outputs := make(map[string]SelectedOutput)
@@ -276,6 +848,26 @@ func TestRegistryCapacityIsMeasuredAndBounded(t *testing.T) {
 				}
 			}
 			switch name {
+			case "freshUpstream":
+				// Reproduce the exact measured reservation that stopped the fresh
+				// upstream OVN run before deployment at the former 1 GiB ceiling.
+				const required int64 = 1_122_458_894
+				small := int64(6 * (len(imageKeys()) + 1))
+				truncate(filepath.Join(outputs["cwe"].Layout, "blobs/sha256/fresh-layer"), (required-(64<<20)-small)/2)
+			case "atLimit", "overLimit":
+				small := int64(6 * (len(imageKeys()) + 1))
+				truncate(filepath.Join(outputs["cwe"].Layout, "blobs/sha256/large"), (registryBytes-(64<<20)-small)/2)
+				if name == "overLimit" {
+					truncate(filepath.Join(outputs["cwe"].Layout, "blobs/sha256/one-more-byte"), 1)
+				}
+			case "blobLimit", "tooManyBlobs":
+				count := 4096
+				if name == "tooManyBlobs" {
+					count++
+				}
+				for i := len(imageKeys()) + 1; i < count; i++ {
+					truncate(filepath.Join(outputs["cwe"].Layout, "blobs/sha256", fmt.Sprintf("extra-%04d", i)), 0)
+				}
 			case "oversized":
 				truncate(blob, registryBytes+1)
 			case "combined":
@@ -294,11 +886,17 @@ func TestRegistryCapacityIsMeasuredAndBounded(t *testing.T) {
 				delete(outputs, "provider")
 			}
 			bytes, err := registryCapacity(outputs)
-			if name == "exact" {
+			if name == "exact" || name == "freshUpstream" || name == "atLimit" || name == "blobLimit" {
 				if err != nil {
 					t.Fatal(err)
 				}
 				expected := int64(64<<20) + 6*int64(len(imageKeys())+2)
+				switch name {
+				case "freshUpstream":
+					expected = 1_122_458_894
+				case "atLimit":
+					expected = registryBytes
+				}
 				if bytes != expected {
 					t.Fatalf("capacity:%d != %d", bytes, expected)
 				}
@@ -306,6 +904,28 @@ func TestRegistryCapacityIsMeasuredAndBounded(t *testing.T) {
 				t.Fatal("unsafe capacity accepted")
 			}
 		})
+	}
+}
+
+func TestSelectedSiteImagesKeepAllNonOVNInputs(t *testing.T) {
+	for _, withOVN := range []bool{false, true} {
+		outputs := map[string]SelectedOutput{}
+		if withOVN {
+			outputs["ovn"] = SelectedOutput{}
+		}
+		keys := selectedImageKeys(outputs)
+		for _, key := range imageKeys() {
+			found := false
+			for _, selected := range keys {
+				found = found || selected == key
+			}
+			if found != (key != "ovn" || withOVN) {
+				t.Fatalf("OVN selected=%v: unexpected membership for %s", withOVN, key)
+			}
+		}
+		if _, err := registryCapacity(outputs); err == nil {
+			t.Fatal("missing required non-OVN inputs accepted")
+		}
 	}
 }
 
@@ -550,7 +1170,7 @@ func TestSiteImageCopyChecksEveryNativeReadback(t *testing.T) {
 				t.Fatal(err)
 			}
 			tool := filepath.Join(tools, "oras")
-			script := "#!/bin/sh\ncase \"$1\" in\n cp) exit 0;;\n manifest) printf '{\"digest\":\"%s\"}\\n' \"$DESCRIPTOR\";;\n *) exit 42;;\nesac\n"
+			script := "#!/bin/sh\nset -eu\ntest \"$NO_PROXY\" = 'existing.example,172.18.0.2'\ntest \"$no_proxy\" = 'lower.example,172.18.0.2'\ntest \"$HTTP_PROXY\" = 'http://proxy.example:8080'\ncase \"$1\" in\n cp) exit 0;;\n manifest) printf '{\"digest\":\"%s\"}\\n' \"$DESCRIPTOR\";;\n *) exit 42;;\nesac\n"
 			if err := os.WriteFile(tool, []byte(script), 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -563,13 +1183,16 @@ func TestSiteImageCopyChecksEveryNativeReadback(t *testing.T) {
 			for _, key := range imageKeys() {
 				outputs[key] = SelectedOutput{Layout: filepath.Join(work, "run/packages", key), Observation: lifecycle.Artifact{Digest: digest}}
 			}
-			session := ManagementSession{Name: "owned", Tools: tools, Work: work, Runner: Runner{Work: work, Env: []string{"PATH=/usr/bin:/bin", "DESCRIPTOR=" + descriptor}}}
-			refs, err := copySiteImages(context.Background(), session, "172.18.0.1:15501", outputs)
+			session := ManagementSession{Name: "owned", Tools: tools, Work: work, Runner: Runner{Work: work, Env: []string{"PATH=/usr/bin:/bin", "DESCRIPTOR=" + descriptor, "NO_PROXY=existing.example", "no_proxy=lower.example", "HTTP_PROXY=http://proxy.example:8080"}}}
+			refs, err := copySiteImages(t.Context(), session, "172.18.0.2:5000", outputs)
+			if environmentValue(session.Runner.Env, "NO_PROXY") != "existing.example" || environmentValue(session.Runner.Env, "no_proxy") != "lower.example" {
+				t.Fatal("registry proxy scope escaped the image-copy runner")
+			}
 			if name == "exact" {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if len(refs) != 15 {
+				if len(refs) != 16 || refs["ovn"] == "" {
 					t.Fatal("not all site images copied")
 				}
 				for _, key := range imageKeys() {

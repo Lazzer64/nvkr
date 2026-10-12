@@ -24,9 +24,13 @@ import (
 // Apply the authenticated patch with Git, not a second patch interpreter.
 // The overlay adds local profile data without modifying upstream NKE files.
 func laptopProfilesPatchedFixture(t *testing.T) string {
+	return laptopProfilesPatchedFixtureCatalog(t, "profiles-catalog")
+}
+
+func laptopProfilesPatchedFixtureCatalog(t *testing.T, catalogName string) string {
 	t.Helper()
 	root := t.TempDir()
-	cat, err := catalog.LoadContext(t.Context(), catalog.Dir(filepath.Join("..", "..", "..", "definitions", "nke-local-dev-arm64", "profiles-catalog")))
+	cat, err := catalog.LoadContext(t.Context(), catalog.Dir(filepath.Join("..", "..", "..", "definitions", "nke-local-dev-arm64", catalogName)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +266,208 @@ func TestLaptopProfilesRejectTamperedPatch(t *testing.T) {
 	assertFactoryErrorCode(t, err, e.CodeUnpinnedSource)
 }
 
-// This admits one diagnostic artifact, not image/profile runtime compatibility.
+// Execute the authored staging command; BuildKit itself is an external gate.
+func TestLaptopProfilesImageContext(t *testing.T) {
+	for _, catalogName := range []string{"profiles-catalog", "upstream-ovn-profiles-catalog"} {
+		t.Run(catalogName, func(t *testing.T) { testLaptopProfilesImageContext(t, catalogName) })
+	}
+}
+
+// Exact bytes from NKE 8fb2d53368823bd386b4fbd55b4ab6d3c0931345, not a
+// Dockerfile grammar or semantic validator. BuildKit owns that interpretation.
+const laptopProfilesDockerfile = `# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG BASE_REGISTRY=docker.io
+
+FROM ${BASE_REGISTRY}/alpine:3.24.1
+
+RUN mkdir -p /profiles
+COPY profiles/ /profiles/
+COPY runbooks/ /profiles/runbooks/
+`
+
+func testLaptopProfilesImageContext(t *testing.T, catalogName string) {
+	t.Helper()
+	cat, err := catalog.LoadContext(t.Context(), catalog.Dir(filepath.Join("..", "..", "..", "definitions", "nke-local-dev-arm64", catalogName)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := cat.Components["nke-local-profiles"].BuildCommand
+	for _, tc := range []struct {
+		name          string
+		missing       string
+		dockerfile    string
+		beforeStaging bool
+	}{
+		{"complete", "", laptopProfilesDockerfile, false},
+		{"missing epoch", "epoch", laptopProfilesDockerfile, true},
+		{"missing runbooks", "controller/test/fixtures/runbooks/fixture.yaml", laptopProfilesDockerfile, false},
+		{"missing config", "controller/test/fixtures/profiles/configProfiles/nico-vms-worker.yaml", laptopProfilesDockerfile, false},
+		{"missing Dockerfile", "controller/profiles/example/Dockerfile", "", true},
+		{"base substituted", "", strings.ReplaceAll(laptopProfilesDockerfile, "alpine:3.24.1", "alpine:latest"), true},
+		{"registry substituted", "", strings.ReplaceAll(laptopProfilesDockerfile, "BASE_REGISTRY=docker.io", "BASE_REGISTRY=example.invalid"), true},
+		{"extra stage", "", laptopProfilesDockerfile + "\nFROM ubuntu:24.04 AS extra\n", true},
+		{"Dockerfile symlink", "", laptopProfilesDockerfile, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := laptopProfilesPatchedFixtureCatalog(t, catalogName)
+			files := []string{
+				"controller/test/fixtures/runbooks/fixture.yaml",
+				"controller/test/fixtures/profiles/configProfiles/nico-vms-cp.yaml",
+				"controller/test/fixtures/profiles/configProfiles/nico-vms-worker.yaml",
+			}
+			for _, name := range files {
+				if name == tc.missing {
+					continue
+				}
+				path := filepath.Join(fixture, name)
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(name+"\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			dockerfile := filepath.Join(fixture, "controller/profiles/example/Dockerfile")
+			if tc.missing != "controller/profiles/example/Dockerfile" {
+				if err := os.MkdirAll(filepath.Dir(dockerfile), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if tc.name == "Dockerfile symlink" {
+					target := filepath.Join(fixture, "foreign-Dockerfile")
+					if err := os.WriteFile(target, []byte(tc.dockerfile), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(target, dockerfile); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(dockerfile, []byte(tc.dockerfile), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stub := t.TempDir()
+			argsFile := filepath.Join(stub, "args")
+			if err := os.WriteFile(filepath.Join(stub, "buildctl-daemonless.sh"), []byte("#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$BUILDKIT_ARGS\"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			script := strings.ReplaceAll(strings.ReplaceAll(command[2], "/src", fixture), "{{.Arch}}", "arm64")
+			cmd := exec.CommandContext(ctx, command[0], command[1], script)
+			cmd.Dir, cmd.WaitDelay = fixture, time.Second
+			for _, env := range os.Environ() {
+				if !strings.HasPrefix(env, "SOURCE_DATE_EPOCH=") && !strings.HasPrefix(env, "PATH=") && !strings.HasPrefix(env, "BUILDKIT_ARGS=") {
+					cmd.Env = append(cmd.Env, env)
+				}
+			}
+			cmd.Env = append(cmd.Env, "PATH="+stub+string(os.PathListSeparator)+os.Getenv("PATH"), "BUILDKIT_ARGS="+argsFile)
+			if tc.missing != "epoch" {
+				cmd.Env = append(cmd.Env, "SOURCE_DATE_EPOCH=1791331916")
+			}
+			out, err := cmd.CombinedOutput()
+			if tc.missing != "" || tc.beforeStaging {
+				if err == nil {
+					t.Fatal("incomplete source launched image build")
+				}
+				if _, err := os.Stat(argsFile); !os.IsNotExist(err) {
+					t.Fatalf("BuildKit was reached on incomplete source: %v", err)
+				}
+				if tc.beforeStaging {
+					if _, err := os.Stat(filepath.Join(fixture, "bin")); !os.IsNotExist(err) {
+						t.Fatalf("Dockerfile/epoch rejection wrote the staging directory: %v", err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("stage image context: %v\n%s", err, out)
+			}
+			contextRoot := filepath.Join(fixture, "bin/profiles-context")
+			for _, pair := range []struct{ source, staged string }{
+				{"nkd-local-profiles/osProfiles/metadata.yaml", "profiles/osProfiles/metadata.yaml"},
+				{"nkd-local-profiles/osProfiles/nke-local-26-04-arm64-plain/userData.tmpl", "profiles/osProfiles/nke-local-26-04-arm64-plain/userData.tmpl"},
+				{files[0], "runbooks/fixture.yaml"},
+				{files[1], "profiles/configProfiles/nico-vms-cp.yaml"},
+				{files[2], "profiles/configProfiles/nico-vms-worker.yaml"},
+			} {
+				source, err := os.ReadFile(filepath.Join(fixture, pair.source))
+				if err != nil {
+					t.Fatal(err)
+				}
+				staged, err := os.ReadFile(filepath.Join(contextRoot, pair.staged))
+				if err != nil || string(source) != string(staged) {
+					t.Fatalf("staged %s changed source bytes: %v", pair.staged, err)
+				}
+			}
+			args, err := os.ReadFile(argsFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, required := range []string{"context=" + contextRoot, "dockerfile=" + fixture + "/controller/profiles/example", "platform=linux/arm64", "build-arg:SOURCE_DATE_EPOCH=1791331916", "dest=" + fixture + "/bin/nke-local-profiles-arm64.oci.tar"} {
+				if !strings.Contains(string(args), required) {
+					t.Fatalf("missing BuildKit argument %q: %s", required, args)
+				}
+			}
+		})
+	}
+}
+
+func TestLaptopProfilesDockerfileAdmissionChangesBuildIdentity(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", "..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+	path := filepath.Join("definitions", "nke-local-dev-arm64", "definition-profiles.json")
+	envPath := filepath.Join(filepath.Dir(path), "environment-local-docker.json")
+	for _, catalogName := range []string{"profiles-catalog", "upstream-ovn-profiles-catalog"} {
+		t.Run(catalogName, func(t *testing.T) {
+			doc, err := definition.LoadDefinition(t.Context(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			doc.Catalog.Base = "./" + catalogName
+			env, err := definition.LoadEnvironment(t.Context(), envPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, err := CompileDocuments(t.Context(), path, doc, envPath, env, "dockerfile-admission")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(plan.Builds) != 1 {
+				t.Fatal("expected one profiles build")
+			}
+			graph := plan.Builds[0].Graph
+			withoutAdmission := *graph
+			withoutAdmission.Nodes = append([]ir.Node(nil), graph.Nodes...)
+			for index, node := range withoutAdmission.Nodes {
+				if node.Kind != ir.KindBuild {
+					continue
+				}
+				prefix, remainder, found := strings.Cut(node.Command[2], "# Exact pinned source bytes")
+				_, stage, staged := strings.Cut(remainder, "mkdir -p bin/profiles-context")
+				if !found || !staged {
+					t.Fatal("profiles command lost exact-byte admission before staging")
+				}
+				withoutAdmission.Nodes[index].Command = append([]string(nil), node.Command...)
+				withoutAdmission.Nodes[index].Command[2] = prefix + "mkdir -p bin/profiles-context" + stage
+			}
+			before, err := withoutAdmission.Digest()
+			if err != nil {
+				t.Fatal(err)
+			}
+			after, err := graph.Digest()
+			if err != nil || after != plan.Builds[0].BuildDigest || before == after {
+				t.Fatalf("owning build identity did not bind admission: before=%s after=%s err=%v", before, after, err)
+			}
+			t.Logf("profiles admission changes Build Digest: %s -> %s", before, after)
+		})
+	}
+}
+
+// This admits one diagnostic native image, not profile/disk compatibility.
 func TestLaptopProfilesArtifactContract(t *testing.T) {
 	root, err := filepath.Abs(filepath.Join("..", "..", ".."))
 	if err != nil {
@@ -305,7 +510,7 @@ func TestLaptopProfilesArtifactContract(t *testing.T) {
 			if err := plan.Validate(); err != nil {
 				t.Fatal(err)
 			}
-			if len(plan.Builds) != 1 || len(plan.LifecycleOutputs) != 1 || plan.LifecycleOutputs[0].Name != "controller-profiles" || plan.LifecycleOutputs[0].Kind != "executable" {
+			if len(plan.Builds) != 1 || len(plan.LifecycleOutputs) != 1 || plan.LifecycleOutputs[0].Name != "controller-profiles" || plan.LifecycleOutputs[0].Kind != "oci" {
 				t.Fatal("profiles must remain a separate single-output selection")
 			}
 			fetches, producers := 0, 0
@@ -320,13 +525,26 @@ func TestLaptopProfilesArtifactContract(t *testing.T) {
 					}
 				case ir.KindBuild:
 					producers++
-					if node.BuilderType != ir.BuilderOCIHermetic || node.OutputType != "tarball" || node.WriteDir != "bin" {
+					if node.BuilderType != ir.BuilderBuildKit || node.Network != ir.NetworkDefault || node.OutputType != "oci-image" || node.WriteDir != "bin" ||
+						node.ArtifactPath != "bin/nke-local-profiles-arm64.oci.tar" || !node.SourceReadOnly ||
+						node.Toolchain != "moby/buildkit@sha256:f8a833b2de9d68e27f0815e4a737abdfaf8a2e4c615650557df11025101557b4" {
 						t.Fatalf("unexpected producer: %+v", node)
 					}
-					if len(node.Command) != 3 || node.Command[0] != "bash" || node.Command[1] != "-euc" ||
-						!strings.Contains(node.Command[2], "tar --sort=name") || !strings.Contains(node.Command[2], "gzip -n") ||
-						strings.Contains(node.Command[2], "buildctl") {
-						t.Fatalf("expected deterministic data packaging, got %v", node.Command)
+					if len(node.Command) != 3 || node.Command[0] != "sh" || node.Command[1] != "-ec" {
+						t.Fatalf("expected source-owned Dockerfile image packaging, got %v", node.Command)
+					}
+					for _, required := range []string{
+						"789f7ad1e406b82f0f55a52152eff7b08846b4122582145fade588c7d931cc3e  controller/profiles/example/Dockerfile",
+						"--local context=/src/bin/profiles-context", "--local dockerfile=/src/controller/profiles/example",
+						"--opt platform=linux/arm64", "build-arg:SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH",
+						// BuildKit dockerui.NamedContext uses reference.FamiliarString
+						// for lookup even when the source-owned FROM is fully qualified.
+						"context:alpine:3.24.1=docker-image://docker.io/library/alpine@sha256:260479a1cfaf304c4c20da7f8405d3ce313513dcd534bb743257bdd2fe0f3e2d",
+						"type=oci,dest=/src/bin/nke-local-profiles-arm64.oci.tar,oci-mediatypes=true,rewrite-timestamp=true",
+					} {
+						if !strings.Contains(node.Command[2], required) {
+							t.Fatalf("missing native image instruction %q", required)
+						}
 					}
 					if len(node.Patches) != 1 || node.Patches[0].Name != "patches/local-profile.patch" ||
 						node.Patches[0].SHA256 != "sha256:54b73a11668fc0aafb7b36ccae740db4cddab7c0bce990aec22685d1cc69e133" {

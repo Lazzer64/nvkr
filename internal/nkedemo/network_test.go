@@ -7,10 +7,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -50,20 +52,49 @@ func TestNetworkKindAdmission(t *testing.T) {
 	}
 }
 
+func TestRecoveryProducerDiagnosticsMatchExactExecutable(t *testing.T) {
+	g := &NetworkGuard{caps: []networkCapability{{Path: "/private/demo/dnsmasq", Binding: networkFileID{Device: 7, Inode: 19}}}}
+	for _, row := range []struct {
+		name          string
+		device, inode uint64
+		want          string
+	}{
+		{"exact", 7, 19, "/private/demo/dnsmasq"},
+		{"different-device", 8, 19, ""},
+		{"different-inode", 7, 20, ""},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			if got := g.ownedExecutablePath(row.device, row.inode); got != row.want {
+				t.Fatalf("executable=%q, want %q", got, row.want)
+			}
+		})
+	}
+	err := remainingProducerError(123, "/private/demo/dnsmasq")
+	for _, want := range []string{"PID 123", `"/private/demo/dnsmasq"`, "ps -p 123 -o pid=,args=", "recovery did not signal it"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("missing %q in %v", want, err)
+		}
+	}
+}
+
 func TestNetworkPlatformBeforeFilesystemOrCommands(t *testing.T) {
 	if runtime.GOOS == "linux" && runtime.GOARCH == "arm64" {
 		t.Skip("native admitted platform exercised by opt-in real E2E")
 	}
 	for _, recovery := range []bool{false, true} {
+		writer := &recordedProgress{}
 		var err error
 		if recovery {
 			_, err = RecoverNetworkGuard(t.Context(), Runner{Work: "/does-not-exist"})
 		} else {
-			_, err = NewNetworkGuard(t.Context(), Runner{Work: "/does-not-exist"}, "172.18.0.0/16")
+			_, err = NewNetworkGuard(t.Context(), Runner{Work: "/does-not-exist", Progress: writer}, "172.18.0.0/16", "/does-not-exist")
 		}
 		var coded *nkderr.Error
 		if !errors.As(err, &coded) || coded.Code != nkderr.CodeEngineCapability {
 			t.Fatalf("platform admission=%v", err)
+		}
+		if !recovery && !slices.Equal(writer.events, phaseEvents("network-preflight", PhaseFailed)) {
+			t.Fatalf("preflight boundary=%+v", writer.events)
 		}
 	}
 }
@@ -487,6 +518,150 @@ func TestNetworkGuestTCPInvalidBeforeWork(t *testing.T) {
 	}
 }
 
+func TestNetworkKindSimulatorInvalidBeforeWork(t *testing.T) {
+	for _, gateway := range []string{"", "8.8.8.8", "172.19.0.1", "172.18.0.0", "172.18.255.255", "172.18.0.1/32", "::ffff:172.18.0.1"} {
+		t.Run(gateway, func(t *testing.T) {
+			g := networkFixture(t)
+			g.BridgeIntent = true
+			calls := 0
+			g.capture = func(context.Context, []string, bool) ([]byte, error) { calls++; return nil, nil }
+			if err := g.AllowKindSimulator(t.Context(), gateway); err == nil {
+				t.Fatal("invalid simulator gateway accepted")
+			}
+			if calls != 0 || len(g.rules) != 0 || g.kindGateway != "" {
+				t.Fatal("invalid grant performed work")
+			}
+		})
+	}
+}
+
+func TestNetworkKindSimulatorJournalExactClosure(t *testing.T) {
+	for _, name := range []string{"legacy", "valid", "gateway-outside", "unbound-rule", "wrong-source", "wrong-target", "wrong-port", "foreign-owner", "duplicate", "arbitrary-interface"} {
+		t.Run(name, func(t *testing.T) {
+			g := networkFixture(t)
+			state := g.snapshot()
+			state.Rules = networkRules(state.Owner, state.KindCIDR)
+			state.Rules = append(state.Rules, guestTCPRule(state.Owner, "172.18.0.2", 30440), guestTCPRule(state.Owner, "172.18.0.2", 30443))
+			if name != "legacy" {
+				state.KindGateway = "172.18.0.1"
+				state.Rules = append(state.Rules, kindSimulatorRule(state.Owner, state.KindCIDR, state.KindGateway))
+			}
+			switch name {
+			case "gateway-outside":
+				state.KindGateway = "172.19.0.1"
+			case "unbound-rule":
+				state.KindGateway = ""
+			case "wrong-source":
+				state.Rules[14].Args[5] = "0.0.0.0/0"
+			case "wrong-target":
+				state.Rules[14].Args[7] = "172.18.0.0/16"
+			case "wrong-port":
+				state.Rules[14].Args[11] = "18080"
+			case "foreign-owner":
+				state.Rules[14].Args[3] = "foreign"
+			case "duplicate":
+				state.Rules = append(state.Rules[:14], state.Rules[13])
+			case "arbitrary-interface":
+				state.Rules[14].Args = append(state.Rules[14].Args, "-i", "eth0")
+			}
+			raw, err := canonical.Marshal(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if name == "legacy" && strings.Contains(string(raw), "kindGateway") {
+				t.Fatal("legacy v2 bytes gained an empty field")
+			}
+			if err = networkWriteExclusive(filepath.Join(g.Work, networkJournal), raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err = readNetworkState(g.Work)
+			if (err == nil) != (name == "legacy" || name == "valid") {
+				t.Fatalf("journal accepted=%v: %v", err == nil, err)
+			}
+		})
+	}
+}
+
+func TestNetworkKindSimulatorIntentAndWithdrawal(t *testing.T) {
+	for _, name := range []string{"success", "ambiguous-insert", "lost-readback", "cancel", "unjoined", "checkpoint-failure"} {
+		t.Run(name, func(t *testing.T) {
+			g := networkFixture(t)
+			g.BridgeIntent = true
+			inserted, inserts, checks := false, 0, 0
+			row := kindSimulatorRule(g.Owner, g.KindCIDR, "172.18.0.1")
+			g.capture = func(_ context.Context, args []string, privileged bool) ([]byte, error) {
+				if args[0] == "ip" {
+					return []byte(fmt.Sprintf(`[{"ifname":"nkdvm0","ifindex":42,"address":%q,"linkinfo":{"info_kind":"bridge"}}]`, g.BridgeMAC)), nil
+				}
+				if !privileged || args[0] != "iptables" || args[4] != row.Table || args[6] != row.Chain || !slices.Equal(args[7:], row.Args) {
+					t.Fatalf("unscoped firewall command: %v", args)
+				}
+				switch args[5] {
+				case "-C":
+					checks++
+					if name == "unjoined" {
+						return nil, ErrUnjoined
+					}
+					if inserted && !(name == "lost-readback" && checks == 2) {
+						return nil, nil
+					}
+					return nil, &CommandError{ExitCode: 1, Cause: errors.New("absent")}
+				case "-I":
+					state, err := readNetworkState(g.Work)
+					if err != nil || state.KindGateway != "172.18.0.1" || len(state.Rules) != 1 || !slices.Equal(state.Rules[0].Args, row.Args) {
+						t.Fatal("firewall mutation preceded durable intent", err)
+					}
+					inserts++
+					inserted = true
+					if name == "ambiguous-insert" {
+						return nil, errors.New("ambiguous joined insertion")
+					}
+				case "-D":
+					inserted = false
+				default:
+					t.Fatalf("unexpected firewall verb: %v", args)
+				}
+				return nil, nil
+			}
+			ctx := t.Context()
+			if name == "cancel" {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			if name == "checkpoint-failure" {
+				g.checkpointHook = func() error { return errors.New("checkpoint failed") }
+			}
+			err := g.AllowKindSimulator(ctx, "172.18.0.1")
+			if (err == nil) != (name == "success") {
+				t.Fatalf("grant=%v", err)
+			}
+			if name == "cancel" || name == "unjoined" || name == "checkpoint-failure" {
+				if inserts != 0 {
+					t.Fatal("failed admission/checkpoint inserted rule")
+				}
+				if name == "unjoined" && !errors.Is(err, ErrUnjoined) {
+					t.Fatal("lost unjoined error")
+				}
+				return
+			}
+			if len(g.rules) != 1 || !inserted {
+				t.Fatal("lost grant intent")
+			}
+			if err = g.AllowKindSimulator(t.Context(), "172.18.0.1"); err == nil || inserts != 1 {
+				t.Fatal("duplicate grant accepted")
+			}
+			if err = g.withdrawRule(t.Context(), g.rules[0]); err != nil || inserted {
+				t.Fatal("exact recovery withdrawal failed", err)
+			}
+			g.kindGateway = "172.18.0.2"
+			if err = g.Checkpoint(t.Context()); err == nil {
+				t.Fatal("gateway binding rewritten")
+			}
+		})
+	}
+}
+
 func TestNetworkGuestTCPAmbiguousInsertRetainsIntent(t *testing.T) {
 	g := networkFixture(t)
 	g.BridgeIntent = true
@@ -768,6 +943,72 @@ func TestNetworkCleanupDoesNotNeedDiagnosticFiles(t *testing.T) {
 	}
 }
 
+func TestNetworkProbeProgressKeepsDiagnosticsWithoutFalseFailures(t *testing.T) {
+	for _, exit := range []int{0, 1, 2} {
+		t.Run(strconv.Itoa(exit), func(t *testing.T) {
+			g := networkFixture(t)
+			writer := &recordedProgress{}
+			tools := privateTestDir(t)
+			script := fmt.Sprintf("#!/bin/sh\nprintf 'private network diagnostic\\n' >&2\nexit %d\n", exit)
+			if err := os.WriteFile(filepath.Join(tools, "sudo"), []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			g.runner.Env = []string{"PATH=" + tools + ":/usr/bin:/bin"}
+			g.runner.Progress = writer
+			exists, err := g.ruleExists(t.Context(), networkRules(g.Owner, g.KindCIDR)[0])
+			if exists != (exit == 0) || (err != nil) != (exit == 2) {
+				t.Fatalf("exists=%t error=%v", exists, err)
+			}
+			if exit == 2 && CommandExitCode(err) != exit {
+				t.Fatal("unexpected probe failure was hidden", err)
+			}
+			if len(writer.events) != 0 || writer.Len() != 0 {
+				t.Fatalf("low-level/expected-absence probe emitted misleading progress: %+v %q", writer.events, writer.String())
+			}
+			raw, err := os.ReadFile(filepath.Join(g.Work, "network-001.log"))
+			if err != nil || string(raw) != "private network diagnostic\n" {
+				t.Fatalf("numbered diagnostic was lost: %q %v", raw, err)
+			}
+		})
+	}
+}
+
+func TestNetworkProgressReportsOwningBoundary(t *testing.T) {
+	for _, name := range []string{"setup-failed", "cleanup-failed", "cleanup-complete"} {
+		t.Run(name, func(t *testing.T) {
+			g := networkFixture(t)
+			writer := &recordedProgress{}
+			g.runner.Progress = writer
+			phase, last := "network-cleanup", PhaseFailed
+			cause := errors.New("private cause")
+			var err error
+			switch name {
+			case "setup-failed":
+				phase = "network-setup"
+				g.checkpointHook = func() error { return cause }
+				err = g.Start(t.Context())
+			case "cleanup-failed":
+				g.stopDNSHook = func(context.Context) error { return cause }
+				err = g.Close(t.Context())
+			case "cleanup-complete":
+				g.finished = true
+				last = PhaseFinished
+				err = g.Close(t.Context())
+			}
+			if name == "cleanup-complete" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if !errors.Is(err, cause) || !strings.Contains(err.Error(), strings.ReplaceAll(phase, "-", " ")) {
+				t.Fatalf("owning boundary/cause missing: %v", err)
+			}
+			if !slices.Equal(writer.events, phaseEvents(phase, last)) {
+				t.Fatalf("events=%+v", writer.events)
+			}
+		})
+	}
+}
+
 func TestNetworkProtectedHelperOwnsInnerDeadline(t *testing.T) {
 	g := networkFixture(t)
 	tools := privateTestDir(t)
@@ -780,9 +1021,435 @@ func TestNetworkProtectedHelperOwnsInnerDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := []string{"-n", "timeout", "--signal=TERM", "--kill-after=5", "25", "ip", "link", "show"}
+	expected := []string{"-n", "-k", "timeout", "--signal=TERM", "--kill-after=5", "25", "ip", "link", "show"}
 	if !slices.Equal(strings.Fields(string(raw)), expected) {
 		t.Fatalf("protected command=%s", raw)
+	}
+}
+
+type sudoAuthenticationProgress struct {
+	authenticate func(context.Context) error
+}
+
+func (p *sudoAuthenticationProgress) Write(raw []byte) (int, error) { return len(raw), nil }
+func (p *sudoAuthenticationProgress) SudoAuthentication() func(context.Context) error {
+	return p.authenticate
+}
+
+func TestNetworkInteractiveSudoBoundary(t *testing.T) {
+	for _, scenario := range []string{"absent", "nil", "authenticated", "recheck-cleanup", "authentication-failed", "unjoined", "sudo-failed", "canceled"} {
+		t.Run(scenario, func(t *testing.T) {
+			g := networkFixture(t)
+			tools := privateTestDir(t)
+			calls, admitted := filepath.Join(tools, "calls"), filepath.Join(tools, "admitted")
+			script := fmt.Sprintf("#!/bin/sh\nprintf 'command\\n' >> %q\nprintf '%%s\\n' \"$@\"\n", calls)
+			if scenario == "authenticated" || scenario == "recheck-cleanup" {
+				script += fmt.Sprintf("test -f %q || exit 99\n", admitted)
+			}
+			if scenario == "sudo-failed" {
+				script += "exit 42\n"
+			}
+			if err := os.WriteFile(filepath.Join(tools, "sudo"), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			g.runner.Env = []string{"PATH=" + tools + ":/usr/bin:/bin"}
+			authCalls := 0
+			failure := errors.New("authentication refused")
+			if scenario != "absent" {
+				presenter := &sudoAuthenticationProgress{}
+				if scenario != "nil" {
+					presenter.authenticate = func(ctx context.Context) error {
+						authCalls++
+						if err := ctx.Err(); err != nil {
+							t.Fatal("canceled context reached authentication")
+						}
+						if scenario == "authentication-failed" {
+							return failure
+						}
+						if scenario == "unjoined" {
+							return ErrUnjoined
+						}
+						return os.WriteFile(admitted, []byte("authenticated"), 0600)
+					}
+				}
+				g.runner.Progress = presenter
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if scenario == "canceled" {
+				cancel()
+			}
+			raw, err := g.Command(ctx, []string{"true"}, true)
+			wantCalls := 1
+			switch scenario {
+			case "authentication-failed", "unjoined", "canceled":
+				wantCalls = 0
+				cause := map[string]error{"authentication-failed": failure, "unjoined": ErrUnjoined, "canceled": context.Canceled}[scenario]
+				if !errors.Is(err, cause) || len(raw) != 0 || g.unjoined.Load() != (scenario == "unjoined") {
+					t.Fatalf("failed admission: output=%q error=%v unjoined=%t", raw, err, g.unjoined.Load())
+				}
+			case "sudo-failed":
+				if CommandExitCode(err) != 42 {
+					t.Fatalf("actual sudo failure lost: %v", err)
+				}
+			default:
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := []string{"-n", "timeout", "--signal=TERM", "--kill-after=5", "25", "true"}
+				if scenario == "absent" || scenario == "nil" {
+					want = append([]string{"-n", "-k"}, want[1:]...)
+				}
+				if !slices.Equal(strings.Fields(string(raw)), want) {
+					t.Fatalf("sudo arguments=%q, want %v", raw, want)
+				}
+			}
+			if scenario == "recheck-cleanup" {
+				g.cleaning = true
+				if _, err := g.Command(t.Context(), []string{"true"}, true); err != nil {
+					t.Fatal(err)
+				}
+				wantCalls = 2
+			}
+			if err == nil {
+				if _, err := g.Command(t.Context(), []string{"true"}, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			log, readErr := os.ReadFile(calls)
+			if wantCalls == 0 && !errors.Is(readErr, os.ErrNotExist) || wantCalls != 0 && (readErr != nil || strings.Count(string(log), "command\n") != wantCalls) {
+				t.Fatalf("command replay/admission: calls=%q error=%v, want %d", log, readErr, wantCalls)
+			}
+			wantAuth := wantCalls
+			switch scenario {
+			case "absent", "nil", "canceled":
+				wantAuth = 0
+			case "authentication-failed", "unjoined":
+				wantAuth = 1
+			}
+			if authCalls != wantAuth {
+				t.Fatalf("auth calls=%d, want %d", authCalls, wantAuth)
+			}
+		})
+	}
+}
+
+func TestNetworkUnattendedSudoAdmissionDiagnostics(t *testing.T) {
+	for _, canceled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("canceled=%t", canceled), func(t *testing.T) {
+			g := networkFixture(t)
+			g.lockPath = filepath.Join(g.Work, "test.lock")
+			tools := privateTestDir(t)
+			script := "#!/bin/sh\nprintf '%s\\n' 'private sudo authentication diagnostic' >&2\nexit 42\n"
+			if err := os.WriteFile(filepath.Join(tools, "sudo"), []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			g.runner.Env = []string{"PATH=" + tools + ":/usr/bin:/bin"}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if canceled {
+				cancel()
+			}
+			err := g.admit(ctx)
+			if err == nil || !strings.Contains(err.Error(), "required unattended networking authorization") || !strings.Contains(err.Error(), networkSudoProbe) || !strings.Contains(err.Error(), "docs/local-nke-demo.md#2-install-prerequisites-on-the-ubuntu-execution-host") || strings.Contains(err.Error(), "private sudo authentication diagnostic") {
+				t.Fatalf("sudo prerequisite diagnostic=%v", err)
+			}
+			if canceled {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("cancellation cause=%v", err)
+				}
+			} else {
+				var command *CommandError
+				if !errors.As(err, &command) || command.Phase != "network-001" || command.ExitCode != 42 {
+					t.Fatalf("sudo command cause=%v", err)
+				}
+			}
+			if _, statErr := os.Lstat(filepath.Join(g.Work, networkJournal)); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("network journal created after failed sudo prerequisite: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestNetworkProbeExecutableAdmission(t *testing.T) {
+	for _, name := range []string{"valid", "empty", "relative", "missing", "directory", "no-exec", "group-write", "other-write", "setuid", "setgid", "foreign-owner", "parent-group-write", "parent-other-write", "symlink"} {
+		t.Run(name, func(t *testing.T) {
+			if name == "foreign-owner" && (runtime.GOOS != "linux" || os.Geteuid() != 0) {
+				t.Skip("foreign executable owner requires an isolated Linux root fixture")
+			}
+			dir := privateTestDir(t)
+			path := filepath.Join(dir, "nke-demo")
+			if err := os.WriteFile(path, []byte("fixture"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			switch name {
+			case "empty":
+				path = ""
+			case "relative":
+				path = "nke-demo"
+			case "missing":
+				path += "-missing"
+			case "directory":
+				path = dir
+			case "no-exec", "group-write", "other-write":
+				mode := map[string]os.FileMode{"no-exec": 0o600, "group-write": 0o720, "other-write": 0o702}[name]
+				if err := os.Chmod(path, mode); err != nil {
+					t.Fatal(err)
+				}
+			case "setuid", "setgid":
+				mode := os.FileMode(0o700) | os.ModeSetuid
+				if name == "setgid" {
+					mode = 0o700 | os.ModeSetgid
+				}
+				if err := os.Chmod(path, mode); err != nil {
+					t.Fatal(err)
+				}
+			case "foreign-owner":
+				if err := os.Chown(path, 1, -1); err != nil {
+					t.Fatal(err)
+				}
+			case "parent-group-write", "parent-other-write":
+				mode := os.FileMode(0o770)
+				if name == "parent-other-write" {
+					mode = 0o777
+				}
+				if err := os.Chmod(dir, mode); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				link := path + "-link"
+				if err := os.Symlink(path, link); err != nil {
+					t.Fatal(err)
+				}
+				path = link
+			}
+			resolved, err := admitNetworkProbeExecutable(t.Context(), path)
+			if name == "valid" || name == "symlink" {
+				if err != nil || resolved != filepath.Join(dir, "nke-demo") {
+					t.Fatalf("selected executable=%q, %v", resolved, err)
+				}
+			} else {
+				var coded *nkderr.Error
+				if !errors.As(err, &coded) || coded.Code != nkderr.CodeEngineCapability || resolved != "" {
+					t.Fatalf("unsafe executable admitted=%q, %v", resolved, err)
+				}
+			}
+		})
+	}
+}
+
+func TestNetworkProbeDirectoryProtection(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		uid     uint32
+		mode    uint32
+		allowed bool
+	}{
+		{"root private", 0, unix.S_IFDIR | 0o755, true},
+		{"current private", uint32(os.Getuid()), unix.S_IFDIR | 0o700, true},
+		{"root sticky temporary", 0, unix.S_IFDIR | unix.S_ISVTX | 0o777, true},
+		{"root non-sticky writable", 0, unix.S_IFDIR | 0o777, false},
+		{"root group writable", 0, unix.S_IFDIR | 0o775, false},
+		{"foreign owner", uint32(os.Getuid()) + 1, unix.S_IFDIR | 0o755, false},
+		{"foreign sticky owner", uint32(os.Getuid()) + 1, unix.S_IFDIR | unix.S_ISVTX | 0o777, false},
+		{"non-directory", 0, unix.S_IFREG | 0o755, false},
+		{"unsearchable", 0, unix.S_IFDIR | 0o600, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if (networkProbeDirectoryProtection(test.uid, test.mode) == nil) != test.allowed {
+				t.Fatal("unsafe directory protection decision")
+			}
+		})
+	}
+}
+
+func TestNetworkProbeContextRefusalBeforePathWork(t *testing.T) {
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	for _, test := range []struct {
+		name string
+		ctx  context.Context
+		code nkderr.Code
+	}{{"nil context", nil, nkderr.CodeUsage}, {"canceled", canceled, nkderr.CodeTimeout}} {
+		t.Run(test.name, func(t *testing.T) {
+			path, err := admitNetworkProbeExecutable(test.ctx, "/must-not-inspect")
+			var coded *nkderr.Error
+			if path != "" || !errors.As(err, &coded) || coded.Code != test.code {
+				t.Fatal("context refusal reached file work or lost code", path, err)
+			}
+		})
+	}
+}
+
+func TestNetworkPrivilegedProbeFixedTargetsAndFailure(t *testing.T) {
+	for _, name := range []string{"success", "occupied-tcp", "occupied-udp", "occupied-dhcp", "canceled", "cancel-after-first"} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if name == "canceled" {
+				cancel()
+			}
+			var calls []string
+			err := probeNetworkPrivilegedPorts(ctx, func(udp bool, port int) error {
+				calls = append(calls, fmt.Sprintf("%t:%d", udp, port))
+				if name == "cancel-after-first" {
+					cancel()
+				}
+				if name == "occupied-tcp" || name == "occupied-udp" && udp || name == "occupied-dhcp" && port == 67 {
+					return unix.EADDRINUSE
+				}
+				return nil
+			})
+			want := []string{"false:53", "true:53", "true:67"}
+			switch name {
+			case "success":
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "canceled":
+				want = nil
+			case "occupied-tcp", "cancel-after-first":
+				want = want[:1]
+			case "occupied-udp":
+				want = want[:2]
+			}
+			if !slices.Equal(calls, want) {
+				t.Fatalf("fixed helper targets=%v, want %v", calls, want)
+			}
+			if name != "success" {
+				var coded *nkderr.Error
+				cause := error(unix.EADDRINUSE)
+				if strings.HasPrefix(name, "cancel") {
+					cause = context.Canceled
+				}
+				if !errors.As(err, &coded) || coded.Code != nkderr.CodePreflightFailed || !errors.Is(err, cause) {
+					t.Fatalf("helper failure=%v", err)
+				}
+			}
+		})
+	}
+	var nilContext context.Context
+	if err := ProbeNetworkPrivilegedPorts(nilContext); err == nil {
+		t.Fatal("nil helper context admitted")
+	}
+	if runtime.GOOS != "linux" || runtime.GOARCH != "arm64" {
+		var coded *nkderr.Error
+		if err := ProbeNetworkPrivilegedPorts(t.Context()); !errors.As(err, &coded) || coded.Code != nkderr.CodeEngineCapability {
+			t.Fatalf("helper platform admission=%v", err)
+		}
+	}
+}
+
+func TestNetworkPrivilegedProbeFailureBeforeJournal(t *testing.T) {
+	for _, cause := range []error{&CommandError{Phase: "network-007", ExitCode: 42, Cause: unix.EADDRINUSE}, context.Canceled, ErrUnjoined} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			g := networkFixture(t)
+			g.journal = false
+			g.lockPath = filepath.Join(g.Work, "test.lock")
+			g.policyPath = filepath.Join(g.Work, "bridge.conf")
+			helper, err := resolveExisting("/usr/bin/true")
+			if err != nil {
+				t.Fatal(err)
+			}
+			g.helperPath = helper
+			g.probeExecutable = "/selected/bootstrap/nke-demo"
+			called := false
+			g.capture = func(_ context.Context, args []string, privileged bool) ([]byte, error) {
+				if args[0] == g.probeExecutable {
+					called = true
+					if !privileged || !slices.Equal(args, []string{g.probeExecutable, "network-port-probe"}) {
+						t.Fatalf("non-fixed privileged probe=%v privileged=%t", args, privileged)
+					}
+					return nil, cause
+				}
+				if privileged && !slices.Equal(args, []string{"true"}) {
+					t.Fatalf("mutation before port admission=%v", args)
+				}
+				if args[0] == "ip" {
+					return []byte("[]"), nil
+				}
+				return nil, nil
+			}
+			err = g.admit(t.Context())
+			if !called || !errors.Is(err, cause) || !strings.Contains(err.Error(), "privileged DNS/DHCP port admission") {
+				t.Fatalf("port child failure=%v called=%t", err, called)
+			}
+			if g.journal || g.unjoined.Load() != errors.Is(cause, ErrUnjoined) {
+				t.Fatal("failed helper changed journal/join authority")
+			}
+			if _, err := os.Lstat(filepath.Join(g.Work, networkJournal)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("journal exists after failed child", err)
+			}
+		})
+	}
+}
+
+func TestNetworkPrivilegedProbeChildError(t *testing.T) {
+	g := networkFixture(t)
+	g.journal = false
+	g.probeExecutable = "/selected/bootstrap/nke-demo"
+	tools := privateTestDir(t)
+	script := "#!/bin/sh\n[ \"$*\" = '-n -k timeout --signal=TERM --kill-after=5 25 /selected/bootstrap/nke-demo network-port-probe' ] || exit 99\nprintf '%s\\n' 'private probe diagnostic' >&2\nexit 42\n"
+	if err := os.WriteFile(filepath.Join(tools, "sudo"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	g.runner.Env = []string{"PATH=" + tools + ":/usr/bin:/bin"}
+	err := g.probePrivilegedPorts(t.Context())
+	var command *CommandError
+	if !errors.As(err, &command) || command.ExitCode != 42 || command.Phase != "network-001" || !strings.Contains(err.Error(), "privileged DNS/DHCP") || strings.Contains(err.Error(), "private probe diagnostic") {
+		t.Fatalf("bounded privileged child invocation/error=%v", err)
+	}
+	if _, err = os.Lstat(filepath.Join(g.Work, networkJournal)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("failed privileged child created journal", err)
+	}
+}
+
+func TestNetworkPortProbeOccupiedSocket(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("IP_FREEBIND probe is Linux-only")
+	}
+	for _, row := range []struct {
+		udp  bool
+		port int
+	}{{false, 0}, {true, 0}, {false, 53}, {true, 53}, {true, 67}} {
+		t.Run(fmt.Sprintf("UDP=%t/port=%d", row.udp, row.port), func(t *testing.T) {
+			if row.port != 0 && (runtime.GOARCH != "arm64" || os.Geteuid() != 0) {
+				t.Skip("fixed privileged sockets require isolated native ARM64 root fixture")
+			}
+			var address string
+			var closeSocket func() error
+			target := net.JoinHostPort("0.0.0.0", strconv.Itoa(row.port))
+			if row.udp {
+				held, err := net.ListenPacket("udp4", target)
+				if err != nil {
+					t.Fatal(err)
+				}
+				address, closeSocket = held.LocalAddr().String(), held.Close
+			} else {
+				held, err := net.Listen("tcp4", target)
+				if err != nil {
+					t.Fatal(err)
+				}
+				address, closeSocket = held.Addr().String(), held.Close
+			}
+			t.Cleanup(func() { _ = closeSocket() })
+			_, raw, err := net.SplitHostPort(address)
+			if err != nil {
+				t.Fatal(err)
+			}
+			port, err := strconv.Atoi(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.port == 0 {
+				err = networkProbePort(row.udp, port)
+			} else {
+				err = ProbeNetworkPrivilegedPorts(t.Context())
+			}
+			if !errors.Is(err, unix.EADDRINUSE) {
+				t.Fatalf("occupied socket admission=%v", err)
+			}
+		})
 	}
 }
 

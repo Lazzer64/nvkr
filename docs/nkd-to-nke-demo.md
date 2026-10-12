@@ -25,7 +25,7 @@ before moving to another NKE release.
 | Components | Dependency OCI images/charts and CAPNICo provider; provisioned provider is built but not used by this tenant path |
 | Site | Source-aligned CLI, controller image, image-bound controller chart and NKTP chart |
 | Tools | Verified native Helm, kubectl, clusterctl, ORAS and Kind bundle |
-| Profiles | Profile files packaged as data, pulled/verified and mounted read-only into the controller |
+| Profiles | Native OCI content image; the chart's init container copies `/profiles` into its shared read-only controller volume |
 | Simulator | NICoSim server/CLI and seed/UI archive |
 
 The combined `all` Definition selects the complete demo artifact membership in
@@ -38,6 +38,23 @@ Kind hosts management services. CAPNICo/NICoSim provisions **real libvirt
 QCOW2 guests**, not CAPD containers. Node readiness, exact backing disk,
 workload/DNS and cleanup are separate acceptance checks from artifact creation.
 See [full-source gaps](full-nke-source-build.md) for acquired/omitted inputs.
+
+By default, both clusters select NVIDIA OVN. The site consumes the completed standalone
+`ovn-chart-arm64` and `ovn-image-arm64` outputs through the owned registry;
+the tenant uses its disk's separately produced OVN packages. Those paths do not
+establish equal bytes. Kind's default CNI and kube-proxy are disabled. Its OVS
+helper reuses the selected image's existing `ovs-server` entrypoint; site OVN
+readiness precedes management-node readiness and Cluster API installation.
+The source-owner startup fix remains required before this selection can pass
+fresh E2E acceptance. Validate actual OVN-node startup and its iptables calls,
+not merely the presence of `firewall-cmd`; the selected image's host wrappers
+and chart mounts also need to agree. The explicit `upstream-ovn` selection uses
+its distinct image, chart, disk and profiles outputs for both clusters. The
+temporary `kind-calico` diagnostic keeps Kind networking and uses tenant Calico;
+neither mode validates the NVIDIA fork, and neither is an automatic fallback.
+The final PASS and retained tenant result name the selection. See the
+[network alternatives](local-nke-demo.md#explicit-upstream-ovn-alternative) and
+[current validation status](adr/reconciliation.md).
 
 ## Prepare charts without rebuilding them
 
@@ -64,9 +81,20 @@ registry, reads back exact manifest digests and supplies explicit NKE image
 overrides. Source-produced archive IDs are not interchangeable with observed
 manifest subjects.
 
-Profiles are data: ORAS transfers their bundle, NKD verifies/extracts it, and
-the adapter supplies an owned read-only profiles volume. No runnable profiles
-image or separate profiles Dockerfile is required by this route.
+Profiles are a native container image, not an executable bundle or a generic OCI
+data artifact. The producer uses NKE's existing pinned profiles Dockerfile with a
+digest-pinned Alpine base that supplies `/bin/sh` and `cp`. ORAS copies the observed
+image to the same local registry and verifies the destination manifest digest.
+The adapter enables `profiles.image.*`; NKE's standard `materialize-profiles`
+init container copies `/profiles` into an `emptyDir` mounted read-only by the
+controller. Deployment checks the exact init image and its successful exit.
+No host-directory injection or additional profiles Dockerfile is needed.
+
+Older Runs whose `controller-profiles` output has `kind: executable` cannot be
+consumed as this native image. Do not relabel or rewrite a completed Run. Build
+a fresh profiles selection and supply it with `--profiles-run`, or build a new
+combined Run. A compatibility replay with the older demo binary retains its
+original data-volume behavior; it is not validation of the new image handoff.
 
 The controller's CAPNICo override is currently tag-shaped. The adapter checks
 the exact destination subject; a tag alone is not an authenticated release
@@ -97,6 +125,35 @@ This is a retained-artifact replay, not a fresh build. For build-plus-deploy
 use `e2e --config` from the quickstart; E2E derives its own fresh paths and
 rejects retained Run references.
 
+Keep the deployment terminal open for phase progress. In a second terminal,
+set `DEMO_OUT` to the exact `--out` directory from that command. Once management
+creation has produced `site/kubeconfig`, watch site installation and provisioning:
+
+```sh
+"$DEMO_OUT/site/tools/kubectl" --kubeconfig "$DEMO_OUT/site/kubeconfig" \
+  get events --all-namespaces --watch
+```
+
+Inspect Cluster API objects with the same executable and kubeconfig using
+`get clusters,machines --all-namespaces`. Once tenant provisioning has produced
+`site/tenant-kubeconfig`, watch tenant nodes:
+
+```sh
+"$DEMO_OUT/site/tools/kubectl" --kubeconfig "$DEMO_OUT/site/tenant-kubeconfig" \
+  get nodes --watch
+```
+
+`virsh -c qemu:///session list --all` shows the QCOW2 guests. Detailed private
+stage logs remain under `"$DEMO_OUT/site"`; do not post kubeconfigs or logs without
+checking for credentials. A failed network preflight has not created these
+clusters. These watch commands are optional operator tools, not required
+workarounds to discover success. At the default retained handoff, the CLI shows
+actual read-only API/node checks and prints separate site/tenant `kubectl`
+commands. `status --session` repeats live cluster checks. Default deployment
+leaves the environment running; `--cleanup` or the separate `cleanup --session`
+command performs owned teardown. See the
+[retained access instructions](local-nke-demo.md#retained-deployment-and-actual-cluster-access).
+
 ## Local safety boundary
 
 Use a dedicated single-user Ubuntu VM. The adapter owns a private management
@@ -109,6 +166,13 @@ and the QEMU bridge helper required privileges. It preserves process stop/join
 ownership and withdraws controls only after dependent producers stop.
 No global Docker daemon policy is changed. This is operator-trusted local
 execution, not production isolation.
+
+Site CNI/OVS containers are privileged within the owned Kind cluster and share
+the execution host's kernel. The adapter requires the Open vSwitch/Geneve
+modules to be loaded already; it does not claim this prerequisite independently
+isolates privileged source code from the host. Node-local OVS processes and
+paths are removed with the owned Kind node/volume; shared host kernel modules
+are not unloaded.
 
 First-boot APT uses the baked local repository and fails on missing packages.
 The diagnostic profile preserves the physical uplink across worker reboot.
@@ -131,15 +195,28 @@ After SIGKILL/OOM or VM restart:
    Stop/join only independently verified owned producers. Never kill a PID
    merely because it appears in the journal. Tenant/Kind/registry recovery after
    a hard crash is a separate operator task.
-3. Restore only recorded network controls:
+3. Find the journal for the failed attempt, then select its containing directory.
+   The example below matches the quickstart's `--out`; change `DEMO_OUT` if your
+   attempt used another output path. Do not pass the journal file itself or
+   delete its directory before recovery succeeds.
 
    ```sh
-   "$NKE_DEMO" restore --work /absolute/Linux/path/to/original-demo-output
+   find .nkd -name network-state.json -print
+   DEMO_OUT="$PWD/.nkd/demo-e2e-01-demo"
+   test -f "$DEMO_OUT/network-state.json" &&
+   "$NKE_DEMO" restore --work "$DEMO_OUT"
    ```
 
-4. Require success before a new attempt. Active producers, foreign resources,
-   changed file/bridge identities or unexpected routes cause refusal. Inspect
-   the discrepancy rather than forcing removal.
+   In an interactive Linux terminal, recovery authenticates before opening its
+   dashboard and maintains that session without mid-run password prompts.
+   Redirected or unattended recovery instead requires approved
+   non-interactive access; check `sudo -n -k timeout --signal=TERM --kill-after=5 25 true`.
+
+4. This restores only recorded host-network controls; it does not delete tenants,
+   VMs, Kind or registry containers. Require success before a new attempt.
+   Active producers, foreign resources, changed file/bridge identities or
+   unexpected routes cause refusal. Inspect the discrepancy rather than forcing
+   removal.
 
 The Go command accepts only version 2 journals. A Python-era version 1 journal
 must be restored **before upgrading**, using the last compatible revision
@@ -161,7 +238,11 @@ not migrate journals or execute the removed helper automatically. Do not change
 the journal's version number to bypass this boundary.
 
 Restoration takes the same kernel-released lock, never kills serialized PIDs
-and, on the same boot, waits for in-flight bounded sudo work. It can replay an
+and, on the same boot, waits 40 seconds for in-flight bounded sudo work. This
+safety wait may be quiet. A remaining private capability producer is reported
+with its currently observed PID and matched executable path; inspect that
+process before taking action. The diagnostic is not permission to kill other
+services, and recovery never signals the reported process. It can replay an
 interrupted rollback and reads back removals. An older attempt without the
 journal requires manual inspection. Recovery does not create E2E evidence.
 
@@ -169,7 +250,9 @@ journal requires manual inspection. Recovery does not create E2E evidence.
 
 Require one explicit input set, exact artifact read-back, completed NKE stages,
 two Ready QCOW2-backed tenant nodes, workload/DNS success and owned cleanup.
-The adapter prints its final PASS only after those checks.
+The explicit `--cleanup` route prints its final PASS only after those checks.
+Default retained success is a usable deployment handoff, not completed owned
+cleanup or full recorded E2E acceptance.
 
 A separate successful deployment replay does not establish a fresh one-shot
 rebuild, complete source-built distribution, full OS smoke or qualification.

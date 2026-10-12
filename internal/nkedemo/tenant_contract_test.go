@@ -4,14 +4,17 @@
 package nkedemo
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/delivery"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/lifecycle"
@@ -22,6 +25,217 @@ func TestTenantSelectsMaintainedOVNChartStream(t *testing.T) {
 	request := NewTenantRequest("owned")
 	if request.CNI != "ovn-kubernetes" || request.CNIVersion != "1.5.18" {
 		t.Fatalf("tenant must select the packaged NVIDIA OVN chart stream: %+v", request)
+	}
+}
+
+func TestTenantNetworkSelectionIsExplicitAndPreservesTopology(t *testing.T) {
+	for _, test := range []struct {
+		name, network, cni, version string
+	}{
+		{"default", "", "ovn-kubernetes", "1.5.18"},
+		{"maintained", "ovn", "ovn-kubernetes", "1.5.18"},
+		{"upstream diagnostic", "upstream-ovn", "ovn-kubernetes", "1.4.0"},
+		{"temporary diagnostic", "kind-calico", "calico", "3.30.1"},
+		{"unknown", "calico", "", ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := newTenantRequest("owned", test.network)
+			if test.cni == "" {
+				assertConfigUsage(t, err)
+				if !reflect.DeepEqual(request, TenantRequest{}) {
+					t.Fatalf("unknown network must reject without request: %+v %v", request, err)
+				}
+				return
+			}
+			if err != nil || request.CNI != test.cni || request.CNIVersion != test.version {
+				t.Fatalf("request selected unexpected CNI: %+v %v", request, err)
+			}
+			request.CNI, request.CNIVersion = "ovn-kubernetes", "1.5.18"
+			if !reflect.DeepEqual(request, NewTenantRequest("owned")) {
+				t.Fatal("network selection changed unrelated tenant topology")
+			}
+		})
+	}
+}
+
+func TestTenantRejectsUnknownNetworkBeforeInventory(t *testing.T) {
+	work := privateTestDir(t)
+	selected := tenant{name: "owned", network: "unknown", session: ManagementSession{Work: work, Runner: Runner{Work: work}}}
+	assertConfigUsage(t, selected.run(t.Context(), 0))
+	entries, err := os.ReadDir(work)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("rejected network left output: %v %v", entries, err)
+	}
+}
+
+func TestDemoNetworkDiagnosticScopeIsExplicit(t *testing.T) {
+	for _, test := range []struct{ input, mode, label string }{
+		{"", "ovn", "NVIDIA OVN"},
+		{"ovn", "ovn", "NVIDIA OVN"},
+		{"upstream-ovn", "upstream-ovn", "upstream OVN diagnostic; NVIDIA OVN not validated"},
+		{"kind-calico", "kind-calico", "Kind/Calico diagnostic; NVIDIA OVN not deployed"},
+	} {
+		t.Run(test.mode+"/"+test.input, func(t *testing.T) {
+			mode, err := normalizeNetwork(test.input)
+			if err != nil || mode != test.mode {
+				t.Fatalf("network normalization: %q %v", mode, err)
+			}
+			if summary := demoSuccessSummary(mode); !strings.HasPrefix(summary, "PASS ("+test.label+"):") || !strings.Contains(summary, "not a signed Release") {
+				t.Fatalf("ambiguous diagnostic summary: %q", summary)
+			}
+			path := filepath.Join(privateTestDir(t), "tenant-result.json")
+			if err := privateJSON(path, tenantResult{Scope: "unqualified-local-demo", Network: mode}); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result tenantResult
+			if err := json.Unmarshal(raw, &result); err != nil || result.Network != test.mode || result.Scope != "unqualified-local-demo" {
+				t.Fatalf("retained diagnostic lost network/scope: %+v %v", result, err)
+			}
+		})
+	}
+}
+
+func TestTenantCalicoRolloutIsExplicitBoundedAndFailClosed(t *testing.T) {
+	for _, test := range []struct{ name, network string }{
+		{"default", ""}, {"ovn", "ovn"}, {"upstream-ovn", "upstream-ovn"}, {"ready", "kind-calico"},
+		{"failed", "kind-calico"}, {"canceled", "kind-calico"},
+		{"deadline", "kind-calico"}, {"unknown", "calico"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			work := privateTestDir(t)
+			calls := filepath.Join(work, "calls")
+			writeTenantFixture(t, filepath.Join(work, "kubectl"), []byte(`#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$CALLS"
+case "$FAIL" in
+  failed) exit 7 ;;
+  deadline) exec sleep 60 ;;
+esac
+`), 0o700)
+			selected := tenant{network: test.network, session: ManagementSession{Work: work, Tools: work, Runner: Runner{Work: work, Env: []string{"PATH=/usr/bin:/bin", "CALLS=" + calls, "FAIL=" + test.name}}}}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if test.name == "canceled" {
+				cancel()
+			}
+			if test.name == "deadline" {
+				var deadlineCancel context.CancelFunc
+				ctx, deadlineCancel = context.WithTimeout(ctx, 100*time.Millisecond)
+				defer deadlineCancel()
+			}
+			err := selected.waitCNI(ctx, "owned-tenant-kubeconfig")
+			switch test.name {
+			case "canceled":
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("canceled CNI readiness: %v", err)
+				}
+			case "deadline":
+				if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrUnjoined) {
+					t.Fatalf("CNI readiness must honor remaining deadline and join child: %v", err)
+				}
+			case "failed":
+				if CommandExitCode(err) != 7 {
+					t.Fatalf("Calico rollout failure was hidden: %v", err)
+				}
+			case "unknown":
+				assertConfigUsage(t, err)
+			default:
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			raw, readErr := os.ReadFile(calls)
+			if test.name == "deadline" && os.IsNotExist(readErr) {
+				return // The parent may expire before command admission.
+			}
+			if test.name == "default" || test.name == "ovn" || test.name == "upstream-ovn" || test.name == "unknown" || test.name == "canceled" {
+				if !os.IsNotExist(readErr) {
+					t.Fatalf("unselected or rejected CNI readiness started work: %v", readErr)
+				}
+				return
+			}
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			want := "--kubeconfig owned-tenant-kubeconfig -n calico-system rollout status daemonset/calico-node --timeout=240s\n"
+			if string(raw) != want {
+				t.Fatalf("unexpected CNI readiness commands: %q", raw)
+			}
+		})
+	}
+}
+
+func TestTenantDNSRolloutIsBoundedAndFailClosed(t *testing.T) {
+	for _, name := range []string{"ready", "coredns failure", "node-local failure", "canceled", "deadline"} {
+		t.Run(name, func(t *testing.T) {
+			work := privateTestDir(t)
+			calls := filepath.Join(work, "calls")
+			writeTenantFixture(t, filepath.Join(work, "kubectl"), []byte(`#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$CALLS"
+case "$FAIL:$*" in
+  "coredns failure:"*deployment/coredns*) exit 7 ;;
+  "node-local failure:"*daemonset/node-local-dns*) exit 7 ;;
+  "deadline:"*) exec sleep 60 ;;
+esac
+`), 0o700)
+			selected := tenant{session: ManagementSession{Work: work, Tools: work, Runner: Runner{Work: work, Env: []string{"PATH=/usr/bin:/bin", "CALLS=" + calls, "FAIL=" + name}}}}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if name == "canceled" {
+				cancel()
+			}
+			if name == "deadline" {
+				var deadlineCancel context.CancelFunc
+				ctx, deadlineCancel = context.WithTimeout(ctx, 100*time.Millisecond)
+				defer deadlineCancel()
+			}
+			err := selected.waitDNS(ctx, "owned-tenant-kubeconfig")
+			switch name {
+			case "ready":
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "canceled":
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("canceled readiness: %v", err)
+				}
+			case "deadline":
+				if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrUnjoined) {
+					t.Fatalf("readiness must preserve deadline and join child: %v", err)
+				}
+			default:
+				if CommandExitCode(err) != 7 {
+					t.Fatalf("rollout failure was hidden: %v", err)
+				}
+			}
+			raw, readErr := os.ReadFile(calls)
+			if name == "deadline" && os.IsNotExist(readErr) {
+				// A short remaining deadline may expire during process admission,
+				// before the shell runs; it must still prevent subsequent work.
+				return
+			}
+			if name == "canceled" {
+				if !os.IsNotExist(readErr) {
+					t.Fatalf("canceled readiness started a command: %v", readErr)
+				}
+				return
+			}
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			want := "--kubeconfig owned-tenant-kubeconfig -n kube-system rollout status deployment/coredns --timeout=240s\n"
+			if name == "ready" || name == "node-local failure" {
+				want += "--kubeconfig owned-tenant-kubeconfig -n kube-system rollout status daemonset/node-local-dns --timeout=240s\n"
+			}
+			if string(raw) != want {
+				t.Fatalf("unexpected readiness commands: %q", raw)
+			}
+		})
 	}
 }
 
@@ -131,8 +345,15 @@ func TestTenantRequiresTwoDistinctReadyNativeNodes(t *testing.T) {
 }
 
 func tenantVMFixture(t *testing.T) (Runner, string, lifecycle.Artifact, string, []string) {
+	return tenantVMFixtureAt(t, "")
+}
+
+func tenantVMFixtureAt(t *testing.T, simulatorWork string) (Runner, string, lifecycle.Artifact, string, []string) {
 	t.Helper()
 	runner, root, work, first := domainFixture(t)
+	if simulatorWork != "" {
+		work = simulatorWork
+	}
 	second := strings.Replace(first, "000000000001", "000000000002", 1)
 	names := []string{first, second}
 	for _, name := range names {

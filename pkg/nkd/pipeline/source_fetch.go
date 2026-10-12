@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/NVIDIA/nke-recipes/internal/securepath"
 	"github.com/NVIDIA/nke-recipes/internal/sourcegit"
@@ -119,6 +120,9 @@ func (l Local) fetchWithSourceVendorAdmission(n ir.Node, opts RunOptions,
 	}
 	if probeExisting {
 		head, err := sourceFetchGitOut(opts, dir, "rev-parse", "HEAD")
+		if sourceGitBoundaryError(err) {
+			return err
+		}
 		if err == nil && head == n.Commit {
 			if err := l.verifyTree(dir, n, opts); err != nil {
 				return err
@@ -145,7 +149,7 @@ func (l Local) fetchWithSourceVendorAdmission(n ir.Node, opts RunOptions,
 	}
 	for _, s := range steps {
 		if _, err := sourceFetchGitOut(opts, dir, s...); err != nil {
-			if opts.ctx().Err() != nil {
+			if opts.ctx().Err() != nil || sourceGitBoundaryError(err) {
 				return err
 			}
 			// `remote add` fails if origin exists on a reused dir; tolerate.
@@ -201,7 +205,7 @@ func (l Local) vendor(n ir.Node, dir string, opts RunOptions) error {
 func (l Local) verifyTree(dir string, n ir.Node, opts RunOptions) error {
 	head, err := sourceFetchGitOut(opts, dir, "rev-parse", "HEAD")
 	if err != nil {
-		if opts.ctx().Err() != nil {
+		if opts.ctx().Err() != nil || sourceGitBoundaryError(err) {
 			return err
 		}
 		return e.Wrap(e.CodeFetchFailed, err, "resolving HEAD in %s", dir)
@@ -211,7 +215,7 @@ func (l Local) verifyTree(dir string, n ir.Node, opts RunOptions) error {
 	}
 	tree, err := sourceFetchGitOut(opts, dir, "rev-parse", "HEAD^{tree}")
 	if err != nil {
-		if opts.ctx().Err() != nil {
+		if opts.ctx().Err() != nil || sourceGitBoundaryError(err) {
 			return err
 		}
 		return e.Wrap(e.CodeFetchFailed, err, "resolving tree in %s", dir)
@@ -220,6 +224,14 @@ func (l Local) verifyTree(dir string, n ir.Node, opts RunOptions) error {
 		return e.New(e.CodeFetchFailed, "tree-hash mismatch in %s: got %s want %s", dir, tree, n.TreeHash)
 	}
 	return nil
+}
+
+// Admission and bounded-query failures are not an ordinary Git exit. Preserve
+// their owning code rather than retrying, tolerating remote-add or recoding them
+// as a source fetch failure.
+func sourceGitBoundaryError(err error) bool {
+	var coded *e.Error
+	return errors.As(err, &coded) && (coded.Code == e.CodeEngineCapability || coded.Code == e.CodeTimeout)
 }
 
 // abbrev shortens a hash for display without assuming a minimum length.
@@ -234,11 +246,18 @@ func gitOut(ctx context.Context, dir string, args ...string) (string, error) {
 	if ctx == nil {
 		return "", e.New(e.CodeUsage, "git execution requires a non-nil context")
 	}
-	cmd := execCmd(RunOptions{Ctx: ctx}, "git", append([]string{"-C", dir}, args...)...)
+	cmd, err := sourcegit.LocalCommand(ctx, os.Environ(), dir, args...)
+	if err != nil {
+		return "", err
+	}
+	configureCommandCancellation(cmd, 10*time.Second)
 	out, err := outputOwnedCommand(ctx, cmd)
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", e.Wrap(e.CodeTimeout, ctx.Err(), "git execution canceled")
+		}
+		if args[0] == "fetch" {
+			return "", e.Wrap(e.CodeFetchFailed, err, "local source Git fetch failed; %s", sourcegit.LocalCredentialPolicy)
 		}
 		return "", err
 	}

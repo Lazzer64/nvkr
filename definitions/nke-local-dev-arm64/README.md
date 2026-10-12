@@ -8,13 +8,14 @@ They do not publish, sign or build a complete source-only NKE distribution.
 | Selection | Definition | Outputs |
 | --- | --- | --- |
 | Complete demo artifact set | `definition.json` | 29: disk, images, installer-aligned charts/CLI, tools, profiles and simulator in one Run |
+| Explicit upstream OVN diagnostic | `definition-upstream-ovn.json` | 29: replaces the disk, OVN image/chart and profiles outputs together; not NVIDIA-fork validation |
 | Faster component loop | `definition-components.json` | 22: historical components without the disk; not the complete demo selection |
 | OS-only loop | `definition-os.json` | One disk with its complete material closure |
 | Source-built provider loop | `definition-providers.json` | Two native provider images, no disk |
 | NICoSim build loop | `definition-simulator.json` | One executable bundle: source-built Linux ARM64 server, CLI and pinned seed/UI archive |
 | Staged-installer site loop | `definition-site.json` | Four source-aligned candidates: CLI, controller image, image-bound controller chart and NKTP chart |
 | Source-built installer tools | `definition-tools.json` | One five-component Linux ARM64 executable bundle; distinct from the acquired `operator-tools` |
-| Diagnostic controller profiles | `definition-profiles.json` | One OCI-carried tarball containing plain ARM64/Ubuntu 26.04 profile data; not a runnable image or fleet profiles |
+| Diagnostic controller profiles | `definition-profiles.json` | One native Linux ARM64 OCI image containing plain ARM64/Ubuntu 26.04 profile data at `/profiles`; not fleet profiles |
 
 Use `environment-local-docker.json` with native Linux ARM64 Docker, the
 launcher's default runtime. The OS uses TCG. On macOS, follow the guide's
@@ -25,6 +26,22 @@ digest-checked Helm 4.2.4 and ORAS 1.3.3. There is no separate Helm-wrapper imag
 The combined selection creates one immutable Run. Catalog
 overlays remain bound to each exact predecessor digest. `os-tcg.json` depends on the M2
 OS catalog's digest: repinning that catalog requires reviewing this binding.
+The upstream selection stacks `os-upstream-ovn.json` after `os-tcg.json`;
+its `requiresCatalogDigest` binds that exact predecessor, not the base catalog
+alone. Regenerate and review both bindings after changing either predecessor.
+
+`definition-upstream-ovn.json` substitutes these four outputs as one matched
+diagnostic selection; the other 25 output names remain unchanged:
+
+| Output | Format | Role |
+| --- | --- | --- |
+| `nke-node-image-upstream-ovn-arm64` | `disk-image` | QCOW2 with the selected upstream OVN packages |
+| `upstream-ovn-image-arm64` | `oci` | Standalone upstream OVN image |
+| `upstream-ovn-chart-arm64` | `helm-oci` | Chart bound to the standalone image |
+| `controller-profiles-upstream-ovn` | `oci` | Profiles selecting the matching upstream chart stream |
+
+Select all four together for the upstream demo. These output bindings do not
+establish NVIDIA-fork compatibility or completed tenant acceptance.
 
 ```sh
 bin/nkdctl definition validate --definition definitions/nke-local-dev-arm64/definition.json
@@ -72,13 +89,19 @@ suitably sized host. In `nke-demo e2e`, use YAML `build.jobs` or `--jobs`.
 Independent ready producers and packaging operations run concurrently up to
 that limit, while dependencies still gate Packer and publication-shaped packaging.
 
-Profiles contain configuration and runbooks, packaged deterministically as data.
-NKD retains their OCI-carried bundle with the completed Run; the consumer uses
-ORAS and verified extraction to supply files to NKE's profiles volume. No
-profiles Dockerfile, BuildKit producer or runtime init image is needed. The
-diagnostic OS profile remains separate from production fleet profiles and does
-not authenticate the selected disk or establish tenant compatibility.
+Profiles contain configuration and runbooks in a native OCI image built with
+the pinned NKE source-owned `controller/profiles/example/Dockerfile` and the
+existing rootless BuildKit lane. Its Alpine 3.24.1 tag is overridden through a
+BuildKit named context with the existing digest-pinned ARM64 Alpine 3.24.2
+runtime. No new Dockerfile or upstream source mutation is needed. Only the
+authenticated local OS profile, two pinned NICoSim configuration profiles and
+pinned fixture runbooks enter the image. NKE's chart uses `/bin/sh` and
+`cp -a /profiles/. /profiles-out/` in its standard profiles init container;
+the app mounts the shared profiles volume read-only. The diagnostic OS profile
+remains separate from production fleet profiles and does not authenticate the
+selected disk or establish tenant compatibility. Local image construction is
+a networked wrapped build, not qualified execution or publication authorization.
 
 See [reconciliation](../../docs/adr/reconciliation.md) for implementation and
-test boundaries. Ordinary tests do not execute the full demo; this PR supplies
-no durable fresh-build/deploy acceptance record.
+test boundaries. Ordinary tests do not execute the full demo; a fresh complete
+build/deploy/cleanup acceptance record remains required.

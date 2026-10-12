@@ -19,8 +19,25 @@ import (
 	"time"
 
 	"github.com/NVIDIA/nke-recipes/internal/securepath"
+	nkderr "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 	"github.com/NVIDIA/nke-recipes/pkg/nkd/lifecycle"
 )
+
+// Explicit downstream policy, not an upstream completion guarantee. The pinned
+// NKE workflow waits for worker pools then control-plane nodes (20 minutes each)
+// and may retry longer. Keep a finite wait and independent diagnostic/withdrawal
+// headroom instead of truncating deletion with the former three-minute window.
+const (
+	tenantDeletionWaitTimeout = 45 * time.Minute
+	tenantDiagnosticsTimeout  = 6 * time.Minute
+	tenantDeleteTimeout       = 2 * time.Minute
+	tenantWithdrawalTimeout   = 2 * time.Minute
+	tenantCleanupTimeout      = time.Hour
+)
+
+func tenantCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), tenantCleanupTimeout)
+}
 
 // TenantRequest is deployment intent consumed and validated by the pinned NKE
 // CLI. It is not an NKD Definition or an authenticated provider identity.
@@ -93,10 +110,37 @@ func NewTenantRequest(name string) TenantRequest {
 	return request
 }
 
+func newTenantRequest(name, network string) (TenantRequest, error) {
+	mode, err := normalizeNetwork(network)
+	if err != nil {
+		return TenantRequest{}, err
+	}
+	request := NewTenantRequest(name)
+	switch mode {
+	case "kind-calico":
+		request.CNI, request.CNIVersion = "calico", "3.30.1"
+	case "upstream-ovn":
+		request.CNIVersion = upstreamSiteOVNVersion
+	}
+	return request, nil
+}
+
 type tenantRow struct {
-	Name string         `json:"name"`
-	ID   string         `json:"id"`
-	NICo TenantProvider `json:"nico"`
+	Name       string           `json:"name"`
+	ID         string           `json:"id"`
+	NICo       TenantProvider   `json:"nico"`
+	Conditions tenantConditions `json:"conditions"`
+}
+
+// Retain only the two pinned API condition statuses needed for presentation.
+// Messages, transition times and unrelated response fields are not decoded.
+type tenantConditions struct {
+	Provisioning struct {
+		Status TenantConditionStatus `json:"status"`
+	} `json:"provisioning"`
+	Provisioned struct {
+		Status TenantConditionStatus `json:"status"`
+	} `json:"provisioned"`
 }
 
 func selectedTenant(rows []tenantRow, name, id string) (*tenantRow, error) {
@@ -181,6 +225,7 @@ func pause(ctx context.Context, duration time.Duration) error {
 
 type tenant struct {
 	name, id      string
+	network       string
 	session       ManagementSession
 	simulator     *OwnedProcess
 	image         lifecycle.Artifact
@@ -189,13 +234,17 @@ type tenant struct {
 	intent        bool
 	sequence      int
 	cleaning      bool
+	cleanup       tenantCleanupObservations
 }
 
 func (t *tenant) capture(ctx context.Context, args []string, phase string, budget time.Duration) ([]byte, error) {
 	t.sequence++
 	runner := t.session.Runner
+	// Commands retain their private numbered logs. Their exit status is not
+	// provisioning success; report interpreted state from the owning wait loop.
+	runner.Progress = nil
 	if t.cleaning {
-		runner.Work = ""
+		return t.cleanup.capture(ctx, runner, args, phase, t.sequence, budget)
 	}
 	return runner.Capture(ctx, args, fmt.Sprintf("tenant-%03d-%s", t.sequence, phase), budget)
 }
@@ -216,24 +265,41 @@ func (t *tenant) row(ctx context.Context) (*tenantRow, error) {
 	}
 	return selectedTenant(rows, t.name, t.id)
 }
-func (t *tenant) alive(ctx context.Context) error {
+func (t *tenant) alive(ctx context.Context) (*tenantRow, error) {
 	if exited, _ := t.simulator.Exited(); exited {
-		return errors.New("NICoSim exited during tenant provisioning")
+		return nil, errors.New("NICoSim exited during tenant provisioning")
 	}
 	row, err := t.row(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if row == nil {
-		return errors.New("created tenant disappeared")
+		return nil, errors.New("created tenant disappeared")
 	}
-	return nil
+	return row, nil
 }
 func (t *tenant) kubectl(config string, args ...string) []string {
 	return append([]string{filepath.Join(t.session.Tools, "kubectl"), "--kubeconfig", config}, args...)
 }
 
-func (t *tenant) run(ctx context.Context, budget time.Duration) error {
+func (t *tenant) run(ctx context.Context, budget time.Duration) (result error) {
+	boundary := beginProgress(t.session.Runner.Progress, "tenant-provisioning", DeploymentStarted, DeploymentFinished, DeploymentFailed)
+	waitStage := ""
+	defer func() {
+		if waitStage != "" {
+			result = t.waitError(result, waitStage)
+		}
+		boundary.finish(result)
+	}()
+	mode, err := normalizeNetwork(t.network)
+	if err != nil {
+		return err
+	}
+	t.network = mode
+	intent, err := newTenantRequest(t.name, t.network)
+	if err != nil {
+		return err
+	}
 	rows, err := t.inventory(ctx)
 	if err != nil {
 		return err
@@ -242,7 +308,7 @@ func (t *tenant) run(ctx context.Context, budget time.Duration) error {
 		return errors.New("require an empty freshly installed site before tenant creation")
 	}
 	request := filepath.Join(t.session.Work, "tenant-request.json")
-	if err = privateJSON(request, NewTenantRequest(t.name)); err != nil {
+	if err = privateJSON(request, intent); err != nil {
 		return err
 	}
 	t.intent = true
@@ -262,11 +328,21 @@ func (t *tenant) run(ctx context.Context, budget time.Duration) error {
 	}
 	provision, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
+	deadline, _ := provision.Deadline()
+	progress := tenantProgress{writer: t.session.Runner.Progress, started: time.Now(), deadline: deadline, conditions: row.Conditions}
+	guestObserver := tenantGuestObserver{}
+	progress.update(time.Now(), "tenant-kubeconfig", nil)
 	kubeconfig := filepath.Join(t.session.Work, "tenant-kubeconfig")
+	waitStage = "waiting for NKE to publish tenant kubeconfig"
 	for {
-		if err = t.alive(provision); err != nil {
+		if row, err = t.alive(provision); err != nil {
 			return err
 		}
+		progress.conditions = row.Conditions
+		if err = guestObserver.update(provision, t, time.Now()); err != nil {
+			return err
+		}
+		progress.update(time.Now(), "tenant-kubeconfig", nil)
 		raw, readErr := t.capture(provision, t.kubectl(environmentValue(t.session.Runner.Env, "SITE_KUBECONFIG"), "-n", "nke-system", "get", "secret", t.name+"-admin-kubeconfig", "--ignore-not-found", "-o", "json"), "kubeconfig-secret", 30*time.Second)
 		if readErr != nil {
 			return readErr
@@ -284,8 +360,9 @@ func (t *tenant) run(ctx context.Context, budget time.Duration) error {
 			break
 		}
 		if err = pause(provision, 10*time.Second); err != nil {
-			return fmt.Errorf("tenant provisioning budget: %w", err)
+			return err
 		}
+		progress.update(time.Now(), "tenant-kubeconfig", nil)
 	}
 	raw, err := t.capture(provision, t.kubectl(kubeconfig, "config", "view", "-o", "json"), "tenant-config", 30*time.Second)
 	if err != nil {
@@ -301,8 +378,14 @@ func (t *tenant) run(ctx context.Context, budget time.Duration) error {
 		return errors.New("tenant kubeconfig does not select the admitted VM VIP")
 	}
 	var nodes struct{ Items []tenantNode }
+	waitStage = "waiting for two Ready tenant nodes"
+	progress.update(time.Now(), "tenant-api", nil)
 	for {
-		if err = t.alive(provision); err != nil {
+		if row, err = t.alive(provision); err != nil {
+			return err
+		}
+		progress.conditions = row.Conditions
+		if err = guestObserver.update(provision, t, time.Now()); err != nil {
 			return err
 		}
 		raw, err = t.capture(provision, t.kubectl(kubeconfig, "--request-timeout=10s", "get", "nodes", "-o", "json"), "nodes", 30*time.Second)
@@ -310,6 +393,7 @@ func (t *tenant) run(ctx context.Context, budget time.Duration) error {
 			if CommandExitCode(err) != 1 {
 				return err
 			}
+			progress.update(time.Now(), "tenant-api", nil)
 		} else {
 			if err = json.Unmarshal(raw, &nodes); err != nil {
 				return err
@@ -318,19 +402,28 @@ func (t *tenant) run(ctx context.Context, budget time.Duration) error {
 			if checkErr != nil {
 				return checkErr
 			}
+			progress.update(time.Now(), "tenant-nodes", nodes.Items)
 			if ready {
 				break
 			}
 		}
 		if err = pause(provision, 10*time.Second); err != nil {
-			return fmt.Errorf("two-node provisioning budget: %w", err)
+			return err
 		}
 	}
+	waitStage = ""
 	domains, err := vmEvidence(ctx, filepath.Join(filepath.Dir(t.session.Work), "simulator"), t.image, t.domains)
 	if err != nil {
 		return err
 	}
+	if err = t.waitCNI(provision, kubeconfig); err != nil {
+		return err
+	}
+	if err = t.waitDNS(provision, kubeconfig); err != nil {
+		return err
+	}
 	job := filepath.Join(t.session.Work, "workload.json")
+	progress.update(time.Now(), "tenant-workload", nodes.Items)
 	if err = privateJSON(job, workloadJob()); err != nil {
 		return err
 	}
@@ -370,12 +463,85 @@ func (t *tenant) run(ctx context.Context, budget time.Duration) error {
 	if len(ids) != 1 || strings.Split(ids[0], "@")[len(strings.Split(ids[0], "@"))-1] != strings.Split(WorkloadImage, "@")[1] {
 		return errors.New("workload image ID differs from pinned diagnostic acquisition")
 	}
-	return privateJSON(filepath.Join(t.session.Work, "tenant-result.json"), struct {
-		Scope, Name, TenantID string
-		Nodes                 []tenantNode
-		Domains               []domainEvidence
-		Workload              json.RawMessage
-	}{"unqualified-local-demo", t.name, t.id, nodes.Items, domains, raw})
+	return privateJSON(filepath.Join(t.session.Work, "tenant-result.json"), tenantResult{
+		Scope: "unqualified-local-demo", Network: t.network, Name: t.name, TenantID: t.id,
+		Nodes: nodes.Items, Domains: domains, Workload: raw,
+	})
+}
+
+// A retained local diagnostic, not an NKD Release or network compatibility proof.
+type tenantResult struct {
+	Scope, Network, Name, TenantID string
+	Nodes                          []tenantNode
+	Domains                        []domainEvidence
+	Workload                       json.RawMessage
+}
+
+func (t *tenant) waitError(err error, stage string) error {
+	if err == nil {
+		return nil
+	}
+	code := nkderr.CodePreflightFailed
+	var coded *nkderr.Error
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		code = nkderr.CodeTimeout
+	case errors.As(err, &coded):
+		code = coded.Code
+	}
+	return nkderr.Wrap(code, err, "%s (private diagnostics: %s)", stage, t.session.Work)
+}
+
+// Calico can report Node Ready before its node agents finish their own rollout.
+// The diagnostic mode must admit that datapath before the unchanged smoke test;
+// rollout readiness is not functional DNS or workload acceptance.
+func (t *tenant) waitCNI(ctx context.Context, kubeconfig string) (result error) {
+	if err := requireContext(ctx); err != nil {
+		return t.waitError(err, "waiting for tenant CNI readiness")
+	}
+	mode, err := normalizeNetwork(t.network)
+	if err != nil {
+		return err
+	}
+	if mode != "kind-calico" {
+		return nil
+	}
+	boundary := beginProgress(t.session.Runner.Progress, "tenant-cni-readiness", PhaseStarted, PhaseFinished, PhaseFailed)
+	defer func() {
+		result = t.waitError(result, "waiting for tenant Calico daemonset/calico-node rollout")
+		boundary.finish(result)
+	}()
+	ready, cancel := context.WithTimeout(ctx, 4*time.Minute)
+	defer cancel()
+	_, result = t.capture(ready, t.kubectl(kubeconfig, "-n", "calico-system", "rollout", "status", "daemonset/calico-node", "--timeout=240s"), "cni-calico-rollout", 4*time.Minute)
+	return result
+}
+
+// Node Ready does not mean the pinned NKE DNS workloads have finished rolling
+// out. Wait for their owning controllers before running the unchanged DNS
+// smoke test; rollout completion alone is not functional DNS acceptance.
+func (t *tenant) waitDNS(ctx context.Context, kubeconfig string) (result error) {
+	if err := requireContext(ctx); err != nil {
+		return t.waitError(err, "waiting for tenant DNS readiness")
+	}
+	boundary := beginProgress(t.session.Runner.Progress, "tenant-dns-readiness", PhaseStarted, PhaseFinished, PhaseFailed)
+	stage := "waiting for tenant DNS readiness"
+	defer func() {
+		result = t.waitError(result, stage)
+		boundary.finish(result)
+	}()
+	ready, cancel := context.WithTimeout(ctx, 4*time.Minute)
+	defer cancel()
+	for _, resource := range []struct{ name, phase string }{
+		{"deployment/coredns", "dns-coredns-rollout"},
+		{"daemonset/node-local-dns", "dns-node-local-rollout"},
+	} {
+		stage = "waiting for tenant DNS " + resource.name + " rollout"
+		if _, err := t.capture(ready, t.kubectl(kubeconfig, "-n", "kube-system", "rollout", "status", resource.name, "--timeout=240s"), resource.phase, 4*time.Minute); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type workload struct {
@@ -546,8 +712,14 @@ func (t *tenant) preserve(ctx context.Context) error {
 	}
 	return nil
 }
-func (t *tenant) restore(ctx context.Context) error {
+func (t *tenant) restore(ctx context.Context) (result error) {
 	t.cleaning = true
+	defer func() {
+		// Observation loss must not prevent owned deletion or hide its result.
+		if err := t.cleanup.preserve(context.WithoutCancel(ctx), t.session.Work); err != nil && t.session.Runner.Progress != nil {
+			fmt.Fprintln(t.session.Runner.Progress, "Some private tenant cleanup observations unavailable; owned cleanup result is unchanged")
+		}
+	}()
 	if !t.intent {
 		return nil
 	}
@@ -559,15 +731,27 @@ func (t *tenant) restore(ctx context.Context) error {
 		return nil
 	}
 	t.id = row.ID
-	if _, err = t.capture(ctx, []string{t.cli(), "delete", "cluster", t.name}, "delete", 120*time.Second); err != nil {
+	deleteProgress := beginProgress(t.session.Runner.Progress, "tenant-delete", PhaseStarted, PhaseFinished, PhaseFailed)
+	_, err = t.capture(ctx, []string{t.cli(), "delete", "cluster", t.name}, "delete", tenantDeleteTimeout)
+	deleteProgress.finish(err)
+	if err != nil {
 		return err
 	}
-	deadline, cancel := context.WithTimeout(ctx, 180*time.Second)
+	waitProgress := beginProgress(t.session.Runner.Progress, "tenant-deletion-wait", PhaseStarted, PhaseFinished, PhaseFailed)
+	defer func() { waitProgress.finish(result) }()
+	return t.waitDeleted(ctx, tenantDeletionWaitTimeout)
+}
+
+func (t *tenant) waitDeleted(ctx context.Context, budget time.Duration) error {
+	if budget <= 0 {
+		return errors.New("positive tenant deletion wait budget required")
+	}
+	deadline, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	for {
-		row, err = t.row(deadline)
+		row, err := t.row(deadline)
 		if err != nil {
-			return err
+			return fmt.Errorf("NKE tenant deletion did not finish: %w", err)
 		}
 		if row == nil {
 			return nil
@@ -577,8 +761,14 @@ func (t *tenant) restore(ctx context.Context) error {
 		}
 	}
 }
-func (t *tenant) close(ctx context.Context) error {
-	diagnosticErr := t.preserve(ctx)
+func (t *tenant) close(ctx context.Context) (result error) {
+	cleanupProgress := beginProgress(t.session.Runner.Progress, "tenant-cleanup", PhaseStarted, PhaseFinished, PhaseFailed)
+	defer func() { cleanupProgress.finish(result) }()
+	diagnosticProgress := beginProgress(t.session.Runner.Progress, "tenant-diagnostics", PhaseStarted, PhaseFinished, PhaseFailed)
+	diagnostics, cancel := context.WithTimeout(ctx, tenantDiagnosticsTimeout)
+	diagnosticErr := t.preserve(diagnostics)
+	cancel()
+	diagnosticProgress.finish(diagnosticErr)
 	if errors.Is(diagnosticErr, ErrUnjoined) {
 		return diagnosticErr
 	}
@@ -589,11 +779,15 @@ func (t *tenant) close(ctx context.Context) error {
 }
 
 func consumeTenant(ctx context.Context, cfg Config, guard *NetworkGuard, session ManagementSession, server *OwnedProcess, image lifecycle.Artifact, domains Runner, url string) (result error) {
+	network, err := normalizeNetwork(cfg.Network)
+	if err != nil {
+		return err
+	}
 	var random [6]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		return err
 	}
-	t := tenant{name: "nkd-tenant-" + hex.EncodeToString(random[:]), session: session, simulator: server, image: image, domains: domains, diagnosticURL: url}
+	t := tenant{name: "nkd-tenant-" + hex.EncodeToString(random[:]), network: network, session: session, simulator: server, image: image, domains: domains, diagnosticURL: url}
 	ids, err := ownedManagementNodes(ctx, session.Runner, session.Name)
 	if err != nil {
 		return err
@@ -609,22 +803,65 @@ func consumeTenant(ctx context.Context, cfg Config, guard *NetworkGuard, session
 		return errors.New("management node changed before guest route admission")
 	}
 	defer func() {
-		if errors.Is(result, ErrUnjoined) {
+		if holdErr := waitRetainedCleanup(ctx, result); holdErr != nil {
+			result = errors.Join(result, holdErr)
 			return
 		}
-		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 6*time.Minute)
+		if errors.Is(result, ErrUnjoined) {
+			recordRetainedCleanup(ctx, result)
+			return
+		}
+		cleanup, cancel := tenantCleanupContext(ctx)
 		defer cancel()
 		closeErr := t.close(cleanup)
+		recordRetainedCleanup(ctx, closeErr)
 		result = errors.Join(result, closeErr)
 		if errors.Is(closeErr, ErrUnjoined) {
 			return
 		}
-		if withdrawErr := guard.RevokeGuestTCP(cleanup); withdrawErr != nil {
+		if runtimeRetention(ctx) != nil {
+			// Detached owners never retry privileged commands. The original
+			// network journal retains guest-rule intent for a freshly authorized
+			// foreground restore, after all actual producers have joined.
+			return
+		}
+		withdrawal, stopWithdrawal := context.WithTimeout(cleanup, tenantWithdrawalTimeout)
+		defer stopWithdrawal()
+		if withdrawErr := guard.RevokeGuestTCP(withdrawal); withdrawErr != nil {
 			result = errors.Join(result, ErrRetainedControls, withdrawErr)
 		}
 	}()
+	defer recoverRetainedPanic(ctx, &result)
 	if err = guard.AllowGuestTCP(ctx, rows[0].NetworkSettings.Networks["kind"].IPAddress, []int{30440, 30443}); err != nil {
 		return err
 	}
-	return t.run(ctx, cfg.Timeout)
+	if err = t.run(ctx, cfg.Timeout); err != nil {
+		return err
+	}
+	return presentTenantResult(ctx, cfg, session)
+}
+
+// Show the cluster result before either retention or explicit teardown. The
+// display is a fresh read-only observation, not a replacement for t.run's
+// artifact, disk, workload and DNS acceptance checks.
+func presentTenantResult(ctx context.Context, cfg Config, session ManagementSession) error {
+	if cfg.Progress != nil {
+		access := OperatorAccess{kubectl: filepath.Join(session.Tools, "kubectl"), site: filepath.Join(session.Work, "kubeconfig"), tenant: filepath.Join(session.Work, "tenant-kubeconfig")}
+		if err := access.WriteLiveStatus(ctx, session.Runner, cfg.Progress); err != nil &&
+			(!errors.Is(err, errOperatorHealthUnconfirmed) || errors.Is(err, ErrUnjoined) || ctx.Err() != nil) {
+			// A health observation may differ after t.run's unchanged acceptance
+			// checks. It stays visible, but cannot become a presenter-only gate.
+			// Writer/admission failures, cancellation and unjoined children still
+			// return their owning error; none grant retention or cleanup success.
+			return err
+		}
+	}
+	if owner := runtimeRetention(ctx); owner != nil {
+		access, accessErr := InspectOperatorAccess(ctx, session)
+		if accessErr != nil {
+			return accessErr
+		}
+		return owner.markReady(ctx, access)
+	}
+	return nil
 }

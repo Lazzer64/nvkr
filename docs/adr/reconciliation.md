@@ -92,6 +92,14 @@ execution. Preparation/validation stay offline; build networking needs explicit 
 and exposes the default bridge, not an outbound-only firewall. A narrow root extraction/ownership stage
 precedes non-root consumer work. Local execution has no subordinate-ID/user-namespace guarantee.
 Success, returned failure and cancellation own bounded cleanup; hard-crash orphan recovery remains deferred.
+An unjoined metadata observer retains only its exact dependent resources and
+keeps independently bounded cleanup for the rest. Its stop-issued object
+locators may be saved in a private no-replace `observer-retained.json` beside
+the attempt diagnostics; they are non-authoritative inspection data, never a
+cross-process adoption/deletion capability. Persistence failure stays visible
+without permitting an artifact or skipping independent cleanup. Controlled
+contracts distinguish successful private retention, no-replace/storage failure
+and unjoined ownership; this is not live orphan-recovery acceptance.
 ADR-10/18 own the complete driver and native runner contracts.
 
 Attempt-owned material manifests and bounded source-owned build logs are diagnostic. Unsafe entries fail
@@ -179,9 +187,21 @@ a real joined bake or extend hosted, signing or qualification admission.
 
 The Go downstream consumer invokes `nkdctl` for build, verification and
 extraction, and NKE's pinned staged installer for deployment. Kind hosts
-management services; CAPNICo/NICoSim provisions QCOW2 tenant VMs. Final success
+management services; CAPNICo/NICoSim provisions QCOW2 tenant VMs. Full E2E success
 requires two Ready nodes, workload/DNS checks, exact disk/artifact bindings and
-owned cleanup. Cobra/Viper configuration supplies descriptions, not receipts.
+owned cleanup. The explicit `--cleanup` route retains that full acceptance
+scope. Default `run`/`e2e` instead hand off a retained local environment to the
+shell, with separate `status` and explicit `cleanup` commands. A live retained
+owner, its serialized description and historical Ready time are not current
+Kubernetes health, joined cleanup or a release receipt. The actual launch/peer
+selection, detach, operation cancellation, partial retention and explicit
+teardown have controlled native Linux ARM64 process fixtures; these are not a
+fresh NKE retained deployment or proof of SSH/logout/cgroup persistence.
+Live access presentation executes bounded read-only bundled kubectl API/node
+queries for the site and tenant and keeps raw responses private. Its focused
+tests do not establish real Ubuntu runtime acceptance. New retained work does
+not retroactively change the exact-revision complete recording below.
+Cobra/Viper configuration supplies descriptions, not receipts.
 The combined build reuses bootstrap executables and the measured toolchain;
 catalog substitutions retain their own exact predecessor binding. `--jobs`
 bounds concurrent ready producer and packaging operations in the existing
@@ -195,31 +215,336 @@ acquisition; controlled tests cover pin/dirty/source/path/cancellation failures
 and prepare-before-build ordering, not current external Git authorization or
 fresh tenant acceptance.
 
+Ordinary local source Git and installer preparation now use the existing
+`internal/sourcegit` owner to exclude ambient global hooks, fsmonitor, filters,
+templates and line-ending conversion. Developer credential and selected proxy/TLS
+trust settings are projected only into network fetch; explicit absolute local-repository redirects remain
+available. Its transport override admits HTTPS, SSH and local files, not cleartext
+HTTP/Git or external helpers. Clone fixes upload-pack, disables local-path
+optimization with `--no-local`, enables transferred-object checks and disables
+recursive submodules; ref discovery also fixes upload-pack.
+Neither expands developer credential projection beyond fetch. Real Git fixtures
+exercise TLS-verified helper fetch, plaintext refusal and exact local clone/ref
+results; these are not current private-source access or held receipt evidence.
+Ordinary local sources reject indexed gitlinks and nonempty, untracked, missing,
+symlinked or mismatched root `.gitmodules` descriptors. A regular tracked empty
+descriptor requires Git's empty-HEAD and index/worktree correspondence checks;
+the maintained OVN fork's inert descriptor does not authorize nested sources.
+Git owns the bounded index-mode query; its Git 2.38+ capability floor is named on
+query failure. Ignoring submodules during status is not evidence of clean nested sources.
+The ordinary adapter accepts operation-first arguments only; its explicit
+directory owns repository selection. The demo may consume one leading `-C`
+before that admission; additional global options are refused before repository
+queries or command-log creation. Git still owns operation argument syntax.
+Privacy-safe refusal diagnostics name static configuration families and
+redirect indices, never configuration values, paths or URLs. Ordinary fetch and
+configuration-query failures explain the supported fetch-only credential policy
+without assigning an authentication cause or changing cancellation codes.
+Real Git fixtures cover exact checkout bytes, callback exclusion,
+local redirects and authenticated fetch. The E2E build adapter preserves these
+bounded, owner-validated redirects, and the NKE clone launcher appends its two
+redirects instead of discarding other local source inputs. These fixtures are not proof of current
+private-repository access; the stricter held hosted-source admission is unchanged.
+The downstream site installer now takes a full detached private checkout of its
+exact source pin instead of enabling sparse checkout, which Git configures through
+the deliberately rejected `extensions.worktreeConfig` delegation. Real Git
+regressions cover this failure, unchanged source bytes, the exact historical pin,
+cancellation and continued rejection of delegated configuration. Command admission
+errors retain the failing phase without exposing arguments or source paths. These
+tests do not establish a completed Ubuntu site replay.
+
+Maintained OS Definitions, catalog execution and Packer toolchain assembly select Docker.
+The older authored Podman Environment and its TCG Definition are removed; generic
+NKD Podman support remains. The ARM64 catalog baseline retains the already-published
+historical M2 Docker candidate, not a newly measured current toolchain. Local Docker
+launchers still freeze their freshly validated image into an attempt overlay.
+Static Plan and wrapper tests cover these selections, not a new native bake.
+
 The local OS selects the PR #113 NKE/NVIDIA OVN fork at pinned commit
 `26cc199de8e814a7fe6d899a770fc04df0bbc2f9`; profile packages and tenant requests
 select its `1.5.18` chart stream. The combined Definition also declares standalone
 OVN OCI image and bound Helm OCI outputs. Disk-embedded and standalone outputs
 are independently produced; this does not close original-owner cross-output
 reuse or establish equal bytes. Fork graph/profile tests and actual pinned-chart
-Helm rendering with loopback OCI push/pull passed; the changed combined Run,
-fork OS bake and tenant acceptance still require a fresh runtime run.
+Helm rendering with loopback OCI push/pull were reported locally, without a
+retrievable CI/Release evidence attachment for these exercises. An author-reported
+local attempt at `de31a87` completed the combined artifact Run,
+including the fork OS bake, with 29 expected and 29 observed outputs in the
+`unqualified-local-execution` lane. Its exact Run identity and original records
+remain private; no retrievable external artifact is cited here.
+Artifact completion does not establish tenant acceptance or default OVN startup.
 
-Profiles use an OCI-carried data bundle, ORAS transport and NKD-authenticated
-extraction, followed by a read-only controller volume. The additive source
-overlay changes no upstream NKE files. Local-only APT installation and uplink
-naming are explicit profile choices, not a general NKE offline boot contract.
-The pinned installer still requires the unused legacy `images.profiles` field.
+The selected fork's Ubuntu runtime omits `firewall-cmd`, while its non-DPU
+executable initialization requires it even when firewalld is disabled.
+[OVN issue #1](https://github.com/dsx-ai-factory/ovn-kubernetes/issues/1)
+records the source paths and observed startup failure: artifact builds can
+succeed without a Ready tenant. A canonical source-owner fix and reviewed pin
+update are necessary for that NVIDIA selection, but are not shown to be
+sufficient for tenant, workload/DNS or cleanup acceptance. No local catalog
+patch is applied. Neither contract checks nor earlier deployment replays close
+this NVIDIA-specific gate.
+
+Separately, the retained continuous attempt above used the explicitly selected
+`kind-calico` diagnostic and ended with a two-node readiness timeout, not a
+successful E2E video or an OVN startup test. That timeout's cause was not
+established by this recording; it cannot be attributed to the uninstalled
+NVIDIA OVN startup path. Later acceptance evidence below retains its own exact
+revision and network selection, rather than retroactively explaining this failure.
+
+The downstream demo now selects those standalone NVIDIA OVN outputs for the
+Kind site as well as selecting the fork's stream for the QCOW2 tenant. Its private
+Kind configuration disables the default CNI and kube-proxy. The site adapter
+copies the selected native image through the existing owned registry and exports
+the observed bound chart through `nkdctl publish chart`; it starts node-local OVS
+using that image's existing entrypoint before site OVN, node readiness and CAPI.
+These privileged local CNI processes are not an independently isolated provider.
+Already-loaded Open vSwitch/Geneve modules are admitted before installer
+acquisition or deployment mutation. The adapter does not issue module-load or
+unload commands, but the privileged source-owned OVS entrypoint can manipulate
+the shared kernel; prerequisite admission is not an isolation boundary.
+The changed site topology has no completed live E2E acceptance. The source-owner
+startup fix, reviewed pin update and fresh dual-cluster runtime checks remain
+required, separately from artifact and adapter tests.
+Read-only rendering of the retained chart with its built Helm 4.2.4 executable
+was reported locally to preserve the selected image digest across all six site
+chart slots. No retrievable rendering artifact is cited for that exercise;
+it does not establish validation of the exact values currently installed by the
+demo, or a running cluster. Owner validation must also cover real node startup: the
+selected [iptables wrapper](https://github.com/dsx-ai-factory/ovn-kubernetes/blob/26cc199de8e814a7fe6d899a770fc04df0bbc2f9/dist/images/iptables-scripts/iptables#L5)
+requires `/host`, whereas the selected
+[node chart](https://github.com/dsx-ai-factory/ovn-kubernetes/blob/26cc199de8e814a7fe6d899a770fc04df0bbc2f9/charts/ovn-kubernetes/charts/ovnkube-single-node-zone/templates/daemonset.yaml#L324)
+mounts `/host/run/dbus`, not that root. This is a source-level compatibility
+gap, not an observed subsequent runtime failure or a local workaround.
+
+The explicit `upstream-ovn` demo option is additive; NVIDIA OVN remains the
+default and no mode silently falls back. Its authored local Definition replaces
+four output names (disk, image, chart and profiles), preserving a 29-output
+combined Run. Upstream `v1.4.0` resolves to commit
+`d6a3812d1bc1c36bf24c7eda0e86e9b13d84907d` and tree
+`ce0cb49cd14f2fc260457e61a5a222c027a07f79`. Whole-producer overlays bind the
+upstream image, chart and offline CNI packages; a separate authenticated profile
+patch installs stream `1.4.0` and names its distinct served disk. Tenant requests
+select that same stream. Opposite-mode outputs are rejected before deployment.
+The source-owned image Dockerfile still acquires OVS/OVN and kubectl through APT;
+this does not claim hermetic, FIPS/STIG, qualification or Kubernetes compatibility.
+
+The complete alternate Plan compiled locally. Local rendering of the exact pinned
+upstream Helm templates was reported to produce seven image references, each bound to the
+selected digest through the existing repository/tag helper, without a template
+patch; no retrievable external rendering artifact is cited for that local exercise.
+Controlled tests cover mode propagation, four distinct output names,
+profile package/disk alignment, image binding, six-container node observations
+and site-network readiness before Cluster API. These checks alone do not
+establish real startup or tenant acceptance. Separately, a fresh complete E2E
+on `71b356f5899efb759571f0ea51781ead3f7c466a` passed on 2026-10-11: one
+29-output Run, matched upstream site/tenant inputs, two Ready ARM64 QCOW2 nodes,
+unchanged zero-retry workload/DNS and natural deletion plus joined owned cleanup.
+The [exact-revision evidence](../evidence/local-upstream-ovn-2026-10-11.md)
+retains the bindings, runtime checks and recording integrity. This is an
+unqualified local diagnostic, not live acceptance of later changes, a supported
+release combination, M2 or qualification. This option neither fixes nor
+validates the NVIDIA fork's open startup issue.
+
+Fresh profiles selections produce a native OCI image through the existing
+rootless BuildKit lane and pinned NKE profiles Dockerfile. A named build context
+selects the existing exact Alpine image digest instead of the Dockerfile's tag;
+the additive source overlay changes no upstream NKE files. ORAS transports the
+observed image to the local registry without changing its manifest. The consumer
+uses the chart's standard image init container and read-only shared volume,
+checking the exact image and successful init exit instead of injecting files
+into a Kind host directory. Local-only APT installation and uplink naming are
+explicit profile choices, not a general NKE offline boot contract.
 [Profile factory tests](../../pkg/nkd/factory/nke_laptop_profiles_test.go)
-cover additive patch authentication, compilation and modeled APT/uplink cases.
-[Consumer tests](../../internal/nkedemo/site_test.go) cover bundle-index
-preservation, owner rejection of corrupt bytes and volume-description checks;
-the source-chart rendering test is opt-in and skipped without its chart input.
-Neither suite alone proves actual registry transport, boot or deployment.
+cover additive patch authentication, native-image compilation, exact staging
+bytes and modeled APT/uplink cases. [Consumer tests](../../internal/nkedemo/site_test.go)
+reject substituted images, incomplete/failed init states and alternate volumes.
+The opt-in exact pinned source-chart rendering check and the following native
+exercises were reported locally; their private attempt paths are not a
+retrievable external acceptance record. An isolated
+native ARM64 rootless BuildKit test produced manifest
+`sha256:197fe058d0fbcff5d7841abfee58067aa05f7cdd21040642fe7e327096b574a0`.
+ORAS transport/readback, manifest retrieval from the Kind network and the image's
+init copy command passed with exact staged profile/runbook comparison. This is
+not by itself a completed NKD profiles Run or Kubernetes init-container observation.
+The retained 29-output attempt above subsequently observed `controller-profiles`
+as `kind: oci` with that exact manifest digest. Its site handoff and the actual
+`materialize-profiles` init container retained the matching image ID, `/profiles`
+path and pod UID; the init container exited zero with reason `Completed`.
+This exercises the changed producer/consumer, but its tenant readiness failure
+still leaves full E2E acceptance unverified.
+
+E2E now admits cached ARM64 Kind and registry images before installer acquisition
+or artifact builds. Deployment authenticates its owned registry's direct IPv4
+address on the admitted Kind network and probes `/v2/` from the actual management
+node before uploads. Scoped proxy bypass applies only to that private endpoint.
+Registry admission measures deduplicated image bytes, the largest serial upload
+and 64 MiB headroom against the same 2 GiB ceiling used by its ephemeral tmpfs.
+Tests cover the measured 1,122,458,894-byte closure, the exact ceiling and one
+byte over, blob-count bounds and the launch argument. This is a capacity
+correction, not fresh deployment or workload/DNS acceptance.
+Contract tests cover ownership, network/address substitutions and probe failures;
+the isolated native registry test exercised the direct route, but does not prove
+deployment across all supported host configurations. Network progress now groups
+private commands into preflight/setup/cleanup; expected absence probes no longer
+emit misleading failures.
+
+The local network owner now admits a single temporary Kind-to-simulator INPUT
+rule, scoped to the admitted Kind subnet, its exact gateway and TCP port 18089.
+Its version-2 journal records that optional gateway and the exact owner-commented
+rule before insertion; existing version-2 journals without this grant remain
+recoverable. Site admission probes health from the owned Kind node using its real
+proxy environment before installing the site. Host-side health alone cannot
+admit this route. Controlled tests cover bounded response checks, cancellation,
+private diagnostics, rule substitutions and recovery. Hosts with an INPUT-drop
+policy require this scoped route even when host-side health succeeds. A separate
+nftables/firewalld input-hook drop can still reject it; the owned-node probe,
+not an iptables accept alone, decides admission. The demo does not override that
+administrator policy; see the [operator firewall guidance](../local-nke-demo.md).
+Live acceptance of the new route remains unexercised.
+
+The demo CLI automatically selects a terminal dashboard for interactive standard
+input/output. Its phase map, observed state and bounded public activity use typed
+owner events, not log-derived authority; narrow terminals stack the panes. `--plain`,
+pipes and redirected output retain scrolling progress; `--verbose` builds use plain
+public-log streaming. Tab changes focus, PgUp/PgDn scroll activity and End returns
+to live activity. Tenant stage, count and closed condition changes add activity
+immediately; unchanged reported waits add a heartbeat at most once per 30 seconds.
+These reports do not prove successful API polls or guest progress. The tenant pane
+now prioritizes its blocker, four observed checkpoints, role-bound VM/console
+metadata, node counts and independently aged observations. Bounded polling joins
+the exact tenant Machine/NicoMachine pair to an owned libvirt domain before
+describing its state or console-file size. Only positive growth of the same
+file identity counts as activity; baseline, replacement and truncation do not. A closed
+role-bound `InstanceCreateFailed` report remains visible before a domain exists.
+Unknown bindings, states and reasons cannot advance readiness. No private console
+text, instance identifiers or provider messages are projected into public output.
+Controlled observer and simulation tests cover binding substitutions, unsafe
+files, unavailable observations, cancellation, privacy and 80×24 layout; this
+observer has not yet been exercised in a fresh live E2E. Fixed Packer summaries
+expose selected boot, transfer, provisioning and post-processing reports without
+copying variable paths or addresses. An opted-in, attempt-bound read-only observer
+now samples bounded OS build-log metadata into a separate private descriptor
+channel. The dashboard accepts it only for the exact reported running build
+operation and distinguishes sample age, aggregate bytes and same-file growth
+from execution health. Baselines, replacements, truncation and rejected entries
+do not establish activity. Names, console text and paths remain private; this is
+not a live console viewer, progress receipt or ETA. Controlled tests cover bounded
+frames, pipe backpressure, descriptor isolation, collector stop/join, unsafe file
+entries and compact layouts. An unjoined stop or attachment fails the build;
+bounded diagnostic collection is still attempted. Retention keeps the exact
+observer, its work volume, identity workspace and runtime executable/configuration.
+Cleanup still attempts independent containers and the input volume and closes
+completed staging descriptors. A joined observer's failed removal is retried by
+the final reaper; persistent cleanup failure rejects any collected artifact.
+Controlled native Linux race tests exercise these cases, not termination of
+kernel-blocked runtime launches or successful cleanup under every daemon failure.
+Fresh live build acceptance remains unexercised.
+While the dashboard owns input, q and Ctrl+C ask for confirmation;
+only y/Y requests cancellation. Escape closes details or dismisses confirmation,
+never canceling work. Plain/verbose output and the initial sudo prompt retain
+signal-driven cancellation without a dialog. Normal cancellation waits for owned
+work and cleanup before terminal restoration. During cancellation, f then y
+restores the terminal and exits 130 without joining cleanup; resources may remain
+and no success is claimed. The exit warning includes the configured workspace
+and actual executable as recovery guidance only; it does not prove admission,
+journal existence or producer ownership. Recovery requires the original journal
+and stopped owned producers and restores only recorded network controls. Renderer
+panic, output/input failure and a closed event stream restore the terminal before
+waiting for cleanup, while preserving the mandatory owner join and failure.
+Normal confirmed cancellation retains its cleanup screen.
+Plain guest summaries suppress unchanged
+snapshots and independently advancing ages.
+Failed deployment stops unfinished active panes without
+claiming that their individual checks failed. [CLI contracts](../../cmd/nke-demo/dashboard_test.go)
+and [simulation-screen tests](../../cmd/nke-demo/dashboard_view_test.go) exercise
+layout, bounded/sanitized snapshots, concurrent reports, cancellation joining and
+terminal failures. These are controlled presentation/race contracts, not a completed
+fresh E2E or live interruption acceptance for this candidate.
+
+The interactive Linux CLI authenticates before opening the
+dashboard or starting work, then refresh its existing sudo session using bounded
+non-interactive checks while that workflow runs. Deployment and independently
+bounded cleanup must not open password prompts. Redirected commands retain the
+cache-independent unattended check. No password is handled by the Go reader or
+diagnostic writer, no sudo policy is modified, and privileged operations are not
+replayed after failure. The initial prompt names its deadline and hidden password
+input. Failure diagnostics distinguish deadline expiry, cancellation and other
+authentication failures without asserting that a password was submitted or
+accepted. Controlled tests and targeted race checks cover authentication before
+work, periodic refresh failure, cancellation and refresher joining, including
+preservation of unjoined-child errors. Isolated Linux ARM64 PTY tests exercised
+foreground ownership/restoration, dashboard checks without suspension and actual
+same-terminal sudo validation/refresh. Validation/refresh wiring passed on a non-interactive
+sudo-policy host; it does not prove timestamp-cache use, a real password policy, hour-long credential
+retention or a complete fresh deployment with this change.
+Interactive refresh uses ordinary sudo timestamps rather than a helper-scoped
+credential: policy may allow other terminal-session processes to reuse it for
+their full sudoers command scope. The host policy is unchanged; this route
+requires a trusted execution host, not an untrusted launcher sandbox.
+
+The downstream tenant smoke now waits for the pinned CoreDNS Deployment and
+node-local DNS DaemonSet rollouts, within four minutes and the remaining tenant
+deadline. Node Ready alone does not establish DNS rollout readiness. The
+unchanged zero-retry workload still has to prove real cluster DNS and ARM64
+execution. The explicit Kind/Calico diagnostic additionally requires the tenant
+Calico node DaemonSet rollout before those DNS checks, within four minutes and
+the remaining tenant deadline. A deployment-only replay observed both nodes
+Ready and DNS rollouts passing while Calico was still unready; its unchanged
+smoke then failed on DNS timeout. The added CNI admission is not proof that the
+underlying datapath is fixed. Controlled failure/cancellation tests cover these
+gates. An owned-subprocess fixture exercises the actual tenant orchestration:
+CNI/DNS rollout failures and canceled waits prevent the single smoke submission.
+Kubeconfig, Ready-node, CNI and DNS waits retain their named stage and private
+diagnostic location; cancellation or a tenant deadline retains the timeout code
+at the public demo boundary. These fixtures do not start real guests or establish
+functional DNS. An author-reported local
+continuous invocation at `bda67f0` subsequently
+observed both ARM64 tenant nodes Ready, both DNS rollouts and the unchanged
+workload/DNS smoke passing, but exited 17 at `tenant-deletion-wait`. Its original
+recording remains failed, not a successful E2E video. The downstream three-minute
+deletion wait is shorter than the selected NKE teardown's worker/control-plane
+waits; the last actual teardown phase was not retained, so a timeout-budget
+mismatch does not by itself establish the runtime cause. Complete fresh E2E
+acceptance, including successful NKE deletion and owned cleanup, remains open.
+Cleanup now best-effort retains three bounded private command-output slots and
+the final command status in one exclusive private observation file. A canceled
+empty poll preserves the last useful inventory. Controlled tests show that
+storage failure neither prevents deletion nor changes its result, and no raw
+cleanup response reaches public progress. Tenant cleanup now has an explicit
+one-hour ceiling with a 45-minute disappearance wait, six-minute diagnostics,
+two-minute delete request and two-minute guest-route withdrawal. The subsequent
+owned host-runtime cleanup retains its independent eight-minute bound. This finite
+downstream policy gives room for the pinned worker-then-control-plane teardown;
+it is not an upstream maximum because retries and other activities can extend it.
+Controlled deadline tests cover timeout/cancellation and exact ownership. The
+later deployment-only replay naturally completed NKE deletion and owned cleanup
+with the longer budgets, while preserving its failed smoke result. This does
+not establish a fresh successful E2E; that acceptance remains unproven.
 
 [Ordinary adapter tests](../../internal/nkedemo) cover controlled ownership,
 journal, cleanup, artifact and tenant-description cases. Runner tests exercise
 bounded subprocess cancellation and joining; CLI tests exercise output-failure
-cancellation with controlled callbacks. These do not prove real SIGINT during
+cancellation with controlled callbacks. The live cluster projection now crosses
+the concise CLI filter as an owner-generated public result rather than subprocess
+log text. Composed `run`/`e2e` and dashboard tests cover immediate tables,
+activity eviction, historical post-terminal replay and later cleanup failure.
+Retained-owner progress carries the same owner-generated table through its
+existing authenticated private control as a single typed result, with unchanged
+32 KiB queue/envelope and sequence-gap refusal. Mixed payloads and oversized
+results fail before presentation. JSON-relay contracts and native retained
+launch fixtures cover typed/plain output and cursor/error behavior; their
+synthetic cluster answers are not fresh retained NKE runtime acceptance.
+Synthetic Kubernetes answers establish presentation wiring only, not fresh NKE
+cluster acceptance. DNS/DHCP port admission now invokes a
+fixed Go helper through the existing bounded sudo runner before recording host
+intent; executable admission precedes artifact inspection. Controlled tests
+cover fixed targets, rejected helper arguments, failures before journaling and
+child error propagation. This does not prove a fresh tenant deployment.
+Set-ID and replaceable-ancestor refusal run in the ordinary helper contracts.
+Foreign executable ownership requires the isolated Linux root fixture; the real
+TCP/UDP 53 and UDP 67 collision rows additionally require native ARM64 root.
+Ordinary hosted tests do not establish those privileged socket observations.
+These tests do not prove real SIGINT during
 NKE stages, privileged sudo/libvirt failure, runner/VM restart, or cancellation
 at every build/deployment phase. Network-only recovery uses version-2 journals
 and never kills serialized PIDs; restore legacy live controls before upgrading.

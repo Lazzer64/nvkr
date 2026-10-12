@@ -21,6 +21,13 @@ The launcher checks capabilities before downloading or creating an attempt.
 It does not install packages, start/resize VMs, prune caches or reset runtimes.
 Git authorization must work on the Linux execution host.
 
+Ordinary local fetch projects global `credential.helper`, `credential.username`
+and `credential.useHttpPath`, plus fetch-only HOME/XDG, SSH-agent and selected
+proxy/TLS-trust settings. System helpers, GH/GCM/DBus/keyring environment,
+arbitrary SSH commands and other global URL rewrites are not inherited.
+Use a compatible configured helper or an explicit local repository containing
+the pinned objects; checkout and status receive no developer helper or HOME.
+
 ### Apple Silicon Mac with Colima
 
 Follow [the quickstart's macOS setup](local-nke-demo.md#additional-macos-setup)
@@ -67,7 +74,7 @@ parallel producer jobs, and selection:
 | `all` | Combined demo artifact set: OS, components, site, tools, profiles and simulator |
 | `site` | Installer-aligned CLI, controller image/chart and NKTP chart |
 | `tools` | Source-built native installer-tools bundle |
-| `profiles` | Controller profile files in a data bundle |
+| `profiles` | Native OCI controller profiles image with configuration and runbooks |
 | `simulator` | NICoSim server, CLI and runtime-assets bundle |
 
 The complete demo builds `all` in one Run through `nke-demo e2e`, then deploys

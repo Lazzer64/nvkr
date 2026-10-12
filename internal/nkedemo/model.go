@@ -29,17 +29,25 @@ type RunInputs struct {
 // Out must be a new private directory outside sources and accepted attempts.
 // Timeout bounds tenant provisioning; cleanup has separate bounded contexts.
 type Config struct {
+	Cleanup     bool
+	Network     string
 	NKECheckout string
 	NKDCTL      string
-	Runs        RunInputs
-	Out         string
-	Timeout     time.Duration
-	Progress    io.Writer
+	// DemoExecutable is supplied by the CLI or native Go integration, never
+	// authored YAML or flags. Only its fixed privileged-port helper is invoked.
+	DemoExecutable string
+	Runs           RunInputs
+	Out            string
+	Timeout        time.Duration
+	Progress       io.Writer `json:"-"`
 }
 
 // BuildConfig selects the existing local launcher, which bootstraps and invokes
 // nkdctl. It does not introduce a second build engine or in-process SDK path.
 type BuildConfig struct {
+	// Network selects a closed authored artifact set for E2E. It does not
+	// substitute source pins or confer deployment/readiness authority.
+	Network       string
 	Repository    string
 	NKEClone      string
 	AttemptPrefix string

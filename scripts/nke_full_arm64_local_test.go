@@ -31,6 +31,46 @@ func linkLauncherTestTimeout(t *testing.T, tools string) {
 	}
 }
 
+func TestBuildNetworkSelectionFailsBeforeProducerWork(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"missing mode", []string{"--network"}, "Usage:"},
+		{"unknown mode", []string{"--network", "guessed", "--check", "all"}, "Build network must"},
+		{"Calico is not an artifact selection", []string{"--network", "kind-calico", "--check", "all"}, "Build network must"},
+		{"upstream subset", []string{"--network", "upstream-ovn", "--check", "profiles"}, "requires the complete all selection"},
+		{"upstream implicit subset", []string{"--network", "upstream-ovn", "fresh"}, "requires the complete all selection"},
+		{"private upstream subset", []string{"--prepare-only", "--network", "upstream-ovn", "fresh", "1", "os"}, "requires the complete all selection"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.Mkdir(filepath.Join(dir, "scripts"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			body, err := os.ReadFile("nke-full-arm64-local.sh")
+			if err != nil {
+				t.Fatal(err)
+			}
+			launcher := filepath.Join(dir, "scripts", "nke-full-arm64-local.sh")
+			if err := os.WriteFile(launcher, body, 0600); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "bash", append([]string{launcher}, tc.args...)...)
+			out, err := cmd.CombinedOutput()
+			if err == nil || !strings.Contains(string(out), tc.want) {
+				t.Fatalf("error=%v output=%s, want %s", err, out, tc.want)
+			}
+			if _, err := os.Stat(filepath.Join(dir, ".nkd")); !os.IsNotExist(err) {
+				t.Fatalf("rejected mode created attempt: %v", err)
+			}
+		})
+	}
+}
+
 func TestLocalDeveloperPreflight(t *testing.T) {
 	for _, tc := range []struct {
 		name, system, arch, runtime, lane, state, disk, daemon, want string
@@ -67,6 +107,9 @@ func TestLocalDeveloperPreflight(t *testing.T) {
 		{"OS diagnostics without cached Packer", "Linux", "aarch64", "docker", "os", "running", "100000", "ok", "Prerequisite diagnostics passed", false},
 		{"mutable bootstrap pin rejected", "Linux", "aarch64", "docker", "providers", "running", "100000", "ok", "admitted bootstrap image/platform/runtime", true},
 		{"foreign bootstrap platform rejected", "Linux", "aarch64", "docker", "providers", "running", "100000", "ok", "admitted bootstrap image/platform/runtime", true},
+		{"invalid Git count", "Linux", "aarch64", "docker", "providers", "running", "100000", "ok", "GIT_CONFIG_COUNT must", true},
+		{"overflowing Git count", "Linux", "aarch64", "docker", "providers", "running", "100000", "ok", "GIT_CONFIG_COUNT must", true},
+		{"no room for local clone redirects", "Linux", "aarch64", "docker", "providers", "running", "100000", "ok", "two free Git configuration entries", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -158,6 +201,14 @@ esac`,
 			if tc.name == "relative clone rejected" {
 				cmd.Env = append(cmd.Env, "NKE_LOCAL_CLONE=../nke")
 			}
+			switch tc.name {
+			case "invalid Git count":
+				cmd.Env = append(cmd.Env, "GIT_CONFIG_COUNT=not-a-count")
+			case "overflowing Git count":
+				cmd.Env = append(cmd.Env, "GIT_CONFIG_COUNT=999999999999999999999999999999")
+			case "no room for local clone redirects":
+				cmd.Env = append(cmd.Env, "GIT_CONFIG_COUNT=15", "NKE_LOCAL_CLONE=/must-not-be-inspected")
+			}
 			if strings.HasPrefix(tc.name, "Colima ") {
 				profile := "nkd-demo"
 				if tc.name == "Colima invalid profile" {
@@ -186,6 +237,11 @@ esac`,
 				t.Fatalf("check created attempt storage: %v", err)
 			}
 			calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
+			if strings.Contains(tc.name, "Git count") || tc.name == "no room for local clone redirects" {
+				if len(calls) != 0 {
+					t.Fatalf("invalid Git configuration reached host or producer work: %s", calls)
+				}
+			}
 			for _, forbidden := range []string{"pull ", "run ", "buildx build", "start --", "context use"} {
 				if strings.Contains(string(calls), forbidden) {
 					t.Fatalf("check performed mutation/producer work %q: %s", forbidden, calls)
@@ -430,6 +486,7 @@ esac
 func TestSimulatorLauncherUsesValidatedToolchainID(t *testing.T) {
 	const validated = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	const plan = `{"lifecycleOutputs":[{"name":"nicosim-tools-arm64","kind":"executable","components":["nico-sim"]}],"builds":[{"name":"nicosim-tools-arm64","catalogDigest":"catalog","components":["nico-sim"],"executionGraph":{"nodes":[{"id":"fetch","needs":[]},{"id":"build","needs":["fetch"]}]},"catalogSnapshot":{"Components":{"nico-sim":{"fromSource":true,"toolchainImages":{"arm64":"old"}}}}}]}`
+	const selectedGraph = `{"vertices":[{"key":"operation/build","kind":"operation","label":"build (build)","reference":"build","build":"nicosim-tools-arm64"},{"key":"artifact/tools","kind":"artifact","label":"tools (executable)","reference":"tools","build":"nicosim-tools-arm64"},{"key":"output/nicosim-tools-arm64","kind":"output","label":"nicosim-tools-arm64 (required executable)","reference":"tools","build":"nicosim-tools-arm64"},{"key":"route/private","kind":"route","label":"private-secret-ref","reference":"private-ref"},{"key":"producer/build","kind":"producer","label":"duplicate producer","reference":"build"}],"edges":[{"from":"operation/build","to":"artifact/tools","relation":"produces"},{"from":"artifact/tools","to":"output/nicosim-tools-arm64","relation":"fulfills slot"},{"from":"artifact/tools","to":"route/private","relation":"publication route"},{"from":"producer/build","to":"operation/build","relation":"instruction"}]}`
 	for _, tc := range []struct {
 		name, returned, buildExit string
 		wantError                 bool
@@ -445,6 +502,10 @@ func TestSimulatorLauncherUsesValidatedToolchainID(t *testing.T) {
 		{"shared image cannot be a tag", "local:latest", "99", true, true, validated, false},
 		{"shared image unavailable in runtime", validated, "99", true, true, "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", false},
 		{"graph failure prevents toolchain work", validated, "0", true, false, "", true},
+		{"selected graph failure prevents execution", validated, "0", true, false, "", false},
+		{"overlong display record omitted", validated, "0", false, false, "", false},
+		{"preserve OVN redirect with NKE clone", validated, "0", false, false, "", false},
+		{"private preparation excludes final execution", validated, "0", false, false, "", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -476,9 +537,25 @@ exit "$TEST_BUILD_EXIT"
 			write("tools/runner", []byte(`#!/bin/sh
 printf '%s\n' "$*" >>"$TEST_CALLS"
 case "$1 $2" in
-  'run plan') printf '%s\n' "$TEST_PLAN";;
-  'run graph') [ "$TEST_GRAPH_EXIT" = 0 ] || exit "$TEST_GRAPH_EXIT"; printf 'flowchart LR\n  fetch --> build\n';;
-  'run local') jq -e --arg id "$TEST_VALIDATED" '.toolchainSubstitutions[0].to == $id' "$TEST_REPO/.nkd/laptop-bootstrap/id-probe/toolchain-attempt.json";;
+  'run plan')
+    if [ "$4" = .nkd/laptop-bootstrap/id-probe/definition.json ]; then
+      jq -e '.outputs[0].catalog.overlays[-1] | endswith("/toolchain-attempt.json")' "$4" >/dev/null || exit 99
+      printf '%s\n' "$TEST_PLAN" | jq '. + {selected: true}'
+    else printf '%s\n' "$TEST_PLAN"; fi;;
+  'run graph')
+    [ "$TEST_GRAPH_EXIT" = 0 ] || exit "$TEST_GRAPH_EXIT"
+    if [ "$8" = json ]; then
+      [ "$TEST_SELECTED_GRAPH_EXIT" = 0 ] || exit "$TEST_SELECTED_GRAPH_EXIT"
+      jq -e '.selected == true' "$4" >/dev/null || exit 99
+      printf '%s\n' "$TEST_SELECTED_GRAPH"
+    else printf 'flowchart LR\n  fetch --> build\n'; fi;;
+  'run local')
+    jq -e --arg id "$TEST_VALIDATED" '.toolchainSubstitutions[0].to == $id' "$TEST_REPO/.nkd/laptop-bootstrap/id-probe/toolchain-attempt.json" || exit 99
+    if [ -n "${TEST_CAPTURE_REDIRECTS:-}" ]; then
+      printf '%s\n' "$GIT_CONFIG_COUNT" >"$TEST_CAPTURE_REDIRECTS"
+      git config --get-all url./local-ovn.git.insteadOf >>"$TEST_CAPTURE_REDIRECTS"
+      git config --get-all "url.$TEST_NKE_CLONE.insteadOf" >>"$TEST_CAPTURE_REDIRECTS"
+    fi;;
   *) exit 99;;
 esac
 `), 0700)
@@ -512,12 +589,38 @@ esac
 			if tc.graphFail {
 				graphExit = "42"
 			}
-			cmd := exec.CommandContext(ctx, "bash", filepath.Join(dir, "scripts/nke-full-arm64-local.sh"), "id-probe", "1", "simulator")
+			selectedGraphExit := "0"
+			if tc.name == "selected graph failure prevents execution" {
+				selectedGraphExit = "42"
+			}
+			displayGraph := selectedGraph
+			if tc.name == "overlong display record omitted" {
+				displayGraph = strings.Replace(displayGraph, "build (build)", strings.Repeat("x", 513), 1)
+			}
+			args := []string{filepath.Join(dir, "scripts/nke-full-arm64-local.sh"), "id-probe", "1", "simulator"}
+			if tc.name == "private preparation excludes final execution" {
+				args = append(args[:1], append([]string{"--prepare-only"}, args[1:]...)...)
+			}
+			cmd := exec.CommandContext(ctx, "bash", args...)
 			cmd.Env = append(os.Environ(), "PATH="+filepath.Join(dir, "tools")+string(os.PathListSeparator)+os.Getenv("PATH"),
 				"CONTAINER_RUNTIME=docker", "NKE_LOCAL_CLONE=", "DOCKER_HOST=", "DOCKER_CONTEXT=", "COLIMA_PROFILE=",
 				"TEST_REPO="+dir, "TEST_PLAN="+plan, "TEST_RETURNED="+tc.returned, "TEST_BUILD_EXIT="+tc.buildExit,
 				"TEST_VALIDATED="+validated, "TEST_CALLS="+filepath.Join(dir, "calls"), "NKD_LOCAL_BOOTSTRAP="+shared, "TEST_INSPECTED="+tc.inspected,
-				"NKE_SOURCE_TOKEN=command-log-environment-sentinel", "TEST_GRAPH_EXIT="+graphExit)
+				"NKE_SOURCE_TOKEN=command-log-environment-sentinel", "TEST_GRAPH_EXIT="+graphExit, "TEST_SELECTED_GRAPH="+displayGraph, "TEST_SELECTED_GRAPH_EXIT="+selectedGraphExit)
+			if tc.name == "preserve OVN redirect with NKE clone" {
+				clone := filepath.Join(dir, "nke-clone")
+				init := exec.CommandContext(ctx, "git", "init", "--quiet", clone)
+				if output, err := init.CombinedOutput(); err != nil {
+					t.Fatalf("prepare local Git fixture: %v %s", err, output)
+				}
+				clone, err := filepath.EvalSymlinks(clone)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cmd.Env = append(cmd.Env, "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=url./local-ovn.git.insteadOf",
+					"GIT_CONFIG_VALUE_0=https://github.com/dsx-ai-factory/ovn-kubernetes.git", "NKE_LOCAL_CLONE="+clone,
+					"TEST_NKE_CLONE="+clone, "TEST_CAPTURE_REDIRECTS="+filepath.Join(dir, "redirects"))
+			}
 			var stdout, stderr bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &stdout, &stderr
 			err := cmd.Run()
@@ -526,6 +629,13 @@ esac
 			}
 			if strings.Contains(stdout.String(), "nkdctl command:") {
 				t.Fatal("command logging contaminated stdout")
+			}
+			if tc.name == "preserve OVN redirect with NKE clone" {
+				redirects, err := os.ReadFile(filepath.Join(dir, "redirects"))
+				const want = "3\nhttps://github.com/dsx-ai-factory/ovn-kubernetes.git\nhttps://github.com/dsx-ai-factory/nke.git\nhttps://github.com/dsx-ai-factory/nke\n"
+				if err != nil || string(redirects) != want {
+					t.Fatalf("Git did not observe preserved OVN and appended NKE redirects: %v %q", err, redirects)
+				}
 			}
 			if strings.Contains(stdout.String()+stderr.String(), "command-log-environment-sentinel") {
 				t.Fatal("command logging exposed an environment value")
@@ -568,9 +678,36 @@ esac
 					invoked = append(invoked, "nkdctl command: "+runner+" "+line)
 				}
 			}
-			wantCount := 4 // Baseline Plan, complete graph, dry-run preview, and final exec.
+			wantCount := 6 // Baseline and selected Plans/graphs, dry-run preview, and final exec.
+			if tc.name == "private preparation excludes final execution" {
+				wantCount = 5
+				path := filepath.Join(dir, ".nkd/laptop-bootstrap/id-probe/build-invocation.json")
+				info, err := os.Lstat(path)
+				if err != nil || info.Mode().Perm() != 0600 {
+					t.Fatalf("not private invocation: %v", err)
+				}
+				raw, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var args []string
+				if err := json.Unmarshal(raw, &args); err != nil || len(args) != 17 || args[0] != ".nkd/laptop-bootstrap/id-probe/nkdctl" || args[8] != "id-probe" || args[14] != "1" || args[16] != "docker" {
+					t.Fatalf("bad private invocation: %v %q", err, raw)
+				}
+				for _, arg := range args {
+					if strings.Contains(arg, "build-activity") {
+						t.Fatal("bootstrap adopted activity descriptor")
+					}
+				}
+				if strings.Contains(string(calls), "--attempt id-probe --attempts-root") {
+					t.Fatal("prepare-only executed final Run")
+				}
+			}
 			if tc.wantError {
 				wantCount = 2 // Graph or toolchain rejection prevents execution.
+			}
+			if selectedGraphExit != "0" {
+				wantCount = 4 // Selected graph rejection prevents preview and execution.
 			}
 			if len(logged) != wantCount || !slices.Equal(logged, invoked) {
 				t.Fatalf("logged commands=%q, executed commands=%q; want %d", logged, invoked, wantCount)
@@ -589,6 +726,40 @@ esac
 			}
 			if reached := strings.Contains(string(calls), "run local"); reached == tc.wantError {
 				t.Fatalf("local execution reached=%t; want %t: %s", reached, !tc.wantError, calls)
+			}
+			if !tc.wantError {
+				graph, err := os.ReadFile(filepath.Join(dir, ".nkd/laptop-bootstrap/id-probe/graph.json"))
+				if err != nil || string(graph) != displayGraph+"\n" {
+					t.Fatalf("selected owner graph was not preserved: %v %s", err, graph)
+				}
+				selected := "run plan --definition .nkd/laptop-bootstrap/id-probe/definition.json"
+				if strings.Index(string(calls), selected) < strings.Index(string(calls), "toolchain-build") ||
+					!strings.Contains(string(calls), "run graph --plan .nkd/laptop-bootstrap/id-probe/selected-plan.json --view complete --format json") {
+					t.Fatalf("selected graph did not follow toolchain substitution: %s", calls)
+				}
+				requiredRecords := []string{
+					`Build display: {"vertices":3,"edges":2,"truncated":false}`,
+					`Build vertex: {"key":"operation/build","kind":"operation","label":"build (build)","reference":"build","build":"nicosim-tools-arm64"}`,
+					`Build edge: {"from":"artifact/tools","to":"output/nicosim-tools-arm64","relation":"fulfills slot"}`,
+				}
+				if tc.name == "overlong display record omitted" {
+					requiredRecords = []string{`Build display: {"vertices":2,"edges":1,"truncated":true}`, requiredRecords[2]}
+					if strings.Contains(stderr.String(), `"key":"operation/build"`) || strings.Contains(stderr.String(), `"from":"operation/build"`) {
+						t.Fatal("display kept an oversized record or its dangling edge")
+					}
+				}
+				for _, required := range requiredRecords {
+					if !strings.Contains(stderr.String(), required) {
+						t.Fatalf("missing selected graph display record %q: %s", required, &stderr)
+					}
+				}
+				if strings.Index(stderr.String(), "Build display:") < strings.LastIndex(stderr.String(), "Build edge:") ||
+					strings.Index(stderr.String(), "Build display:") < strings.LastIndex(stderr.String(), "Build vertex:") {
+					t.Fatal("display completion metadata preceded graph records")
+				}
+				if strings.Contains(stderr.String(), "private-secret-ref") || strings.Contains(stderr.String(), "producer/build") {
+					t.Fatal("display leaked excluded route or duplicated producer records")
+				}
 			}
 		})
 	}

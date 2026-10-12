@@ -16,10 +16,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/NVIDIA/nke-recipes/internal/buildactivity"
 	"github.com/NVIDIA/nke-recipes/internal/ownedcmd"
 	"github.com/NVIDIA/nke-recipes/internal/securepath"
+	"github.com/NVIDIA/nke-recipes/internal/sourcegit"
+	nkderrors "github.com/NVIDIA/nke-recipes/pkg/nkd/errors"
 	"golang.org/x/sys/unix"
 )
 
@@ -64,6 +68,40 @@ type Runner struct {
 	// Only the artifact launcher opts into streaming public build output. Other
 	// commands keep potentially sensitive deployment diagnostics private.
 	output io.Writer
+	// Opted in only for the directly executed final nkdctl local Run. Bootstrap
+	// shells and every source/utility command receive no inherited activity FD.
+	buildActivity bool
+	directory     string // Command cwd, independent of private diagnostic storage.
+}
+
+// SudoAuthorizer is an optional terminal bridge on a downstream progress writer.
+// A nil callback selects unattended execution. Authentication is not durable
+// authorization: each protected command still executes through sudo policy.
+// The presenter owns terminal admission, the bounded prompt and child joining;
+// this package never receives, stores or logs a password.
+type SudoAuthorizer interface {
+	SudoAuthentication() func(context.Context) error
+}
+
+func (r Runner) sudoAuthentication() func(context.Context) error {
+	if presenter, ok := r.Progress.(SudoAuthorizer); ok {
+		return presenter.SudoAuthentication()
+	}
+	return nil
+}
+
+func (r Runner) authenticateSudo(ctx context.Context) (bool, error) {
+	if err := requireContext(ctx); err != nil {
+		return false, err
+	}
+	authenticate := r.sudoAuthentication()
+	if authenticate == nil {
+		return false, nil
+	}
+	if err := authenticate(ctx); err != nil {
+		return true, err
+	}
+	return true, requireContext(ctx)
 }
 
 type boundedDiagnostic struct {
@@ -130,6 +168,11 @@ type OwnedProcess struct {
 	groupProbe  func(int) (bool, error)
 	groupSignal func(int, unix.Signal) error
 	progress    *progressBoundary
+
+	processWriter   io.Writer
+	processExitOnce sync.Once
+	activity        *buildactivity.Receiver
+	localGitFetch   bool
 }
 
 func (p *OwnedProcess) PID() int { return p.cmd.Process.Pid }
@@ -138,6 +181,7 @@ func (p *OwnedProcess) PID() int { return p.cmd.Process.Pid }
 func (p *OwnedProcess) Exited() (bool, error) {
 	select {
 	case <-p.done:
+		p.observeProcessExit()
 		p.mu.Lock()
 		err := errors.Join(p.waitErr, p.joinErr)
 		p.mu.Unlock()
@@ -147,6 +191,26 @@ func (p *OwnedProcess) Exited() (bool, error) {
 		return true, err
 	default:
 		return false, nil
+	}
+}
+
+// Observe only a joined owner from the calling lifecycle, never the Wait
+// goroutine. An unobserved exit does not prove the process is still alive.
+func (p *OwnedProcess) observeProcessExit() {
+	if p.processWriter == nil {
+		return
+	}
+	select {
+	case <-p.done:
+		p.mu.Lock()
+		joined := p.joinErr == nil
+		p.mu.Unlock()
+		if joined {
+			p.processExitOnce.Do(func() {
+				reportProgress(p.processWriter, ProgressEvent{Kind: ProcessExited, Name: p.phase, Status: "exited"})
+			})
+		}
+	default:
 	}
 }
 
@@ -201,6 +265,14 @@ func (p *OwnedProcess) finish() {
 	if joinErr != nil {
 		joinErr = fmt.Errorf("%w: %s: %w", ErrUnjoined, p.phase, joinErr)
 	}
+	if p.activity != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		activityErr := p.activity.Close(ctx)
+		cancel()
+		if activityErr != nil {
+			joinErr = errors.Join(joinErr, fmt.Errorf("%w: build activity reader: %w", ErrUnjoined, activityErr))
+		}
+	}
 	if p.log != nil {
 		_ = p.log.Close()
 	}
@@ -213,11 +285,66 @@ func (p *OwnedProcess) finish() {
 	close(p.done)
 }
 
+func (p *OwnedProcess) waitOwned(ctx context.Context) error {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		p.reportBuildActivity()
+		select {
+		case <-p.done:
+			p.reportBuildActivity()
+			return nil
+		case <-ticker.C:
+			continue
+		case <-ctx.Done():
+			// Kernel-blocked work can survive KILL. Preserve the unsafe owner state
+			// rather than blocking forever or releasing dependent controls.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
+			defer cancel()
+			return errors.Join(p.Stop(cleanupCtx), ctx.Err())
+		}
+	}
+}
+
+func (p *OwnedProcess) reportBuildActivity() {
+	for _, record := range p.activity.Drain() {
+		reportProgress(p.processWriter, ProgressEvent{Kind: OSBuildLogs, BuildLogs: record})
+	}
+}
+
+// RunAuthenticationCommand reuses the downstream process owner while retaining
+// the caller's direct terminal streams. It never captures or logs authentication
+// input/output. The presenter admits the terminal and supplies a bounded context.
+func RunAuthenticationCommand(ctx context.Context, cmd *exec.Cmd) error {
+	if err := requireContext(ctx); err != nil {
+		return err
+	}
+	if _, bounded := ctx.Deadline(); !bounded || cmd == nil || cmd.Path == "" || cmd.Cancel == nil {
+		return errors.New("authentication requires a bounded context and CommandContext command")
+	}
+	if err := ownedcmd.ConfigureCancellation(cmd, ownedcmd.DefaultTerminationGrace); err != nil {
+		return err
+	}
+	p := &OwnedProcess{cmd: cmd, phase: "sudo-authentication", done: make(chan struct{}), groupProbe: groupAlive, groupSignal: signalGroup}
+	if err := cmd.Start(); err != nil {
+		return errors.Join(err, ctx.Err())
+	}
+	go p.finish()
+	if err := p.waitOwned(ctx); errors.Is(err, ErrUnjoined) {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return errors.Join(p.waitErr, p.joinErr, ctx.Err())
+}
+
 // Stop sends TERM to the exact live group, then escalates to KILL and joins.
 // A canceled caller is not permission to release dependent controls.
 func (p *OwnedProcess) Stop(ctx context.Context) (result error) {
 	var observedExit error
 	defer func() {
+		p.reportBuildActivity()
+		p.observeProcessExit()
 		if p.progress != nil {
 			p.progress.finish(errors.Join(result, observedExit))
 		}
@@ -225,39 +352,74 @@ func (p *OwnedProcess) Stop(ctx context.Context) (result error) {
 	if ctx == nil {
 		return fmt.Errorf("%w: stop requires a context", ErrUnjoined)
 	}
-	select {
-	case <-p.done:
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		// Cleanup succeeds when the group joined, but a child that failed
-		// before this stop request must not become successful presentation.
-		observedExit = p.waitErr
-		return p.joinErr
-	default:
+	var requestedTerm, requestedKill bool
+	joined := func() (bool, error) {
+		select {
+		case <-p.done:
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			// Preserve failures that preceded Stop or exited normally with a
+			// failure code. Only a matching, successfully requested stop signal
+			// is expected cleanup, and this never changes the recorded waitErr.
+			observedExit = p.waitErr
+			if exit, ok := p.waitErr.(*exec.ExitError); ok && exit.ProcessState != nil {
+				if status, ok := exit.Sys().(syscall.WaitStatus); ok && status.Signaled() &&
+					(requestedTerm && status.Signal() == syscall.SIGTERM || requestedKill && status.Signal() == syscall.SIGKILL) {
+					observedExit = nil
+				}
+			}
+			return true, p.joinErr
+		default:
+			return false, nil
+		}
+	}
+	if complete, err := joined(); complete {
+		return err
+	}
+	signalFailure := func(signalErr error, killed bool) error {
+		waitCtx := ctx
+		if killed {
+			// Escalation already permits a finite join grace after the caller's
+			// cancellation. A late signal error must use that same ownership grace.
+			waitCtx = context.WithoutCancel(ctx)
+		}
+		waitCtx, cancel := context.WithTimeout(waitCtx, 5*time.Second)
+		defer cancel()
+		// Darwin can return EPERM for an exited, unreaped group. Neither that
+		// error nor a leader exit proves descendants joined. Only the sole
+		// finalizer's completed disappearance check can supersede the error.
+		select {
+		case <-p.done:
+		case <-waitCtx.Done():
+		}
+		if complete, joinErr := joined(); complete {
+			return joinErr
+		}
+		return fmt.Errorf("%w: %w", ErrUnjoined, signalErr)
 	}
 	if err := p.groupSignal(p.PID(), unix.SIGTERM); err != nil {
-		return fmt.Errorf("%w: %w", ErrUnjoined, err)
+		return signalFailure(err, false)
 	}
+	requestedTerm = true
 	timer := time.NewTimer(40 * time.Second)
 	defer timer.Stop()
 	select {
 	case <-p.done:
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return p.joinErr
+		_, joinErr := joined()
+		return joinErr
 	case <-ctx.Done():
 	case <-timer.C:
 	}
 	if err := p.groupSignal(p.PID(), unix.SIGKILL); err != nil {
-		return fmt.Errorf("%w: %w", ErrUnjoined, err)
+		return signalFailure(err, true)
 	}
+	requestedKill = true
 	grace := time.NewTimer(5 * time.Second)
 	defer grace.Stop()
 	select {
 	case <-p.done:
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return p.joinErr
+		_, joinErr := joined()
+		return joinErr
 	case <-grace.C:
 		return fmt.Errorf("%w: %s did not finish after KILL", ErrUnjoined, p.phase)
 	}
@@ -323,11 +485,42 @@ func (r Runner) start(ctx context.Context, args []string, phase string, capture,
 	}
 	cmd := exec.CommandContext(commandCtx, path, args[1:]...)
 	cmd.Env = append([]string{}, r.Env...)
+	localGitFetch := false
+	if args[0] == "git" {
+		// Admit the same effective directory Git will execute in. Diagnostic
+		// storage and command cwd are independent, and a relative -C is relative
+		// to command cwd, not this process's cwd.
+		directory := r.Work
+		if r.directory != "" {
+			directory = r.directory
+		}
+		dir, directoryErr := filepath.Abs(directory)
+		if directoryErr != nil {
+			return nil, &CommandError{Phase: phase, ExitCode: -1, Cause: directoryErr}
+		}
+		gitArgs := args[1:]
+		if len(gitArgs) >= 2 && gitArgs[0] == "-C" {
+			if filepath.IsAbs(gitArgs[1]) {
+				dir = gitArgs[1]
+			} else {
+				dir = filepath.Join(dir, gitArgs[1])
+			}
+			gitArgs = gitArgs[2:]
+		}
+		cmd, err = sourcegit.LocalCommand(commandCtx, r.Env, dir, gitArgs...)
+		if err != nil {
+			return nil, &CommandError{Phase: phase, ExitCode: -1, Cause: err}
+		}
+		localGitFetch = gitArgs[0] == "fetch"
+	}
 	cmd.Dir = r.Work
+	if r.directory != "" {
+		cmd.Dir = r.directory
+	}
 	if err := ownedcmd.ConfigureCancellation(cmd, ownedcmd.DefaultTerminationGrace); err != nil {
 		return nil, err
 	}
-	p := &OwnedProcess{cmd: cmd, phase: phase, done: make(chan struct{}), groupProbe: groupAlive, groupSignal: signalGroup}
+	p := &OwnedProcess{cmd: cmd, phase: phase, done: make(chan struct{}), groupProbe: groupAlive, groupSignal: signalGroup, localGitFetch: localGitFetch}
 	if r.Work != "" {
 		p.logDir, _, err = securepath.OpenDirectory(r.Work)
 		if err != nil {
@@ -356,6 +549,7 @@ func (r Runner) start(ctx context.Context, args []string, phase string, capture,
 		sink = p.diagnostic
 	}
 	if r.output != nil {
+		p.processWriter = r.Progress
 		if sink == nil {
 			sink = r.output
 		} else {
@@ -374,11 +568,48 @@ func (r Runner) start(ctx context.Context, args []string, phase string, capture,
 	if r.Progress != nil {
 		_, _ = fmt.Fprintf(r.Progress, "Demo phase: %s\n", phase)
 	}
+	var activityWriter *os.File
+	if r.buildActivity {
+		p.processWriter = r.Progress
+		reader, writer, pipeErr := os.Pipe()
+		if pipeErr != nil {
+			if p.log != nil {
+				_ = p.log.Close()
+			}
+			if p.logDir != nil {
+				_ = p.logDir.Close()
+			}
+			return nil, &CommandError{Phase: phase, ExitCode: -1, Cause: pipeErr}
+		}
+		p.activity, err = buildactivity.NewReceiver(ctx, reader)
+		if err != nil {
+			_ = reader.Close()
+			_ = writer.Close()
+			if p.log != nil {
+				_ = p.log.Close()
+			}
+			if p.logDir != nil {
+				_ = p.logDir.Close()
+			}
+			return nil, &CommandError{Phase: phase, ExitCode: -1, Cause: err}
+		}
+		activityWriter = writer
+		cmd.ExtraFiles = []*os.File{writer}
+		cmd.Args = append(cmd.Args, "--build-activity-fd", "3")
+	}
 	err = requireContext(ctx)
 	if err == nil {
 		err = cmd.Start()
 	}
+	if activityWriter != nil {
+		_ = activityWriter.Close()
+	}
 	if err != nil {
+		if p.activity != nil {
+			closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			err = errors.Join(err, p.activity.Close(closeCtx))
+			cancel()
+		}
 		if p.log != nil {
 			_ = p.log.Close()
 		}
@@ -387,6 +618,7 @@ func (r Runner) start(ctx context.Context, args []string, phase string, capture,
 		}
 		return nil, &CommandError{Phase: phase, ExitCode: -1, Cause: err}
 	}
+	reportProgress(p.processWriter, ProgressEvent{Kind: ProcessStarted, Name: phase, Status: "started"})
 	go p.finish()
 	return p, nil
 }
@@ -427,20 +659,11 @@ func (r Runner) execute(ctx context.Context, args []string, phase string, timeou
 	if err != nil {
 		return nil, err
 	}
-	select {
-	case <-p.done:
-	case <-ctx.Done():
-		// A child blocked in the kernel can outlive SIGKILL. Bound our join,
-		// report ErrUnjoined, and retain its dependent controls instead of
-		// waiting indefinitely or claiming the command has stopped.
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
-		joinErr := p.Stop(cleanupCtx)
-		cleanupCancel()
-		if joinErr != nil {
-			raw, diagnosticErr := p.stdout.result()
-			return raw, errors.Join(joinErr, ctx.Err(), diagnosticErr)
-		}
+	if err := p.waitOwned(ctx); errors.Is(err, ErrUnjoined) {
+		raw, diagnosticErr := p.stdout.result()
+		return raw, errors.Join(err, diagnosticErr)
 	}
+	p.observeProcessExit()
 	raw, outErr := p.stdout.result()
 	_, stderrErr := p.stderr.result()
 	if p.diagnostic != nil {
@@ -458,6 +681,9 @@ func (r Runner) execute(ctx context.Context, args []string, phase string, timeou
 		var exit *exec.ExitError
 		if outErr == nil && stderrErr == nil && errors.As(waitErr, &exit) {
 			code = exit.ExitCode()
+		}
+		if p.localGitFetch && waitErr != nil && ctx.Err() == nil {
+			err = nkderrors.Wrap(nkderrors.CodeFetchFailed, err, "local source Git fetch failed; %s", sourcegit.LocalCredentialPolicy)
 		}
 		return raw, &CommandError{Phase: phase, ExitCode: code, Cause: err}
 	}
