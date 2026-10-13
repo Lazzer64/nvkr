@@ -199,7 +199,8 @@ inside the producer deadline, uses the same guarded Docker device projection, an
 Published native Packer pins remain required. The strict disk-evidence mode additionally requires the full
 inspector image and measured executable pins. Explicit candidate `diskEvidence: build-provenance-v1` omits inspector
 preparation and execution; it authenticates live producer/material evidence under ADR-13/20 instead.
-This is the M2 producer-provenance scope; full inspection and material reconciliation belong to M3 (ADR-13 §6).
+This is the M2 and M3 MVP producer-provenance scope; full inspection and material reconciliation remain
+deferred hardening (ADR-13 §6).
 The ARC group sums only executed material-producer budgets, applying the selected VM class ceiling to its
 root producer. Synthetic SBOM/package nodes do not each add an adapter-default hour. One shared adapter-default
 hour covers public toolchain pulls (each bounded to fifteen minutes), terminal observation,
@@ -707,6 +708,21 @@ with vendored inputs. The renderer must reject guards it cannot express, includi
 family or credentials in build phases. These are testable contracts; current rendering is not proof that a
 provider or protected environment has exercised them.
 
+The M3 qualification contract admits only the exact successful originating build from the intended repository
+and default branch. Source Run, attempt, commit, workflow identity, Definition, Environment and Plan bindings
+are authenticated separately from the qualification invocation. A manually dispatched qualification workflow
+does not itself prove that its source build succeeded or came from the approved branch. The M2 validation-branch
+exception cannot authorize qualification. Any later workflow adapter must reject unrelated or unsuccessful
+Runs before downloading executable subjects or requesting qualification signing credentials.
+
+Delivered-tool smoke execution receives the exact authenticated payloads, has networking disabled and has no
+qualification OIDC or attachment authority. The qualification publisher consumes authenticated results only
+after the complete required set passes, and uses a committed workflow identity distinct from the build
+workflow. Missing required smoke or external-suite results fail closed; declared suites outside MVP scope are
+reported as not evaluated. Source/build authentication and all verdict collection precede signing. A signing
+or attachment failure can leave earlier attachments but never produces successful qualification. ADR-16 owns
+the evidence and publication contract; reconciliation separately records implementation and hosted acceptance.
+
 The v1 scheduler may group consecutive offline observation, SBOM and packaging nodes with identical runner,
 container and platform into one bounded job. Every logical node retains its exact execution command and
 container isolation; fetch, build, publication and signing remain separate jobs. Internal dependencies use the
@@ -787,8 +803,10 @@ With `publication.mode: per-output-v1`, the compiler emits independent output pu
 metadata-only aggregate operation (ADR-20 §6). Output publication packages cannot be grouped with other
 utility nodes, so grouping cannot recreate an all-output payload download. Offline packaging receives only
 the public GitHub workflow/run identity variables, never registry, source or OIDC credentials. Each output's
-verification exports a bounded metadata carrier. The finalizer downloads only the aggregate metadata,
-published reference, signing record, predicate, verification record and pinned cosign tool. Provider-result
+verification exports a bounded metadata carrier. The finalizer downloads the aggregate metadata,
+published reference, signing record, predicate, verification record and pinned cosign tool. For the complete
+qualification handoff it also restores each output's original publication reference, signing record and
+predicate; these bounded metadata carriers do not download output payloads. Provider-result
 admission still covers every stage and bootstrap job; any failed, skipped or missing required job prevents
 completion. Assembly and finalization have registry-read permission and no OIDC minting or package-write
 permission. All credentials and signing remain outside ARC producer jobs.
