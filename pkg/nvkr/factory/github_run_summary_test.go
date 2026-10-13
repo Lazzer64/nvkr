@@ -16,6 +16,7 @@ import (
 
 	e "github.com/dsx-ai-factory/nvkr/pkg/nvkr/errors"
 	"github.com/dsx-ai-factory/nvkr/pkg/nvkr/pipeline"
+	yamlv3 "go.yaml.in/yaml/v3"
 )
 
 func TestGitHubRunSummariesHaveTwoOwners(t *testing.T) {
@@ -140,8 +141,26 @@ func TestGitHubRunRenderedSummaryResults(t *testing.T) {
 				t.Fatal(err)
 			}
 			raw := bundle.Files[GitHubWorkflowPath]
-			if PerOutputPublication(plan) && !bytes.Contains(raw, []byte("*nvkr_")) {
-				t.Fatal("publication fixture does not exercise compact workflow decoding")
+			if PerOutputPublication(plan) {
+				var tree yamlv3.Node
+				if err := yamlv3.Unmarshal(raw, &tree); err != nil {
+					t.Fatal(err)
+				}
+				var hasAlias func(*yamlv3.Node) bool
+				hasAlias = func(node *yamlv3.Node) bool {
+					if node.Kind == yamlv3.AliasNode {
+						return true
+					}
+					for _, child := range node.Content {
+						if hasAlias(child) {
+							return true
+						}
+					}
+					return false
+				}
+				if !hasAlias(&tree) {
+					t.Fatal("publication fixture does not exercise compact workflow decoding")
+				}
 			}
 			workflow := decodeGitHubWorkflow(t, raw)
 			finalizer := workflow.Jobs["nvkr-lifecycle-run"]
