@@ -258,7 +258,7 @@ that remains outstanding after merge.
 | 18 Execution and GitHub | Shared local/hosted producer launcher, held source/vendor lifetime, capability admission, manual-only GitHub generation, exact optional publication-branch allowlist, separate full-development branch workflow, mode-specific concurrency and artifact retention, scoped credentials and unconditional finalization; at most two optional summaries per attempt with operation details in logs; explicit native ARC disk grouping, raw build-only disk transport and optional native hosted platform maps (including separate CLI output slots); authenticated independent qualification invocation/source-event binding; generated fixed native worker and qualifier with separate credentials | Maintained candidate qualification is configured for post-merge acceptance; a fresh complete exact-attempt handoff and hosted/independent-consumer evidence remain unproved. Default-branch push publication and in-repository PR build triggers remain deferred; arbitrary self-hosted/other-provider routes and qualified emitters fail closed. Provider configuration and fresh runtime evidence remain separate |
 | 19 Downstream boundary | Exact required/observed output membership, component evidence joins and noncircular release-content identity | Downstream owners supply topology, placement, provisioning and runtime qualification; historical topology records grant no current authority |
 | 20 Publication | Digest-selected sibling repositories, signed evidence membership, native OCI/Docker subjects, aggregate runnable OCI indexes with exact native-child evidence, bounded metadata navigation and per-output assembly/finalization; candidate M2 hosted signing/publication completed; public-bootstrap FDE build-provenance publication supported; development attempt namespaces and scoped GHCR cleanup | Main-only Plan execution, independent M2 full-payload disk consumption, strict full-content publication and object-store/CDN transports remain unproved or unavailable; registration is deferred |
-| 21 Generation | Exact recorded input selection, independent fixed production/development layouts, manifest-last ownership, deterministic checks/retirement, canonical Plan inspection, linked graphs, semantic diffs, atomic pin maintenance plus regeneration and review patch workflows; separately owned qualification pair and runtime policy drift admission | Qualification generation does not make both owner writes one atomic transaction. Automatic PR publication and scheduled/private-source service acceptance are unexercised; lock and generated files are separate transactions; complete crash matrix remains |
+| 21 Generation | Exact recorded input selection, independent fixed production/development layouts, manifest-owned semantic action interfaces and Plan-derived invocation data with expanded-step validation, manifest-last ownership, deterministic checks/retirement, canonical Plan inspection, linked graphs, semantic diffs, atomic pin maintenance plus regeneration and review patch workflows; separately owned qualification pair and runtime policy drift admission | Latest stable-workflow, semantic-interface and controlled-transfer regressions are unrun; semantic-action hosted execution, automatic PR publication and scheduled/private-source service acceptance are unexercised. Producer matrices and general callable workflows remain deferred. Qualification generation does not make both owner writes one atomic transaction; lock and generated files are separate transactions; complete crash matrix remains |
 | 22 Pins | Catalog v3/lock v1, per-module tags, source/artifact/action/tool pin maintenance, no-op/check/CAS semantics, derived pin sets, same-release maintenance groups, whole-producer overlays, exact toolchain substitutions and authored embedded-version metadata authentication | Pin-set loading needs pinned Git access. Curated graph/SBOM edges remain deferred. Optional metadata consistency is not disk-content inspection, external acquisition or production acceptance |
 
 ## Feature-branch pipeline development
@@ -960,9 +960,33 @@ NKD wrapped execution, publication, native AMD64 runtime, fleet profile validity
 [Registry browsing of the recorded candidate](https://github.com/dsx-ai-factory/nvkr/blob/a187d6b702cbc1a70452760c606c2c4de1ed6618/docs/evidence/2026-10-06-team-demo-pipeline.md#metadata-browsing-validation)
 retains the external scope and binary identity.
 
-The generator/validator/writer enforce a 500,000-byte workflow limit. YAML compaction must preserve expanded
-semantics; oversized bundles fail before writes. Native offline disk preparation shares the ARC group to
-avoid restoring its full material closure on publication runners. Consumed carrier deletion reduces duplicate
+The generator/validator/writer enforce a 500,000-byte workflow limit. The top-level workflow retains named
+jobs, exact dependencies, runner and credential policy, native preflight and checkout. Manifest-owned local
+composite actions expose fixed semantic interfaces for execution, input/image preparation, output collection
+and carrier transfer. Grouped jobs reuse the node interface; declared optional slots and further individual
+upload calls preserve output counts and order without cardinality-specific or numbered variant actions.
+One canonical `action-data.json` member holds named operation parameters. The runtime descriptor admits the
+Plan and recomputes the selected values; templates retain fixed commands and pinned actions without
+accepting executable script data.
+Operator setup and timed producer execution stay inline. Controlled upload/download wrappers contain one pinned transport step,
+with conditions, timeouts and continue-on-error on their callers. Steps with referenced outcomes/outputs
+remain inline, including finalization and the final Run upload used by the closing summary; `recover-inputs`
+handles the preceding recovery. Static validation expands templates and invocation bindings for graph and credential checks and
+compares every generated member against exact regeneration; the 21,000-byte script limit also covers action
+bodies. Credential inputs map only to their
+original consuming steps. This replaces numbered-anchor/inline-map compaction without changing carrier
+membership or complete finalizer result accounting. Source provider IDs and scheduling order now derive
+from target/consumer cohorts, while exact Plan/IR IDs remain unchanged. Static Plan/manifest path headers
+replace the changing Plan digest. Ordinary source/artifact/toolchain pins and generator
+updates can retain identical workflow bytes when topology, labels/interfaces and visible policy stay
+unchanged. Transport-pin stability additionally requires no affected inline call; the summary requires an
+inline final Run upload, so upload-action pin changes affect this workflow. Checkout pins, cohort splits/merges, runtime containers/services, runner/capability routes,
+permissions, secret references, timeouts, qualification and inline setup remain visible change boundaries.
+Complete bundle regeneration and drift checking remain mandatory. Complete native-preflight, pinned-checkout
+and shared-preparation steps use descriptive aliases; preparation selects its job through `github.job`.
+Matrix scheduling and reusable callable workflows remain deferred, and no fresh hosted execution of this
+composite layout is recorded. Oversized workflows still fail before writes. Native offline disk preparation
+shares the ARC group to avoid restoring its full material closure on publication runners. Consumed carrier deletion reduces duplicate
 storage but does not establish a measured hosted storage bound.
 
 ## Native ARC disk route

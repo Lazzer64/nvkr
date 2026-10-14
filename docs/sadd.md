@@ -536,6 +536,24 @@ material where applicable. These dependencies cannot be replaced by caller-suppl
 Compilation resolves the selected Definition, Environment, and component catalogs into a plan, validates the
 complete artifact graph, and renders only admitted engines and lanes. The committed bundle is regenerated from
 the same inputs and engine; missing, extra or changed owned files cause drift failure (ADR-21).
+GitHub keeps named jobs, dependencies, runners, permissions and failure/time boundaries visible in the
+top-level workflow. Manifest-owned composite actions expose fixed interfaces for node/source execution,
+preparation, output collection and transport. Grouped jobs reuse the node interface; optional slots and
+individual transfer calls preserve arbitrary admitted output counts without new action variants. One canonical
+invocation-data member holds parameters with named operation roles. The runtime descriptor operation
+recomputes selected values from the admitted Plan; templates contain fixed commands and pinned actions,
+with no executable script inputs. Controlled transport
+wrappers contain one upload/download and retain their
+provider controls on the caller; native preflight, checkout, operator setup, timed producers and steps with
+referenced outcomes/outputs stay inline. This includes finalization and the final Run upload used by the
+closing summary; shared recovery precedes inline finalization. Static Plan/manifest references and source scheduling by target/consumer cohort
+reduce routine pin churn without changing executable Plan/IR identities. Workflow bytes remain stable only
+while topology, labels/interfaces, visible policy and required inline action pins stay unchanged; every input change still requires
+complete bundle regeneration and checking. Static validation expands templates with their invocation data and checks their exact generated
+bytes, preserving credential scope and per-job finalizer results. Producer matrix and general callable
+scheduling remain deferred (ADR-18 §8); ADR-21 admits only the separate fixed native qualification worker
+and its selected-platform matrix.
+
 An explicit GitHub development Environment selects a separate fixed bundle. It shares the
 compiler, helper and complete output checks with production, while keeping its Plan, workflow and
 ownership manifest separate. Branch testing therefore does not replace the maintained publication bundle.
