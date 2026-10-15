@@ -328,6 +328,14 @@ unpinned identities, caller-provided pass booleans, wrong roles, expired evidenc
 closed with coded errors and no partial output. Release-set conformance remains exhaustive. Cluster topology and post-clearance deployment qualification
 are deferred outside the current artifact model (ADR-19); they cannot authorize promotion.
 
+`testresults.Producer` describes implementations external to NVKR. Those implementations own suite
+configuration, access, execution and process lifecycle; NVKR supplies only output descriptions,
+wrapper validation and deterministic serialization in lane **none (descriptive)**. No producer
+execution, cluster operation, dispatcher or qualification integration is supplied. Unsigned output
+descriptions cannot authorize qualification or promotion, or replace ADR-05's publisher evidence and
+authenticated later observations. The [output reference](../external-test-output-contract.md) owns
+the descriptive fields, format declarations and wire limits.
+
 ## Consequences
 
 **Positive**
