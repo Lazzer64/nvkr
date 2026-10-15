@@ -75,14 +75,25 @@ The [pinned-source audit](../../definitions/nvke-fde/fde-audit.md) records retai
 files, SSH key distinctions, a GRUB cleanup defect and cloned-volume-key implications. The public value
 requires no GitHub secret; private passphrases remain unsupported.
 
-## Preparatory external test output boundary
+## External test output and local diagnostic boundary
 
-`pkg/nvkr/testresults` implements JUnit/CTRF output descriptions, wrapper validation and deterministic
-Encode/Decode in lane **none (descriptive)**. Producer execution, file collection, format parsing,
-authenticated coverage, signing and publication remain unimplemented. Contract tests establish no
-external execution or service acceptance. Validation-vector v3 and qualification-evidence v2 are unchanged.
+`testresults` implements bounded JUnit/CTRF descriptions and deterministic serialization in lane
+**none (descriptive)**. `validation` dispatches explicit named checks; `conformance` implements the
+`kube-conformance` / `hydrophone` diagnostic adapter. Lifecycle authenticates selected product/tools
+publications and exports held executable bytes; catalog, buildgraph, acquisition and delivery retain
+production ownership. Original reports, product/tool source provenance and before/after observations
+are retained. Normal harness exit status is a fact with an unknown cause, never a passing verdict.
+Local/disposable acknowledgements are operator declarations, not proof of locality or exclusive ownership.
+
+Contract and process-fixture tests cover guards, capture, cleanup and dispatch. They do not establish
+successful external execution of the corrected published-source route. Report parsing, original JUnit
+validity, continuous installed-byte proof, AI/user adapters, Definition applicability detection,
+qualification signing and promotion from these outputs remain unimplemented. Local unsigned sources
+remain unsupported. Existing validation-vector v3 and qualification-evidence v2 are unchanged.
 [ADR-16 §6](0016-release-gates-and-digest-first-selection.md#6-passive-external-qualification-handoff--deferred-producer-protocol)
-owns the boundary; the [output reference](../external-test-output-contract.md) owns fields and limits.
+owns diagnostic execution and passive external qualification; [ADR-18 §3](0018-pipeline-ir-and-ci-adapter-emission.md#3-helper-owned-isolation-and-narrowly-admitted-native-arc-disks)
+owns the host isolation posture. The [operator reference](../external-test-output-contract.md)
+owns prerequisites, selection and capture limits. These proposed contracts establish no organizational ratification.
 
 ## M3 MVP scope and acceptance boundary
 
