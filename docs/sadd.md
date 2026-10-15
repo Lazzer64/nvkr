@@ -52,6 +52,12 @@ regeneration without rebuilding the generator. Definitions declare named deliver
 NVKR does not operate a registry, provision clusters, or manage fleet lifecycle. External owners provide source
 access, registry retention, runtime conformance, and deployment policy. Downstream systems consume accepted
 artifact references and own their deployment descriptions (ADR-19/20).
+A separately authored repository CI adapter schedules producer Runs and invokes
+NVKE's suite in a separate downstream job outside this product lifecycle and v1
+qualification acceptance (ADR-16/18). NVKE owns guest/cluster provisioning,
+assertions and teardown; the parent harness owns host admission, outer leases,
+disk service and journaled network-control restoration. These trusted-code CI
+diagnostics do not add runtime authority to the artifact-verification core.
 
 ## Assumptions {#assumptions}
 

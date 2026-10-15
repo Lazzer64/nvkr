@@ -146,8 +146,11 @@ Their execution classes select exactly
 `arc-amd64-kvm` and `arc-arm64-kvm`. This is an explicit operator-trusted runner/daemon boundary: it does not
 claim an authenticated provider allocation, subordinate identity, independent sandbox attestation or qualification.
 Production and standalone diagnostic disk jobs use the `nkd-arc` protected Environment, with pool access
-restricted to the reviewed workflow on the default branch and any exact branches explicitly admitted by
-`githubDispatchBranches`. The separate signed-development policy is described below.
+restricted to reviewed producer workflows on the default branch and any exact branches explicitly admitted by
+`githubDispatchBranches`. The separate signed-development policy is described below. The separately authored
+downstream E2E adapter has its own trust and provider-admission requirements in this section's
+[repository NVKE E2E adapter](#repository-nvke-e2e-adapter-outside-generated-execution) subsection;
+producer admission does not establish admission of that downstream workflow.
 
 With publication and signing omitted, the same native policy also admits a **build-only diagnostic**
 workflow at `static-unqualified`. It accepts plain disks and ADR-10's explicit public-bootstrap LUKS2
@@ -191,6 +194,10 @@ disk producer's full material closure.
 
 Internal native toolchains beneath the candidate publication prefix's `toolchains/`
 repositories use a separate preparation step with `contents: read` and `packages: read`.
+The maintained M2 and two NVKE nightly publication prefixes also reuse the already-published
+`ghcr.io/dsx-ai-factory/{nvkr,nke-recipes}/m2-candidate/toolchains/` pins. Reusing these
+toolchain subjects does not relocate them into the nightly output namespace or admit unrelated
+publication owners or toolchain repositories.
 Only that step receives the ephemeral workflow token. The helper admits the complete Plan,
 native platform and disk host requirements before pulling; it uses a private temporary Docker
 configuration and deletes it on success or failure before source or producer execution.
@@ -315,6 +322,32 @@ Helper delivery can use pinned source bootstrap or a pinned helper image. Delive
 execution authority: a qualified claim still needs exact helper bytes and the ADR-07 runtime observation.
 Prebuilt helper-image qualification stays disabled until that admission contract exists. Runtime/helper changes
 belong to Environment/profile configuration; component toolchains remain producer inputs.
+
+#### Repository NVKE E2E adapter outside generated execution
+
+The separately authored repository CI adapter uses `arc-arm64-kvm` and `nkd-arc`
+for kind management plus native KVM tenant guests. This engineering contract is
+outside generated Run execution and v1 product qualification acceptance; it adds
+no Environment runtime engine, public runtime API or qualified runner claim.
+The generated adapter's native disk policy above remains unchanged. Other labels
+and downstream runtime targets are unsupported by this E2E adapter.
+
+NVKE owns guest and cluster provisioning, assertions and guest/cluster teardown.
+The parent repository harness owns host admission, serialization, the disk service,
+outer leases, network-control mutation and journaled restoration. It requires
+native architecture, KVM, host packages, exact source and private workspace before
+host mutation and joins both owners before reporting a successful cycle. Missing
+cleanup evidence retains recovery controls and fails the cycle.
+
+The pinned NVKE suite is fully trusted code. Its sudo and Docker access are
+root-equivalent on the runner; running under the parent's UID means it can access
+the parent's read-only job token despite environment scrubbing. Private paths
+and separate workflow jobs do not establish an independent sandbox or signer.
+The suite's unsigned outcomes therefore remain diagnostics, including its own
+pass verdict. A label, configured schedule or local contract test proves neither
+pool access nor combined runtime acceptance. Provider admission and the first
+combined cycle remain external evidence in reconciliation; no organizational
+tool approval or named-decider ratification is inferred.
 
 ### 4. Runner provenance and conditional self-hosting bootstrap
 
@@ -715,6 +748,9 @@ output requirements and finalizer with production; no selected outputs are filte
 rejects this GitHub-only setting. Arbitrary runtime setup/variables and a second dispatch-branch allowlist
 are rejected. Legacy runner overrides must name an admitted generic hosted label; disks use only the
 explicit native ARC policy and fixed execution-class labels above.
+Combining this fixed development workflow with a nonempty `githubBundle` is
+unsupported and returns `CodeEngineCapability` before catalog resolution or
+generated-output work; optional named bundles select production workflows only.
 
 Unsigned development omits both publication and signing, remains `static-unqualified`, and cannot use
 ARC or disk evidence. Signed development requires real cosign, the GitHub issuer, `per-output-v1`, the

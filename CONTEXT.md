@@ -220,6 +220,15 @@ Distinct independently authenticated release claims covering exact reproduction,
 Qualified release-gate acceptance is deferred; no retained clearance implementation consumes these claims.
 _Avoid_: Generic pass result, cluster qualification
 
+**Downstream test coordinator**:
+A separately authored repository CI adapter outside the NVKR product lifecycle
+that joins exact project producer Runs, consumes authenticated publication bytes
+and invokes NVKE's suite in a separate job. NVKE owns guest/cluster provisioning,
+assertions and teardown; the parent harness owns host admission, outer leases,
+disk service and network-control restoration. Its unsigned reports are diagnostics,
+not qualified conformance receipts or a seventh public lifecycle object (ADR-16/18).
+_Avoid_: Nightly qualification, qualified runtime, product fleet operator
+
 **Clearance**:
 Authenticated authorization for one exact qualified ReleaseSet after its required evidence, policy, and lifecycle checks pass.
 This is a deferred contract; the unused authorization implementation has been removed.
