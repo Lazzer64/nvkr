@@ -275,8 +275,7 @@ func TestMaintainedWorkflowFitsGitHubFileLimit(t *testing.T) {
 	if !bytes.Equal(raw, bundle.Files[GitHubWorkflowPath]) {
 		t.Fatal("committed workflow differs from its complete regenerated Plan")
 	}
-	document := decodeGitHubWorkflow(t, raw)
-	t.Logf("maintained workflow: %d bytes, %d explicit jobs", len(raw), len(document.Jobs))
+	t.Logf("maintained workflow: %d bytes, %d explicit jobs", len(raw), len(githubSerializedJobOrder(t, raw)))
 }
 
 // Render the maintained complete Plan as well as checking its committed bytes:
@@ -299,4 +298,46 @@ func TestMaintainedM2RenderingFitsGitHubFileLimit(t *testing.T) {
 		t.Fatalf("maintained workflow has less than 5%% headroom (%d of %d bytes); compact semantic calls before expanding membership", len(raw), maxGitHubWorkflowBytes)
 	}
 	t.Logf("maintained M2 rendering: %d bytes (%d bytes below GitHub limit)", len(raw), maxGitHubWorkflowBytes-len(raw))
+}
+
+func TestMaintainedGitHubBundlesKeepJobsInEntryWorkflow(t *testing.T) {
+	for _, planPath := range []string{
+		FactoryPlanPath,
+		GitHubDevelopmentPlanPath,
+		".github/nvkr-run-nvke-nightly-arm64/plan.json",
+		".github/nvkr-run-nvke-nightly-upstream-ovn-arm64/plan.json",
+	} {
+		t.Run(planPath, func(t *testing.T) {
+			plan, err := LoadPlanContext(t.Context(), "../../../"+planPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bundle, err := RenderGitHub(t.Context(), plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name := range bundle.Files {
+				if strings.HasPrefix(name, ".github/workflows/") && name != bundle.WorkflowPath {
+					t.Fatalf("producer bundle emitted an additional workflow %s", name)
+				}
+			}
+			workflow := decodeGitHubWorkflow(t, bundle.Files[bundle.WorkflowPath])
+			if _, dispatch := workflow.On["workflow_dispatch"]; !dispatch || len(workflow.On) != 1 {
+				t.Fatal("producer entry must expose only its manual dispatch trigger")
+			}
+			projection, err := githubNeedsForPlan(t.Context(), plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(workflow.Jobs) != len(projection.Reduced) || len(projection.Collectors) == 0 {
+				t.Fatal("maintained entry lost execution jobs or result collection")
+			}
+			for id, job := range workflow.Jobs {
+				if job.RunsOn == "" || len(job.Steps) == 0 {
+					t.Fatalf("job %s delegates execution outside the entry workflow", id)
+				}
+			}
+			t.Logf("one entry: %d bytes, %d execution/result jobs", len(bundle.Files[bundle.WorkflowPath]), len(workflow.Jobs))
+		})
+	}
 }

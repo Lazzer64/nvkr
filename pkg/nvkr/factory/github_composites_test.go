@@ -18,6 +18,25 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+func TestGitHubActionsRejectMalformedOrCallableJobs(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "empty"},
+		{name: "comment only", raw: "# missing workflow\n"},
+		{name: "invalid YAML", raw: "jobs: [\n"},
+		{name: "no jobs", raw: "name: Missing jobs\n"},
+		{name: "local workflow call", raw: "jobs:\n  operation:\n    uses: ./.github/workflows/nvkr-worker.yml\n"},
+		{name: "remote workflow call", raw: "jobs:\n  operation:\n    uses: example/repo/.github/workflows/worker.yml@main\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := expandGitHubActions(&Plan{}, []byte(test.raw), nil)
+			assertFactoryErrorCode(t, err, e.CodeInvalidCatalog)
+		})
+	}
+}
+
 // The fixture deliberately combines caller-only contexts, an output-referenced
 // execution step and all provider controls that cannot move across action scope.
 func githubCompositeContractFixture(actions githubActionRefs, container bool) []byte {

@@ -493,6 +493,28 @@ func githubYAMLField(node *yamlv3.Node, name string) *yamlv3.Node {
 	return nil
 }
 
+func githubYAMLOnlyFields(node *yamlv3.Node, allowed ...string) bool {
+	if node == nil || node.Kind != yamlv3.MappingNode || len(node.Content)%2 != 0 {
+		return false
+	}
+	seen := map[string]bool{}
+	for index := 0; index < len(node.Content); index += 2 {
+		key := node.Content[index]
+		if key.Kind != yamlv3.ScalarNode || key.Tag != "!!str" || seen[key.Value] {
+			return false
+		}
+		seen[key.Value] = true
+		found := false
+		for _, name := range allowed {
+			found = found || key.Value == name
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
 func githubYAMLValue(node *yamlv3.Node, name string) string {
 	if value := githubYAMLField(node, name); value != nil {
 		return value.Value

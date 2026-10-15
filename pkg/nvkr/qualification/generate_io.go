@@ -33,6 +33,9 @@ func (manifest qualificationManifest) validate() error {
 	if !qualificationWorkflowPath.MatchString(manifest.QualificationWorkflow) || !qualificationWorkflowPath.MatchString(manifest.SmokeWorkflow) || manifest.QualificationWorkflow == manifest.SmokeWorkflow || manifest.QualificationWorkflow == manifest.ProducerWorkflow || manifest.SmokeWorkflow == manifest.ProducerWorkflow {
 		return e.New(e.CodePipelineDrift, "unsafe qualification ownership paths")
 	}
+	if factory.IsLegacyGeneratedGitHubChildWorkflowPath(manifest.QualificationWorkflow) || factory.IsLegacyGeneratedGitHubChildWorkflowPath(manifest.SmokeWorkflow) {
+		return e.New(e.CodePipelineDrift, "qualification ownership overlaps a retired producer workflow namespace")
+	}
 	expected := map[string]bool{manifest.QualificationWorkflow: true, manifest.SmokeWorkflow: true}
 	previous := ""
 	for _, member := range manifest.Members {

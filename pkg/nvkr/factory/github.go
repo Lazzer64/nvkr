@@ -111,6 +111,10 @@ func renderGitHub(ctx context.Context, plan *Plan, validate bool) (*GeneratedBun
 		return nil, err
 	}
 	layout := githubLayoutFor(plan)
+	needsProjection, err := githubNeedsForPlan(ctx, plan)
+	if err != nil {
+		return nil, err
+	}
 	files, planDigest, err := renderStaticInputs(ctx, plan, layout)
 	if err != nil {
 		return nil, err
@@ -387,13 +391,21 @@ func renderGitHub(ctx context.Context, plan *Plan, validate bool) (*GeneratedBun
 		if githubQualificationHandoffEnabled(plan) {
 			writeGitHubQualificationHandoffStep(&body, actions)
 		}
-		writeGitHubRunSummary(&body, githubRunEndSummary(len(allNeeds)))
+		summary := githubRunEndSummary(len(allNeeds))
+		if len(needsProjection.Collectors) != 0 {
+			summary = githubCollectedRunEndSummary(len(allNeeds))
+		}
+		writeGitHubRunSummary(&body, summary)
 	}
 	workflow, actionFiles, err := lowerGitHubActions(plan, body.Bytes(), actions)
 	if err != nil {
 		return nil, err
 	}
 	workflow, err = shareGitHubActions(plan, workflow, actionFiles, actions)
+	if err != nil {
+		return nil, err
+	}
+	workflow, err = lowerGitHubNeeds(ctx, plan, workflow)
 	if err != nil {
 		return nil, err
 	}
