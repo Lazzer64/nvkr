@@ -1,6 +1,6 @@
 # Architecture implementation and evidence
 
-Reviewed 2026-10-13. ADR-01–22 own the lane-specific engineering contracts pending named-decider
+Reviewed 2026-10-15. ADR-01–22 own the lane-specific engineering contracts pending named-decider
 ratification. This ledger owns current implementation and remaining acceptance. Code and contract tests,
 recorded external execution, and organizational approval are separate facts. Historical source and
 schema results do not transfer to a changed candidate.
@@ -1466,7 +1466,380 @@ contracts do not establish GHCR interoperability, signing-service behavior,
 runtime compatibility, installation or external acceptance of the new format projections; earlier browsing
 and publication records do not establish that acceptance.
 
-The generator/validator/writer enforce a 500,000-byte limit for each workflow file. The entry workflow retains
+Private CI payload transport uses the existing Go registry and bounded archive owners. Actions attachments
+carry canonical JSON locators; source archives, helpers, tools and compiled payloads stay in an API-confirmed
+private/internal GHCR package with no reported repository association. Separate read/write package credentials
+and their configured usernames are scoped to transfer steps. The repository token authenticates repository
+metadata and Actions locator reads; it is not a package-credential fallback. Publication retains its separate
+private destination and inspected-root admission. GHCR publication jobs also pass their automatic repository
+token separately for the source metadata lookup; development publisher tokens remain package-scoped. Local
+contracts cover this credential separation and its generated projection; the development publication job
+recorded below also exercised these separate bindings.
+The v2 carrier uses at most 64 ordered raw chunks of at most
+1 GiB, checking each digest, config binding and complete archive before publishing extracted roots. Earlier draft v1 locators
+require a new producing Run. Controlled local-registry contracts cover multiple chunks, corrupt/reordered or
+truncated bytes, bounds, no-overwrite extraction and joined cancellation; they do not prove GHCR service
+acceptance. Raw chunks trade compression for predictable layer bounds. Registry retention, effective hidden
+package grants and anonymous/unrelated-user/fork access remain operator responsibilities. Old workflow
+artifacts and caches are not migrated or purged. No complete hosted private-transfer Run is recorded.
+
+The generated workflow binds the two nonsecret storage usernames from repository variables into workflow
+environment values; nested transfer actions consume the supported `env` context. Authored nightly,
+native-toolchain and OS-validation callers supply the corresponding username explicitly.
+[Development Run 38842595104](https://github.com/dsx-ai-factory/nvkr/actions/runs/38842595104), commit
+`3b0d86f61afab587bd5ed1a1a86d0f1cc9fb4921`, exercised all four bootstrap uploads and downstream helper
+downloads. The CI package metadata reported internal visibility and null repository association. Bootstrap
+attachment `12022225123` contained only a 437-byte locator JSON referencing a 31,075,328-byte helper archive
+at GHCR digest `sha256:0f2688d46c23635668f62ded0dcb90412827b0401dd169d848cf93e25c0ab889`.
+The anonymous registry challenge and subsequent anonymous pull-token exchange both returned HTTP 401;
+unrelated authenticated users, enterprise grants and fork identities were not exercised.
+[Output publication job 116787811052](https://github.com/dsx-ai-factory/nvkr/actions/runs/38842595104/job/116787811052)
+succeeded with the separate repository/package credentials. All four native disk jobs passed runner and
+private toolchain preparation. SBOM attestation jobs encountered Cosign/Rekor duplicate-entry conflicts;
+these partial observations do not establish a complete successful Run or release acceptance.
+
+For the first failed SBOM attestation, Rekor returned the reported existing entry at log index `3272949380`,
+integrated at `2026-10-16T02:59:31Z`, before Cosign failed at `03:00:01Z`. The pinned Cosign 3.1.3 dependency
+does not recover that conflict into a bundle. SBOM creation now has ADR-04's bounded fresh-invocation recovery;
+the exact predicate, subject and full verification remain mandatory. Regression cases were added but not run
+at the operator's request; package compilation, static analysis and review passed. Hosted recovery remains
+unproved. The subsequent
+[development Run 38844396801](https://github.com/dsx-ai-factory/nvkr/actions/runs/38844396801), commit
+`01eafd737bf25f6da2a98d70e471a2851a7cf6c6`, reached source and build work but failed private-package admission
+before SBOM signing. In
+[source job 116792702215](https://github.com/dsx-ai-factory/nvkr/actions/runs/38844396801/job/116792702215)
+and [ARM64 build job 116792950777](https://github.com/dsx-ai-factory/nvkr/actions/runs/38844396801/job/116792950777),
+execution and carrier packaging succeeded; upload then returned `NVKR-E-TRUST-POLICY-MISSING` because package
+access could not be authenticated. Concurrent operator requests using the same personal account received
+HTTP 403 with primary quota `5000`, remaining `0`, and reset `2026-10-16T03:39:23Z`.
+The generated full-success route requires approximately 5,183 package metadata requests before conditional
+revalidation or unrelated account activity: 2,022 for 1,011 uploads, 2,327 for carrier/helper downloads, and
+834 for fresh development publication. A reset alone does not provide reliable headroom for that route.
+The storage owner now uses ADR-18's operation-local authenticated ETag revalidation while retaining every
+network policy check. One download batch shares a backend; its in-memory response cache is bounded to 128
+entries and 8 MiB, with exact URL/credential isolation and no stale-on-error fallback. Regression cases
+were added but not executed at the operator's request. Compilation, vet, lint and independent static review
+passed. An authenticated package API probe at `2026-10-16T03:39:42Z` returned a `200` response followed by
+`304`, with primary quota usage unchanged at one request. The provider's `200` ETag used the weak `W/`
+prefix while its matching `304` ETag omitted it. The strict string comparison in
+[bootstrap job 116798618159](https://github.com/dsx-ai-factory/nvkr/actions/runs/38846651931/job/116798618159)
+therefore failed closed; comparison now follows
+[HTTP's weak entity-tag rule](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.8.3.2), preserving opaque-tag
+equality and every privacy check. This probe establishes endpoint revalidation behavior, not full-Run quota
+savings or completion; those remain to be demonstrated.
+
+Six sampled attachments in Run `38844396801` (IDs `12022647313`, `12022133262`, `12023070943`, `12022991328`,
+`12022558957`, and `12023125384`) covered helper, tool, artifact, result, source and package carriers. Each
+ZIP contained exactly one 440–542-byte v2 locator bound to the exact repository, Run, attempt and artifact
+name, with a digest reference to the CI package; no payload files were present. GHCR reported internal
+visibility and no linked repository. These samples do not establish the complete final attachment inventory
+or effective access grants.
+
+[Development Run 38847118548](https://github.com/dsx-ai-factory/nvkr/actions/runs/38847118548), commit
+`8c3a8dbb6af538650d6751c86c1a5bb319541b6d`, finished with 561 successful, four failed and 15 skipped jobs.
+All bootstrap jobs and all four native disk producer jobs passed. SBOM attestation, publication, signing
+and signature verification succeeded for 64 nondisk outputs and both plain disks.
+These successes exercise the new signing implementation but do not prove that a conflict retry occurred. One
+[packaging job](https://github.com/dsx-ai-factory/nvkr/actions/runs/38847118548/job/116801143181)
+failed while pulling its pinned AMD64 BusyBox utility image; its daemon admission and input restoration had
+succeeded. The discarded child-process diagnostic prevents attribution to registry, network or runner
+failure. Platform admission now retains bounded stderr solely for fixed diagnostic classification, with
+cancellation precedence and no raw-response logging or pull-behavior change. Regression cases were added
+but not run at the operator's request; compilation, vet, lint, license, shell and vulnerability checks passed.
+These checks are separate from external exercise and do not constitute the complete test gate.
+
+The successful [ARM64 plain-disk producer](https://github.com/dsx-ai-factory/nvkr/actions/runs/38847118548/job/116801591683)
+uploaded a 3,350,328,832-byte prepared carrier; Actions artifact `12024935662` was a 558-byte ZIP containing
+one 519-byte locator. The ARM64 FDE prepared carrier was 6,450,705,408 bytes; Actions artifact `12023954928`
+was a 553-byte ZIP containing one 515-byte locator. Both ZIP digests matched provider metadata, and the
+locators matched the exact repository, Run, attempt, artifact name and CI registry reference. Successful
+uploads at that commit exercised four and seven raw chunks respectively, inferred from the fixed 1 GiB
+chunk bound. Only locator metadata was independently inspected; payloads were not downloaded for this audit.
+
+The [ARM64 FDE SBOM job](https://github.com/dsx-ai-factory/nvkr/actions/runs/38847118548/job/116809539638)
+failed before signing while restoring its prepared layout: the hosted filesystem ran out of space.
+The runner reported 19 MB free during private download. The [AMD64 FDE SBOM job](https://github.com/dsx-ai-factory/nvkr/actions/runs/38847118548/job/116812945991)
+also exhausted storage, while extracting the private carrier during download. At that commit, transport held about two payload-sized
+copies during download/restoration and three during subsequent upload, approximately 12.015 GiB and
+18.023 GiB for this FDE carrier before tools and workspace overhead. Those peak estimates derive from the
+implementation and measured locator size, not a complete filesystem trace. Native production succeeded;
+this consumer-capacity failure and the BusyBox pull failure prevent all-output completion and release acceptance.
+The [finalizer](https://github.com/dsx-ai-factory/nvkr/actions/runs/38847118548/job/116818167805)
+rejected the failed provider-job closure with `NVKR-E-PROVENANCE-MISSING`; it did not report a complete Run.
+
+The next implementation removes intermediate payload carriers whose consumers share the producing stage.
+Per-output SBOM jobs now receive only prepared control documents and evidence. The publisher joins their
+verified attested controls to the original preparation, moves unchanged blobs without copying, performs full
+inspection and publishes the exact privacy-admitted root. Its separate signing handoff contains only bounded
+metadata bound to that published digest. Signers retain exact Plan, output, Run and cryptographic SBOM checks;
+independent remote verification still checks the complete served payload. Each of the 69 publication/signing
+chains removes one full-layout upload and two downloads; each disk route also removes an unused full disk
+package upload. Native disk jobs additionally omit ten unused intermediate payload uploads each. These
+changes do not move OIDC into producers or publishers.
+Single-file CI uploads expose the existing TAR format as a virtual reader; downloads authenticate and extract
+ordered chunks directly into private staging. Neither direction writes an extra full outer TAR. At that revision,
+factory restore retained its inner carrier alongside extraction for held-source mutation detection and atomic publication.
+Bootstrap compilation also releases its own disposable caches after joining the compiler. Repository build,
+vet, lint, format, license, shell and vulnerability checks, four-bundle regeneration/drift, Actionlint, YAML
+lint and independent source review passed. Regression contracts were added but not executed at the operator's
+request; the complete test gate was not run. The generated production and development workflows have
+47,399 and 46,956 expanded YAML parsing events respectively, below the 47,500 maintained headroom threshold.
+Complete hosted acceptance remains unproved; these checks do not establish a measured storage bound.
+
+[Development Run 38855058706](https://github.com/dsx-ai-factory/nvkr/actions/runs/38855058706), commit
+`d88af16e361c269dc27b1a21fc65f34f50fb9e97`, exercised the revised transport and metadata handoffs and
+finished with 563 successful, five failed and 12 skipped jobs.
+All 65 nondisk outputs completed attestation, publication, signing and independent remote verification.
+All four native disk producers passed; both ARM64 disk publications passed, including the
+[FDE publisher](https://github.com/dsx-ai-factory/nvkr/actions/runs/38855058706/job/116833935272).
+The FDE payload locator (`12028250187`) declared 6,433,993,728 archive bytes; its prepared and attested
+control locators (`12028075621`, `12027758133`) declared 61,952 and 193,024 bytes. Plain ARM64 prepared
+controls (`12028021304`) also declared 61,952 bytes. Their ZIP digests and exact repository, Run, head,
+attempt and carrier-path bindings were checked. No private payload was downloaded for this sample,
+and this is not a complete attachment-inventory audit or filesystem peak measurement.
+
+Four late jobs failed before execution because the pinned download action listed only its default first
+1,000 artifacts before filtering. At 1,055 and then 1,072 artifacts, it omitted the older Cosign locator;
+restoration failed closed with `NVKR-E-VERIFY-FAILED`. The affected jobs were
+[ARM64 plain signing](https://github.com/dsx-ai-factory/nvkr/actions/runs/38855058706/job/116834769009),
+[AMD64 plain SBOM](https://github.com/dsx-ai-factory/nvkr/actions/runs/38855058706/job/116835093678),
+[ARM64 FDE signing](https://github.com/dsx-ai-factory/nvkr/actions/runs/38855058706/job/116836891914) and
+[AMD64 FDE SBOM](https://github.com/dsx-ai-factory/nvkr/actions/runs/38855058706/job/116836964138).
+The [finalizer](https://github.com/dsx-ai-factory/nvkr/actions/runs/38855058706/job/116837362168) also received
+an incomplete locator selection, then correctly rejected the failed provider closure with
+`NVKR-E-PROVENANCE-MISSING`. These were locator-discovery failures, not storage or cryptographic verification failures. The pinned
+[download action](https://github.com/actions/download-artifact/blob/3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c/dist/index.js)
+supported a finite listing override. Generated download templates at that revision set 2,000, and expanded workflow
+validation rejected more than 2,000 possible uploads per attempt, including helper, conditional diagnostic
+and finalization uploads. Missing or changed overrides failed exact-template validation. That bounded a fresh
+generated attempt, not accumulated artifacts across arbitrary reruns. A read-only probe using the exact
+pinned action library listed all 1,073 artifacts across 11 pages with the new bound and found the Cosign
+locator (`12026349075`) on page 11; an exact-name lookup matched it. This exercised the library's real API
+path, not hosted action execution. Four-bundle generation and drift checks, build, vet, lint, formatting,
+license checks, workflow/YAML lint and diff checks passed. At that revision the complete hosted path still
+required a fresh successful Run; unit tests remained unexecuted at the operator's request.
+
+The next [development Run 38859949586](https://github.com/dsx-ai-factory/nvkr/actions/runs/38859949586),
+commit `9ef9c841ebbebef854c30be7beedd8983367234f`, encountered a separate private-chunk read failure in
+the [ARM64 SPIRE agent signing job](https://github.com/dsx-ai-factory/nvkr/actions/runs/38859949586/job/116843230395).
+Its three locator ZIPs downloaded and matched provider digests with 771 artifacts listed. Private restoration
+then returned `NVKR-E-FETCH-FAILED` before signing executed. The underlying read cause was discarded, so
+this record does not establish a transient network fault or an integrity failure. Chunk diagnostics now
+retain fixed categories and bounded progress counts without provider text. Extraction-only recovery admits
+at most three attempts for narrowly typed transient body-read errors, closes responses and checks failed
+staging removal, and repeats complete archive authentication before destination publication. Independent
+archive, integrity, filesystem and cleanup failures cannot authorize recovery. This adds no outer archive
+copy and does not retry publication. Package build/vet, Linux vet, global lint, formatting, license and
+four-bundle drift checks passed, with independent source review. Regression contracts are authored but
+unexecuted at the operator's request. Recovery of an actual interrupted hosted response remains unproved.
+
+The same Run externally exercised the locator pagination fix: its successful
+[ARM64 plain disk signer](https://github.com/dsx-ai-factory/nvkr/actions/runs/38859949586/job/116850300612)
+listed 1,046 artifacts with the 2,000 bound, selected the older Cosign locator (`12028567478`) and both
+route locators, restored the private bytes and completed actual signing (`dryRun=false`) at
+`2026-10-16T06:50:11Z`. This proves the previously failing late-job discovery path, not complete Run acceptance.
+
+That Run finished with 569 successful, four failed and seven skipped jobs. All four native producers,
+69 SBOM attestations and 68 output publications succeeded; 66 outputs completed independent remote
+verification. Besides the SPIRE chunk read, the
+[AMD64 FDE publisher](https://github.com/dsx-ai-factory/nvkr/actions/runs/38859949586/job/116854048985)
+completed its private download but exhausted local disk while unpacking the retained factory TAR. Its
+locator (`12030463435`) declared 6,731,396,096 archive bytes; the 564-byte locator ZIP matched provider
+SHA-256 `051ab577468a9c39af11b6d77c45beb0893f49a98fa0ea93515942a626eefe1f` and exact Run/head/attempt
+bindings. This is a bounded locator sample, not a payload download or peak-space measurement.
+The [ARM64 FDE verifier](https://github.com/dsx-ai-factory/nvkr/actions/runs/38859949586/job/116853852574)
+failed during remote layer materialization with HTTP/2 `PROTOCOL_ERROR`; its log does not establish the
+peer's underlying reason. The [finalizer](https://github.com/dsx-ai-factory/nvkr/actions/runs/38859949586/job/116857487854)
+successfully selected its locator from 1,082 attachments, then rejected the incomplete provider closure
+with `NVKR-E-PROVENANCE-MISSING`. No complete release acceptance follows from this failed Run.
+
+The follow-up implementation streams Plan-selected factory carriers directly into extracted roots and
+publishes disk payloads from checked held descriptors, removing the retained input TAR and disk publisher's
+full temporary copy. It preserves complete transport authentication, no-replace publication, source mutation
+checks and unconditional post-upload rehash even for registry deduplication. The subsequent
+[development Run 38867619968](https://github.com/dsx-ai-factory/nvkr/actions/runs/38867619968), commit
+`53e28a56c85cd3818e07574b7eb25add6934687a`, finished with 565 successful, three failed and 12 skipped jobs.
+All 65 nondisk outputs and both ARM64 disk outputs completed SBOM attestation, publication, signing and
+independent remote verification. The [plain ARM64 publisher](https://github.com/dsx-ai-factory/nvkr/actions/runs/38867619968/job/116874186795)
+streamed restoration in 48 seconds and published in 125 seconds; the
+[ARM64 FDE publisher](https://github.com/dsx-ai-factory/nvkr/actions/runs/38867619968/job/116875695907)
+streamed restoration in 186 seconds and published in 409 seconds. The
+[plain verifier](https://github.com/dsx-ai-factory/nvkr/actions/runs/38867619968/job/116876558917)
+and [FDE verifier](https://github.com/dsx-ai-factory/nvkr/actions/runs/38867619968/job/116881062118)
+completed real verification (`dryRun=false`) of the output and release-wrapper references. These are
+successful hosted disk paths at this revision, not measured peak storage, AMD64 disk acceptance or a complete release.
+
+Both AMD64 disk jobs restored inputs but failed KVM admission before building. The initial
+[preflight 38869133168](https://github.com/dsx-ai-factory/nvkr/actions/runs/38869133168/job/116868903097)
+confirmed device permission failure. A diagnostics-only follow-up at
+`4c95efbc1a5f742b7884ff8635c60fe1b1afe337`,
+[preflight 38873740116](https://github.com/dsx-ai-factory/nvkr/actions/runs/38873740116/job/116883799563),
+reported `/dev/kvm` UID 0, GID 108 and mode 0660; runner UID/GID 1001 and groups 27, 100 and 123 lacked access.
+These read-only probes made no runner permission change. Provisioning the device's numeric group,
+consistent across eligible nodes, is one repair; the fixed generated bootstrap below is the selected
+workflow alternative. The
+[finalizer](https://github.com/dsx-ai-factory/nvkr/actions/runs/38867619968/job/116883648755)
+recovered private artifacts after listing 1,050 attachments, then correctly rejected the incomplete provider
+closure with `NVKR-E-PROVENANCE-MISSING`. Unit contracts remain unexecuted at the operator's request.
+
+The separate [NVKE Run 38912781090](https://github.com/dsx-ai-factory/nvke/actions/runs/38912781090),
+head `c47c9d6c8e8ef8e1141eb7e3028ad6c9c5bdb139`, exercised `sudo chmod 666 /dev/kvm` and real KVM guest boot in
+[AMD64 job 117014068930](https://github.com/dsx-ai-factory/nvke/actions/runs/38912781090/job/117014068930).
+That establishes access after its workflow bootstrap on its observed runner. The shared runner label and
+different registration names do not establish the same Kubernetes cluster, node or deployment as NVKR.
+
+The generated native disk step now rejects missing, symlink or non-character `/dev/kvm` paths before
+checkout and downloads. When the runner cannot open the device read/write, it makes one fixed,
+noninteractive `sudo -n -- chmod 0666 /dev/kvm` attempt with a fifteen-second timeout and five-second kill
+grace, then requires a successful runner read/write-open. Permission-change or access failure remains a
+coded capability rejection. Already-accessible devices are unchanged. Exact generated-step validation
+retains the fixed command, ordering and failure controls; ARC finalizers omit it. The independently authored
+OS-validation diagnostic workflow remains read-only.
+
+This is an operator-accepted native ARC permission bootstrap, not SLSA Build L3 isolation or a qualified
+execution claim. Mode 0666 can widen access to a host-backed/shared device beyond the runner job; it is
+not assumed to be confined to an ephemeral pod. Producer identity, held native capacity/KVM API admission,
+guarded Docker projection and the pipeline-attested evidence lane remain unchanged. Unit contracts remain
+unexecuted at the operator's request.
+
+For the bootstrap revision, repository build/vet and lint, four-bundle regeneration/drift,
+Actionlint, YAML syntax/style checks, formatting, license, shell and diff checks passed; the vulnerability
+scan found no vulnerabilities. Generated YAML retains its existing long-line and document-start style.
+Expanded YAML parsing counts remain 47,431/46,988/22,120/22,112 for production, development and the two
+nightlies, below the 47,500-event headroom bound. Unit, race and Python test suites were skipped at the
+operator's request; these static checks do not establish hosted execution.
+
+The subsequent [development Run 38923861766](https://github.com/dsx-ai-factory/nvkr/actions/runs/38923861766),
+head `0c302566f259da8bd01a80f9b64ea4c196e40afa`, attempt 1, finished with 575 successful, two failed and
+three skipped jobs out of 580. All 69 named outputs, including all four native plain/public-bootstrap FDE
+disks, completed SBOM attestation, publication, real Cosign signing and independent remote verification.
+All four disk runners already exposed `/dev/kvm` with GID 108 and mode 0666. This exercised the generated
+access check without changing permissions and the complete disk build paths; it did not exercise the
+conditional chmod repair, establish SLSA Build L3 or qualified execution, or demonstrate TPM first-boot acceptance.
+
+The [aggregate assembly job](https://github.com/dsx-ai-factory/nvkr/actions/runs/38923861766/job/117085717125)
+failed before assembly while the pinned download action eagerly started requests for 346 selected locator
+artifacts. GitHub returned HTTP 403 for a secondary rate limit with `Retry-After: 1`, despite a primary
+quota remaining of 14,441 out of 15,000. This was a provider locator-acquisition failure after every output
+verified, not a disk build or signature failure. Aggregate publication, signing and verification were skipped;
+the [finalizer](https://github.com/dsx-ai-factory/nvkr/actions/runs/38923861766/job/117086390427)
+rejected the incomplete provider closure. No complete aggregate release acceptance follows from this Run.
+
+The follow-up acquisition path moves locator selection and ZIP reads into the Go transport owner. It
+looks up each exact selected name serially rather than paging a changing global index, then serially
+downloads bounded 64 KiB ZIPs, verifies provider SHA-256, and admits one canonical locator of at most
+32 KiB with exact repository, Run, attempt and name bindings before writing the index. Selected-Run metadata
+anchors repository IDs and head. API starts are spaced by at least 100 milliseconds, with at most four
+attempts only for recognized provider rate limits, cancellable waits and a twenty-minute acquisition bound.
+ZIP reads have no generic retry. The 2,000-selection/workflow budget remains; private GHCR payload
+authentication and restoration are unchanged, with no additional jobs or payload copies. A read-only local
+probe exercised this acquisition path against all 346 assembly locators from Run 38923861766, attempt 1,
+checking the source head before acquisition. It completed in 305 seconds and wrote 179,845 bytes of
+validated locator JSON without fetching private GHCR payloads. This establishes real API/ZIP acquisition
+for that selection; it does not exercise a rate-limit retry, hosted step credentials or complete aggregate
+release acceptance. Repository build, vet and lint, Linux AMD64/ARM64 compilation, four-bundle
+regeneration/drift, Actionlint, YAML, formatting, license, shell and diff checks passed; the vulnerability
+scan found no vulnerabilities. Generated entry workflows and job counts are unchanged. Unit, race and
+Python suites remain unexecuted at the operator's request.
+
+[Development Run 38937379327](https://github.com/dsx-ai-factory/nvkr/actions/runs/38937379327), head
+`491341bef3015c7f0ffc41666b14b0cca3834c1c`, attempt 1, subsequently exercised the serial locator path in
+hosted jobs: 507 helper-preparation steps succeeded and 23 output signature verifiers passed. These are
+provider step observations, not an independent audit of every attachment. One
+[verification job](https://github.com/dsx-ai-factory/nvkr/actions/runs/38937379327/job/117101950150)
+failed before locator acquisition when the Go bootstrap's public module ZIP download returned an HTTP/2
+`INTERNAL_ERROR` from its peer. The remaining work was canceled because aggregate completion was no
+longer possible. The Run ended with 488 successful, 90 canceled and two failed jobs out of 580; the second
+failure was the finalizer's expected rejection of the incomplete provider closure. No aggregate acceptance
+follows from this Run.
+
+The bootstrap now separates credential-free public dependency acquisition from a single offline compiler
+invocation. Only the exact observed module-proxy ZIP error permits up to three acquisition attempts, with
+bounded waits and one shared deadline. Disposable copies of the two small dependency manifests prevent
+checkout normalization and must remain exact. Unknown or integrity failures and compiler failures do not
+retry. This does not replay producer, publication or evidence operations. Focused contract source and
+independent review cover the restriction. The exact generated bootstrap completed on macOS with fresh
+disposable Go caches: real dependency acquisition and one compilation succeeded, both manifests stayed
+exact, and the supervisor removed its caches. This did not inject or exercise the retry branch. Vet, lint,
+four-bundle regeneration/drift, Actionlint, YAML, Python syntax, shell, formatting, license and diff checks
+passed; the vulnerability scan found no vulnerabilities. Entry workflows and job counts are unchanged.
+Unit/race/Python suites remain skipped; hosted acceptance of this bootstrap change remains open.
+
+The current split transport exports the twelve admitted metadata families directly through Actions,
+including metadata-only OCI controls, while binary/source/tool carriers and unknown/mixed contents remain
+private GHCR transfers. A held carrier is projected to a bounded text inventory, checked against its exact
+record schema or complete metadata layout, and bound to repository/Run/attempt/name before publication.
+Consumers retain the serial provider-digest checks, complete Plan selection, no-replace restoration and
+existing evidence authentication. Public records require no registry credential or package metadata calls.
+The unchanged full-success development graph projects 853 public metadata uploads and 1,202 reads,
+removing 2,908 package REST requests (5,501 to 2,593 before retries or conditional revalidation).
+This is a static projection, not measured quota usage. Contract cases are authored but unexecuted at the
+operator's request. Go compilation for macOS and Linux amd64/arm64, vet, lint, four-bundle drift checks,
+Actionlint, YAML lint, shellcheck, license and formatting checks passed; the vulnerability scan found no
+vulnerabilities. Full hosted acceptance and an attachment audit of the new format remain unproved.
+
+PR #196 follow-up confines metadata validation-snapshot writes through an `os.Root` handle in addition
+to lexical path admission. Pattern downloads retain their artifact subdirectory even for a single match;
+dry-run signing does not request cryptographic SBOM verification. Catalog refresh disables Go caches
+unconditionally, including private repositories. Stale fixture paths and carrier/token assertions are
+updated for consumed preparations, local-only payloads and metadata-only downloads. Local unit suites
+remain skipped at the operator's request; hosted checks must confirm these corrections. The initial
+registry pull retains ADR-20's thirty-minute default deadline when the caller supplies none; the review
+suggestion to leave the initial attempt unbounded is not adopted.
+The follow-up coverage now composes actual SBOM, predicate, OCI-control and source-receipt producers with
+factory metadata export and restoration; it checks exact bytes, membership and indexed digests. Negative
+archive cases cover traversal, links, duplicate entries, invalid layouts and cancellation without a receipt
+or retained validation snapshot. Additional cases cover empty/partial nonmerged selection restoration and
+complete-selection rejection, storage-account overrides, and a real bootstrap descendant retaining captured
+pipes. KVM branch tests execute the emitted script against safe filesystem fixtures and simulated open/repair
+results; they neither change real device permissions nor prove runner KVM capability. These additions are
+compiled and statically checked; local unit execution remains skipped and hosted results are pending.
+
+For Run 38867619968, the plain ARM64 prepared-payload attachment (`12032867746`) was a 568-byte ZIP
+containing one 527-byte canonical locator for a 3,250,255,360-byte private archive. Its provider ZIP SHA-256
+`8346896ddd5dba69678d6e0773478a0ecee60bb12bd4d9b32b26dadb90387557`, exact Run/head/attempt and
+carrier bindings were checked without downloading the payload. At `2026-10-16T08:11:54Z`, anonymous manifest
+requests and their exact anonymous pull-token exchanges both returned 401 for that carrier and the published
+plain ARM64 release wrapper. Authenticated package metadata reported internal visibility and no linked
+repository for CI storage and that output package. This establishes the sampled anonymous denial, not
+hidden authenticated, enterprise or fork grants, future visibility or aggregate release availability.
+
+After Run 38867619968 finished, a complete attachment audit concluded at `2026-10-16T08:36:43Z`. All 1,051 Actions
+attachment ZIPs matched their provider SHA-256 digests and contained only one canonical, Run-bound v2
+locator each. Their combined size was 592,517 bytes; individual ZIPs ranged from 478 to 591 bytes.
+The audit rechecked the terminal failed conclusion, exact head and attempt, and unchanged final inventory
+(`sha256:583cc95163932dba53750a022414a95db16d25c2cd7bdae5312a8766507cf2ee`). This verifies every attachment
+in this Run; it excludes logs, caches, historical runs, registry ACLs and functional release acceptance.
+
+Remote disk acquisition also admits at most three fresh reads for the narrowly typed one-layer HTTP/2 peer
+reset, with checked cleanup, one shared deadline and destination commit outside retry. The public HTTP/2
+error type is pinned through `golang.org/x/net v0.61.0`; the Go 1.27 standard library supports that typed
+error conversion. This recovery path has not yet been exercised against an interrupted hosted response.
+Repository build/vet and lint, affected Linux build/vet, four-bundle drift, formatting, license, shell,
+Actionlint and YAML checks passed. The affected delivery vulnerability scan reported no vulnerabilities.
+An offline inspection found exact nonoverlapping roots for all 463 development/production and 221
+per-nightly stage selections. Independent source review covered nested extraction, held disk publication
+and recovery boundaries. The unit/race suites and complete test gate were not run at the operator's request.
+
+Repository workflow contracts disable compiled-output caches and CodeQL database/TRAP/overlay uploads,
+and reject runner debug mode before CodeQL initialization. OS candidate post-build files and the storage
+writer are admitted only for the exact trusted workflow commit. The nightly public runtime attachment
+contains the constructed cycle summary, not raw suite-report files. These safeguards and job consolidation
+retain the existing `pipeline-attested` boundary; they do not establish SLSA Build L3 or qualified execution.
+
+Secondary named-runtime helper bootstraps previously restored the three runtime JSON files directly over
+checked-in generated members, conflicting with private transport's no-replace rule. They now restore into
+fresh staging and invoke the generation owner to admit the complete baseline, exact staged bytes, unchanged
+execution closure and current authored inputs before installation. The existing lock, per-file atomic
+replacement and manifest-last writer retain ownership; this is not an atomic three-file transaction.
+Development bundles and generic transport replacement policy are unchanged. Focused contract source covers
+the admission boundary; unit execution is skipped at the operator's request. Build, affected-package vet
+and lint, Linux AMD64/ARM64 compilation, four-bundle regeneration/drift, Actionlint, YAML, formatting,
+license, shell and diff checks passed; the vulnerability scan found no vulnerabilities. Hosted nightly
+acceptance of this repair remains unproved.
+
+The generator/validator/writer enforce a 500,000-byte limit and 50,000 expanded YAML parsing-event limit
+for each workflow file. The entry workflow retains
 the original named job slots, prerequisite closure, conditions and credential boundaries. Manifest-owned local
 composite actions expose fixed semantic interfaces for execution, input/image preparation, output collection
 and carrier transfer. Grouped jobs reuse the node interface; declared optional slots and further individual
@@ -1496,12 +1869,15 @@ All producer jobs retain their IDs, runners, timeouts, conditions and credential
 workflow. Preparation binds its selector through `github.job`; aliases resolve into independent nodes
 before per-job substitution. Producer generation emits no reusable child workflows. The separately owned
 qualification worker remains callable under its existing qualification contract.
-Ordinary scheduling now pairs only the same BuildTarget's terminal observation and directly dependent
+Ordinary scheduling first appends offline observation, SBOM and packaging to a producer stage when that
+stage owns every input, effective runner/platform and target agree, and the sixteen-node and summed-timeout
+bounds hold. Cross-output joins and credential-bearing signing/publication remain separate. Where that rule
+does not apply, scheduling pairs only the same BuildTarget's terminal observation and directly dependent
 SBOM with compatible offline runtime. An additional input is admitted only for a pinned pipeline tool
 from an independent root acquisition with no BuildTarget, IR instruction or inputs. The pair waits for
 acquisition and restores the tool before observation; failure prevents pair completion. Additional source
-or output dependencies are not admitted. Packaging and other ordinary nodes own
-separate jobs; native ARC disk groups retain their existing live-owner membership. Global topological
+or output dependencies are not admitted. Packaging with inputs outside one producer stage and other ordinary
+nodes own separate jobs; native ARC disk groups retain their existing live-owner membership. Global topological
 adjacency and fixed-size chunks no longer choose membership. This makes independent output additions
 local to their own jobs, required aggregate assembly/publication, finalizer accounting and opening summary.
 An earlier new owner can relocate an identical YAML anchor without changing the expanded existing jobs.
@@ -1517,14 +1893,16 @@ requires successful collectors, their exact Plan-derived partition and strict bo
 The closing summary counts original outcomes, not collector success. Local contracts cover duplicate,
 missing, extra, failed, skipped, canceled, oversized and inconsistent reports, including build-only Plans.
 
-The current production entry workflow is 362,014 bytes (137,986 bytes below the admission bound);
-development is 340,021 bytes. Each has 596 original jobs, 16 collectors and 1,438 dependency edges instead
-of 2,546. The named ARM64 nightly and upstream-OVN entries are 166,854 and 168,278 bytes, each with 266
-original jobs, 16 collectors and 643 edges. All four bundles keep their jobs inline. The writer retired the
-12 legacy producer child files; the workflow files are 77,917 bytes smaller in total. Logical Plans, shared
-action implementations and invocation data remain byte-identical. The earlier output-local grouping
-migration removed accidental unrelated-output failure barriers; dependency reduction preserves the
-resulting ancestor closure.
+The combined production/development layout has 564 original jobs and 16 collectors, down from
+596 original jobs and 16 collectors in the private-storage draft based on the same upstream code.
+The production dependency graph has 1,375 edges, down from 1,438. Logical Plan identity and original
+per-node result accounting remain unchanged by scheduling. Shared preparation selects the current
+`github.job` internally, removing a redundant caller input while retaining exact projection checks.
+Production is 380,112 bytes and 47,451 expanded YAML events; development is 359,349 bytes and 47,008 events.
+The named ARM64 nightly and upstream-OVN entries are respectively 182,314/183,231 bytes and
+22,125/22,117 events, each with 282 jobs and 644 dependency edges.
+All four producer bundles keep their jobs inline. The earlier output-local grouping migration removed
+accidental unrelated-output failure barriers; dependency reduction preserves the resulting ancestor closure.
 The addition/removal regression compiles binary, native binary, collected native binary, source and signed
 per-output publication fixtures with new output names sorting before, between and after existing outputs.
 All 15 cases preserve existing job IDs, relative emission order, expanded operations, invocation values
@@ -1535,8 +1913,15 @@ missing, failed or skipped
 package/scanner jobs. All maintained generated workflows have been regenerated, pass their exact drift
 checks, and pass actionlint and yamllint. These are local contract and static validation results, not hosted
 execution or runtime cost measurements.
-The maintained rendering test fails above a 95% soft budget, before the unchanged
-500,000-byte provider admission bound, directing membership changes to compaction work.
+The maintained rendering test fails above a 95% soft budget for both file bytes and expanded YAML events,
+directing membership changes to compaction work. Alias expansion counts scalars, keys and container
+start/end events; aliases reduce file bytes without reducing the provider's parsing count. The public
+parser implementation supplies the 50,000-event bound, not a permanent provider service contract.
+The private-storage draft at `afe87da2132bf91dc663a2cd0bfe6b7adb4e9ee6` exceeded that bound with 69,519
+production events. GitHub rejected [Run 38833290328](https://github.com/dsx-ai-factory/nvkr/actions/runs/38833290328)
+on push with `Maximum YAML nodes exceeded`; its API reports zero jobs and zero artifacts. That record is
+workflow-validation failure evidence, not producer execution. The draft's generated producer trigger
+remained manual dispatch. Local parsing admission does not establish hosted acceptance of the combined branch.
 On 2026-10-15, a guarded diagnostic of the original 596-job, 2,546-edge representation at
 `a49dafff794b360f2722d53912dc824243395ae6` still returned a dispatch 502 after replacing execution bodies
 with no-ops. An independent 596-job graph was accepted in

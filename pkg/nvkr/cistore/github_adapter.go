@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/dsx-ai-factory/nvkr/internal/securepath"
 	"github.com/dsx-ai-factory/nvkr/internal/transportarchive"
@@ -187,6 +188,10 @@ func requireGitHubLocatorDirectory(path string, expected os.FileInfo) error {
 // provider download. Provider-created artifact directories retain the original
 // download action's merge policy. The owning store authenticates every request.
 func DownloadGitHub(ctx context.Context, request Request, index, destination string, options Options) error {
+	return newBackend().downloadGitHub(ctx, request, index, destination, options)
+}
+
+func (b *backend) downloadGitHub(ctx context.Context, request Request, index, destination string, options Options) error {
 	if ctx == nil || index == "" || destination == "" {
 		return e.New(e.CodeUsage, "private CI download requires context, index and destination")
 	}
@@ -197,13 +202,15 @@ func DownloadGitHub(ctx context.Context, request Request, index, destination str
 	if admission.Name == "" {
 		admission.Name = "private-ci-index"
 	}
-	ctx, cancel, options, err := admit(ctx, admission, options)
-	if err != nil {
+	if err := ValidateGitHubRequest(ctx, admission); err != nil {
 		return err
 	}
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Minute)
 	defer cancel()
+	totalBytes := 0
+	seen := map[string]bool{}
 	count := 0
-	err = filepath.WalkDir(index, func(name string, entry fs.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(index, func(name string, entry fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
 			return e.Wrap(e.CodeTimeout, err, "private CI index traversal canceled")
 		}
@@ -216,14 +223,18 @@ func DownloadGitHub(ctx context.Context, request Request, index, destination str
 		if entry.Type() != 0 || !strings.HasSuffix(entry.Name(), locatorSuffix) {
 			return e.New(e.CodeVerifyFailed, "CI index contains a non-locator member")
 		}
-		file, err := heldfile.OpenContext(ctx, name, heldfile.Options{Label: "private CI locator", MaxBytes: 32 << 10})
+		file, err := heldfile.OpenContext(ctx, name, heldfile.Options{Label: "private CI locator", MaxBytes: MaxMetadataRecordBytes})
 		if err != nil {
 			return e.Wrap(e.CodeFetchFailed, err, "open private CI locator")
 		}
-		raw, readErr := file.ReadAllContext(ctx, 32<<10)
+		raw, readErr := file.ReadAllContext(ctx, MaxMetadataRecordBytes)
 		closeErr := file.Close()
 		if readErr != nil || closeErr != nil {
 			return e.New(e.CodeFetchFailed, "read private CI locator failed")
+		}
+		totalBytes += len(raw)
+		if totalBytes > maxGitHubIndexBytes || count >= MaxGitHubLocatorArtifacts {
+			return e.New(e.CodeVerifyFailed, "CI index exceeds its aggregate bound")
 		}
 		locator, err := DecodeLocator(raw)
 		if err != nil {
@@ -234,11 +245,20 @@ func DownloadGitHub(ctx context.Context, request Request, index, destination str
 		if request.Name != "" && request.Name != selected.Name {
 			return e.New(e.CodeVerifyFailed, "CI index name differs from the selected artifact")
 		}
+		if seen[selected.Name] {
+			return e.New(e.CodeVerifyFailed, "CI index repeats a selected artifact")
+		}
+		seen[selected.Name] = true
+		if locator.Metadata == nil {
+			if err := ValidateGitHubTransfer(ctx, selected, options); err != nil {
+				return err
+			}
+		}
 		parent, err := filepath.Rel(index, filepath.Dir(name))
 		if err != nil || !filepath.IsLocal(parent) {
 			return e.New(e.CodeVerifyFailed, "CI locator parent escapes its provider index")
 		}
-		if err := Download(ctx, selected, locator, filepath.Join(destination, parent), options); err != nil {
+		if err := b.download(ctx, selected, locator, filepath.Join(destination, parent), options); err != nil {
 			return err
 		}
 		count++

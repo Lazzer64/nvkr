@@ -15,7 +15,7 @@ import (
 )
 
 func TestPrivateCIUploadCommandAdmitsBeforePathsOrTransfer(t *testing.T) {
-	for _, scenario := range []string{"missing token", "invalid repository", "invalid artifact", "missing output", "symlink output", "symlink directory", "canceled", "empty optional upload"} {
+	for _, scenario := range []string{"missing token", "missing username", "invalid repository", "invalid artifact", "missing output", "symlink output", "symlink directory", "canceled", "empty optional upload"} {
 		t.Run(scenario, func(t *testing.T) {
 			root := t.TempDir()
 			t.Chdir(root)
@@ -37,6 +37,9 @@ func TestPrivateCIUploadCommandAdmitsBeforePathsOrTransfer(t *testing.T) {
 			switch scenario {
 			case "missing token":
 				t.Setenv("NVKR_CI_STORAGE_TOKEN", "")
+				code = e.CodeTrustPolicyMissing
+			case "missing username":
+				t.Setenv("NVKR_CI_STORAGE_USER", "")
 				code = e.CodeTrustPolicyMissing
 			case "invalid repository":
 				t.Setenv("GITHUB_REPOSITORY", "../invalid")
@@ -99,11 +102,39 @@ func TestPrivateCIDownloadCommandRequiresExactCrossRunAttempt(t *testing.T) {
 	t.Setenv("GITHUB_RUN_ID", "123")
 	t.Setenv("GITHUB_RUN_ATTEMPT", "2")
 	t.Setenv("NVKR_CI_STORAGE_TOKEN", "private-read")
+	t.Setenv("NVKR_CI_STORAGE_USER", "storage-reader")
 	for _, flags := range [][]string{{"--run-id", "456"}, {"--attempt", "3"}, {"--run-id", "00", "--attempt", "3"}} {
 		_, err := invokeLifecycleCLI(t, append([]string{"factory", "github", "ci-download", "--index-dir", "/missing", "--destination", "/must-not-create"}, flags...)...)
 		var coded *e.Error
 		if !errors.As(err, &coded) || coded.Code != e.CodeUsage {
 			t.Fatalf("inexact cross-Run request = %v", err)
 		}
+	}
+}
+
+func TestPrivateCILocatorCommandAdmitsBeforeFilesystemOrNetwork(t *testing.T) {
+	for _, scenario := range []struct {
+		name, server, token string
+		flags               []string
+		code                e.Code
+	}{
+		{"wrong server", "https://example.com", "repository-reader", nil, e.CodeEngineCapability},
+		{"unpaired run", "https://github.com", "repository-reader", []string{"--run-id", "456"}, e.CodeUsage},
+		{"unpaired attempt", "https://github.com", "repository-reader", []string{"--attempt", "2"}, e.CodeUsage},
+		{"wildcard", "https://github.com", "repository-reader", []string{"--pattern", "*"}, e.CodeUsage},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Setenv("GITHUB_ACTIONS", "true")
+			t.Setenv("GITHUB_SERVER_URL", scenario.server)
+			t.Setenv("GITHUB_REPOSITORY", "Example/Source")
+			t.Setenv("GITHUB_RUN_ID", "123")
+			t.Setenv("GITHUB_RUN_ATTEMPT", "1")
+			t.Setenv("NVKR_CI_REPOSITORY_TOKEN", scenario.token)
+			_, err := invokeLifecycleCLI(t, append([]string{"factory", "github", "ci-fetch-locators", "--index-dir", "/must-not-create"}, scenario.flags...)...)
+			var coded *e.Error
+			if !errors.As(err, &coded) || coded.Code != scenario.code {
+				t.Fatalf("locator admission = %v, want %s", err, scenario.code)
+			}
+		})
 	}
 }

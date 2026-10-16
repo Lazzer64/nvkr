@@ -20,7 +20,6 @@ jobs:
     if: github.ref == 'refs/heads/main' && !inputs.verify_published
     permissions:
       contents: read
-      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -52,9 +51,10 @@ jobs:
       - name: Retain native measurements
         if: always() && steps.ci-helper.outcome == 'success'
         uses: ./.github/nvkr-run/actions/ci-upload
+        env:
+          NVKR_CI_STORAGE_WRITE_USER: ${{ vars.NVKR_CI_STORAGE_WRITE_USER }}
         with:
-          nvkr-ci-storage-token: >-
-            ${{ secrets.NVKR_CI_STORAGE_TOKEN || github.token }}
+          nvkr-ci-storage-write-token: ${{ secrets.NVKR_CI_STORAGE_WRITE_TOKEN }}
           nvkr-ci-always: 'true'
           name: native-toolchains-${{ matrix.arch }}-${{ github.sha }}
           path: .nvkr/native-toolchains/${{ matrix.arch }}

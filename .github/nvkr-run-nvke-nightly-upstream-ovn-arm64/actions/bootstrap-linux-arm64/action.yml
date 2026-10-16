@@ -11,8 +11,11 @@ inputs:
   runner-artifact:
     description: Same-Run helper artifact name
     required: true
-  nvkr-ci-storage-token:
-    description: Private CI storage credential, forwarded only to transfer steps
+  nvkr-ci-storage-read-token:
+    description: Dedicated private CI credential, forwarded only to its transfer steps
+    required: true
+  nvkr-ci-storage-write-token:
+    description: Dedicated private CI credential, forwarded only to its transfer steps
     required: true
 runs:
   using: composite
@@ -29,8 +32,12 @@ runs:
       uses: ./.github/nvkr-run-nvke-nightly-upstream-ovn-arm64/actions/ci-download
       with:
         name: 'nvkr-runtime-inputs'
-        path: '.github/nvkr-run-nvke-nightly-upstream-ovn-arm64'
-        nvkr-ci-storage-token: ${{ inputs.nvkr-ci-storage-token }}
+        path: '.nvkr/runtime-inputs'
+        nvkr-ci-storage-read-token: ${{ inputs.nvkr-ci-storage-read-token }}
+    - name: 'Install NVKR runtime inputs'
+      run: |
+        ./nvkr-exec factory github install-runtime-inputs --plan .github/nvkr-run-nvke-nightly-upstream-ovn-arm64/plan.json
+      shell: bash -e {0}
     - name: Verify committed Run generation is current
       id: validate-catalog
       env:
@@ -64,4 +71,4 @@ runs:
         include-hidden-files: 'true'
         if-no-files-found: error
         retention-days: 7
-        nvkr-ci-storage-token: ${{ inputs.nvkr-ci-storage-token }}
+        nvkr-ci-storage-write-token: ${{ inputs.nvkr-ci-storage-write-token }}
