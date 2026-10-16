@@ -50,6 +50,29 @@ This is scoped candidate pipeline-attested delivery, not a claim of main-only wo
 independent full-payload disk consumption, strict full-disk inspection, organizational toolchain approval
 or completed M1–M4 acceptance.
 
+On October 16, 2026, the user extended the internal M2 candidate publication exception to the four
+renamed toolchain subjects below. They were published from the previously measured local archives under
+`ghcr.io/dsx-ai-factory/nvkr/m2-candidate/toolchains/`. Exact-digest read-back compared every manifest and
+configuration byte with its archive and downloaded every compressed layer through the registry client's
+digest-verifying reader. Both GHCR packages report `internal` visibility.
+
+| Image | Platform | Published manifest digest | Configuration digest |
+| --- | --- | --- | --- |
+| packer | linux/amd64 | `sha256:2a8d3ca5b447fe9d4694aa6cd977c6353299b336656b23688bc6dc11b8ab98f2` | `sha256:3f4d0b48004189cdde490973ee9daa4c073856adf92d9ce4c7f2ae17f2f64117` |
+| packer | linux/arm64 | `sha256:1685a47997af96b802d050b31c212868e65626c614f5a69488141a9e979f2ad2` | `sha256:3499d012b6b54bde744a423dc9e55cd6e18d4a8272f9d5f9933a05f1ee16219b` |
+| inspector | linux/amd64 | `sha256:d330a9f8bc17dad13399b9b56de2434bbf2a4ea8fe5511ee83531f1545de30d5` | `sha256:36aea677046c9453384dd5481e7158eaaf520ba66892f8131679ebed499fea91` |
+| inspector | linux/arm64 | `sha256:0eeef5936cc090b1f89961d03a27688adddd9badd3ef236139e26771380b0119` | `sha256:be8b924b9c62aa871e15a263eb47ca8079e7f38cfaac11aea406e5dc72dc4fb4` |
+
+This publication establishes registry transport availability with the publishing credential, not a rebuild
+from the current PR head, hosted provenance or completed organizational license/security review. The source
+locks retain their unresolved general approval gates. The subsequent
+[hosted verification run](https://github.com/dsx-ai-factory/nvkr/actions/runs/38961706554) at
+`2479ef56fa29415d4015b69f65e840192edbfb19` successfully pulled all four selected manifest digests with
+this repository's `packages: read` `GITHUB_TOKEN` on native AMD64 and ARM64 runners. Both packages report
+no linked repository, but the successful pulls demonstrate access for this workflow. That run's subsequent
+entrypoint checks failed because Packer's temporary directory was read-only; it establishes pull access,
+not successful native tool validation, a complete disk bake or inspection.
+
 Strict disk inspection and reconciliation are deferred hardening outside the approved M3 MVP. Controlled receipt/export/transport
 contracts and retained-disk diagnostics exist, but a successful real native NVKE live-Run full-content join
 has not been demonstrated. Qualified release authorization, full v1 qualification/tag/revocation automation,
@@ -1308,7 +1331,7 @@ TCP/UDP 53 and UDP 67 collision rows additionally require native ARM64 root.
 Ordinary hosted tests do not establish those privileged socket observations.
 These tests do not prove real SIGINT during
 NVKE stages, privileged sudo/libvirt failure, runner/VM restart, or cancellation
-at every build/deployment phase. Network-only recovery uses version-2 journals
+at every build/deployment phase. Network-only recovery uses version-3 journals
 and never kills serialized PIDs; restore legacy live controls before upgrading.
 A full tenant crash/restart and recovery matrix remains unverified.
 
@@ -1679,47 +1702,6 @@ PR #97 branch. Removing an authored exception neither changes those provider pol
 The existing provider secret is `NKE_SOURCE_TOKEN`; the rename retains that exact
 credential reference, not an unprovisioned `NVKE_SOURCE_TOKEN`. Package Actions read access, native pool capacity and successful exact-head
 execution remain external acceptance requirements.
-
-## Framework and product naming cutover
-
-The NVKR namespace migration renames authored inputs, Go packages, public commands,
-schema/media types and structured identity families. These contracts do not convert
-historical signed bytes or imply external deployment acceptance. Generated records
-must be regenerated from the renamed authored inputs.
-
-The current hosted path retains the existing provider-owned `nkd-arc` and
-`nkd-release` protected environments and `NKE_SOURCE_TOKEN`. CODEOWNERS uses the
-provider-renamed `nvke-write` team with verified NVKR repository write access;
-the old `nke-write` slug no longer exists. Published Packer/inspector subjects
-stay at their exact
-`ghcr.io/dsx-ai-factory/nke-recipes/m2-candidate/toolchains/` addresses with the
-existing digests. Their plugin path, inspector executable and report properties
-`nkd:diskContentClass`, `nkd:packageFormat`, `nkd:packageArchitecture` and
-`nkd:containedIn` remain the pinned in-image ABI. Host-generated evidence metadata
-continues to use `nvkr:*`. The external package-capture envelope remains
-`nkd.dev/package-acquisitions/v1`, emitted by the selected NVKE producer; internal
-NVKR evidence identities remain distinct. Go network recovery preserves its complete
-version-2 durable host namespace and shared coordination lock. These are explicit
-external/durable contract exceptions, not public namespace aliases.
-Retained node, package, Kubernetes and Packer names are compatibility contracts,
-not missing rebranding work. Source repinning or an independently changed ABI
-requires its own validation and is not part of this naming cutover.
-
-Private toolchain credential preparation includes one narrowly scoped naming-cutover
-exception: the maintained `ghcr.io/dsx-ai-factory/nvkr/m2-candidate` publication
-prefix can pull digest-pinned images from the existing `nke-recipes/m2-candidate/toolchains/`
-namespace. It does not grant a credential to arbitrary images or other publication
-prefixes. Remove that compatibility exception only after all selected legacy
-toolchain subjects have authenticated replacement pins under the normal publication
-namespace and the regenerated Run passes its credential-boundary checks.
-
-The standalone renamed execution helper has measured AMD64/ARM64 executable pins;
-its image pins remain unpublished. Any independently chosen provider-name or
-runtime-publication migration requires verified provisioning, permissions,
-digest measurements and operational read-back; retaining existing contracts
-does not require that migration. Contract tests do not establish an external
-cutover, hosted publication, independent consumer acceptance or qualification.
-
 
 ## Maintained input and schema boundaries
 
