@@ -1481,8 +1481,23 @@ original publication reference, signing record and predicate for the qualificati
 restoring output payload packages. Development finalization
 retains only the six aggregate/tool controls because it emits no qualification handoff. Assembly/finalization need
 registry read access, not OIDC or package-write
-permission. Production rejects arbitrary static credentials; the explicit development mode uses its admitted
-scoped read/write credentials. Local execution and dry-run signing reject this mode.
+permission. Production admits a fixed independent reader/writer credential policy; arbitrary static
+credentials remain rejected. Development retains its separate fixed credential policy. Local execution
+and dry-run signing reject this mode.
+
+Maintained production/nightly generation selects fixed independent
+registry reader/writer credentials, including native toolchain preparation, qualification/smoke and nightly
+runtime consumers. Hosted publication now rejects repository-linked packages even while their repository is
+private. Production qualification generation rejects workflow-token publication and target credentials
+before emitting a bundle, matching its fixed independent writer. Regression cases cover legacy publication,
+legacy targets and their combination; local execution of these cases remains deferred to CI.
+Image-reader account and token bindings use explicit caller inputs, with empty defaults only
+for absent image preparation; composite metadata contains no caller-only variable/secret references.
+Code and regression coverage are prepared; local unit execution is intentionally deferred.
+[PR CI at 6f8afe62](https://github.com/dsx-ai-factory/nvkr/actions/runs/38983931671) passed before
+the composite account-binding correction; it does not prove action loading or registry access.
+No hosted production execution of this change is claimed. Provider package ACL migration, explicit Actions-grant removal,
+credential provisioning and denial tests remain operator work before public visibility.
 
 [Production Run 38977394488](https://github.com/dsx-ai-factory/nvkr/actions/runs/38977394488),
 head `d996200b77848293b18d3861b9f1db1e8b41b423`, attempt 1 completed 579 jobs but its
