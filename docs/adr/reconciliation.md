@@ -1539,7 +1539,10 @@ selection and payload-substitution fixtures cover these boundaries, not a fresh 
 build/deployment. Source host-policy decoding is local and uses the existing
 strict YAML admission; CRD schema validation remains at the server create.
 After deployment and before temporary bootstrap teardown, it imports
-the original host policy without replacement, checks the controller/CSI context,
+the original host policy once without replacement, using the caller's work deadline
+for API discovery, schema validation and creation. Private identity diagnostics
+retain the underlying command failure before the public error is redacted.
+It checks the controller/CSI context,
 permanent registration, derived TPM allowlist, new TPM agent and renewed
 same-boot host certificate, then issues its private completion receipt. Joined
 site-stage failures retain their resources under the independent owner while the
@@ -2060,6 +2063,14 @@ with bounded termination grace. Context/transport and real-subprocess tests cove
 deadline propagation, cancellation and joining; these do not establish a fresh
 E2E or conformance result. Connection/probe bounds, identity validity, independent
 cleanup and authored/upstream producer policies remain separate.
+
+Read-only native readiness queries retry an independently bounded command timeout
+only after the command owner confirms joined execution and successful diagnostic
+drains, while the original deployment deadline remains active. Partial timed-out
+responses cannot establish readiness. Caller expiry/cancellation, unjoined work,
+simulator exit and changed ownership still stop the attempt; mutation commands are
+never replayed. Controlled real-subprocess tests cover timeout recovery and caller
+deadline precedence on both hosts; fresh runtime acceptance remains separate.
 
 Site installation uses the selected NVKE installer's existing Helm post-renderer
 handoff. A private Helm subprocess plugin delegates YAML transformation to the
