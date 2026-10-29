@@ -36,8 +36,7 @@ func GeneratorVersion(version, commit string) string {
 // pseudoVersionGeneratorBuild reports whether info is a module-mode install of
 // an NVKR commit. Checkout builds also record pseudo-versions, but no checksum.
 func pseudoVersionGeneratorBuild(info *debug.BuildInfo, ok bool) bool {
-	return ok && info != nil && info.Main.Path == githubRunnerModule && info.Main.Sum != "" &&
-		githubPseudoVersionPattern.MatchString(info.Main.Version)
+	return moduleGeneratorBuild(info, ok) && githubPseudoVersionPattern.MatchString(info.Main.Version)
 }
 
 // GeneratorLinkerFlags returns the validated Go linker flags that reproduce a

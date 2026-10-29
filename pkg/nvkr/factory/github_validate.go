@@ -349,7 +349,7 @@ func ValidateGitHubBundle(ctx context.Context, plan *Plan, bundle *GeneratedBund
 		}
 		// The bootstrap must provision the Go toolchain via the pinned setup-go action rather
 		// than assume a preinstalled Go: the checkout's .go-version for a source build, or the
-		// released generator's own Go release for its pinned runner.
+		// module-installed generator's own Go release for its pinned runner.
 		release, err := githubRunnerReleaseForGenerator()
 		if err != nil {
 			return err

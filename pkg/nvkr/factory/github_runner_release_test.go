@@ -39,7 +39,13 @@ func TestGitHubRunnerReleaseForGenerator(t *testing.T) {
 		{name: "development build", info: releasedGeneratorBuildInfo("(devel)", "", "go1.27.3")},
 		{name: "tagged local checkout", info: releasedGeneratorBuildInfo("v1.2.3", "", "go1.27.3")},
 		{name: "dirty local checkout", info: releasedGeneratorBuildInfo("v1.2.3+dirty", sum, "go1.27.3")},
-		{name: "pseudo-version", info: releasedGeneratorBuildInfo("v1.2.4-0.20261028120000-abcdefabcdef", sum, "go1.27.3")},
+		{name: "commit install", info: releasedGeneratorBuildInfo("v1.2.4-0.20261028120000-abcdefabcdef", sum, "go1.27.3"),
+			want: githubRunnerRelease{Version: "v1.2.4-0.20261028120000-abcdefabcdef", Sum: sum, GoVersion: "1.27.3"}},
+		{name: "commit install before any tag", info: releasedGeneratorBuildInfo("v0.0.0-20261028120000-abcdefabcdef", sum, "go1.27.3"),
+			want: githubRunnerRelease{Version: "v0.0.0-20261028120000-abcdefabcdef", Sum: sum, GoVersion: "1.27.3"}},
+		{name: "pseudo-version checkout build", info: releasedGeneratorBuildInfo("v1.2.4-0.20261028120000-abcdefabcdef+dirty", "", "go1.27.3")},
+		{name: "commit install with unsupported checksum", info: releasedGeneratorBuildInfo("v1.2.4-0.20261028120000-abcdefabcdef", "h2:abc", "go1.27.3"),
+			code: e.CodeEngineCapability},
 		{name: "other module", info: &debug.BuildInfo{GoVersion: "go1.27.3", Main: debug.Module{Path: "example.com/fork", Version: "v1.2.3", Sum: sum}}},
 		{name: "release", info: releasedGeneratorBuildInfo("v1.2.3", sum, "go1.27.3"), want: testRunnerRelease},
 		{name: "prerelease", info: releasedGeneratorBuildInfo("v1.3.0-rc.1", sum, "go1.27.3"),
@@ -162,11 +168,12 @@ func TestRenderGitHubLabelsUnstampedReleasedGenerator(t *testing.T) {
 	}
 }
 
-// An unstamped `go install …@<commit>` generator is a development build: its
-// Plan records the commit its pseudo-version encodes, and the source bootstrap
-// restamps that same label into the runner built from the checkout.
-func TestRenderGitHubLabelsUnstampedCommitGenerator(t *testing.T) {
-	useGitHubGeneratorBuildInfo(t, releasedGeneratorBuildInfo("v1.2.4-0.20261028120000-abcdefabcdef", testRunnerRelease.Sum, "go1.27.3"))
+// An unstamped `go install …@<commit>` generator records the commit its
+// pseudo-version encodes, and every bootstrap installs that exact module version
+// from its published source, never the checkout, and restamps the same label.
+func TestRenderGitHubPinsUnstampedCommitGenerator(t *testing.T) {
+	const version = "v1.2.4-0.20261028120000-abcdefabcdef"
+	useGitHubGeneratorBuildInfo(t, releasedGeneratorBuildInfo(version, testRunnerRelease.Sum, "go1.27.3"))
 	plan := githubTestPlan(t)
 	plan.GeneratorVersion = GeneratorVersion(UnstampedGeneratorVersion, UnstampedGeneratorCommit)
 	bundle, err := RenderGitHub(context.Background(), plan)
@@ -174,14 +181,28 @@ func TestRenderGitHubLabelsUnstampedCommitGenerator(t *testing.T) {
 		t.Fatal(err)
 	}
 	workflow := expandedGitHubWorkflow(t, bundle)
-	required := "go install -trimpath -ldflags '-X main.version=dev -X main.commit=abcdefabcdef' ./cmd/nvkr\n"
-	if !bytes.Contains(workflow, []byte(required)) {
-		t.Fatalf("commit generator bundle omits %q", required)
+	for _, required := range []string{
+		"go-version: '1.27.3'",
+		"go install -trimpath -ldflags '-X main.version=dev -X main.commit=abcdefabcdef' " + nvkrRunnerPackage + "@" + version + "\n",
+		"test \"$installed\" = '" + githubRunnerModule + " " + version + " " + testRunnerRelease.Sum + "'\n",
+	} {
+		if !bytes.Contains(workflow, []byte(required)) {
+			t.Errorf("commit generator bundle omits %q", required)
+		}
 	}
-	if bytes.Contains(workflow, []byte(nvkrRunnerPackage+"@")) {
-		t.Fatal("commit generator bundle installs a published runner module")
+	for _, forbidden := range []string{"go-version-file", " ./cmd/nvkr\n"} {
+		if bytes.Contains(workflow, []byte(forbidden)) {
+			t.Errorf("commit generator bundle contains %q", forbidden)
+		}
+	}
+	helper, found := bundle.Files[githubCITransferPath(plan, "bootstrap-download")+"/action.yml"]
+	if !found || !strings.Contains(string(helper), githubRunnerModule+"@"+version) || !strings.Contains(string(helper), testRunnerRelease.Sum) {
+		t.Fatal("transport helper bootstrap is not pinned to the commit generator's module version")
 	}
 	if got := GeneratorVersion(UnstampedGeneratorVersion, "abcdefabcdef"); got != plan.GeneratorVersion {
 		t.Fatalf("restamped runner label = %q; want %q", got, plan.GeneratorVersion)
+	}
+	if err := ValidateGitHubBundle(context.Background(), plan, bundle); err != nil {
+		t.Fatalf("commit generator bundle does not validate under the same build: %v", err)
 	}
 }
