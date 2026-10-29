@@ -27,6 +27,8 @@ func releasedGeneratorBuildInfo(version, sum, goVersion string) *debug.BuildInfo
 	return &debug.BuildInfo{GoVersion: goVersion, Main: debug.Module{Path: githubRunnerModule, Version: version, Sum: sum}}
 }
 
+// Only a module-mode install of an exact release or commit pins the runner to
+// a module version; checkout builds and other modules build from source.
 func TestGitHubRunnerReleaseForGenerator(t *testing.T) {
 	sum := testRunnerRelease.Sum
 	for _, test := range []struct {
@@ -104,6 +106,8 @@ func TestRenderGitHubPinsReleasedGeneratorRunner(t *testing.T) {
 	assertFactoryErrorCode(t, ValidateGitHubBundle(context.Background(), plan, bundle), e.CodeEngineCapability)
 }
 
+// Linker stamps win; unstamped release and commit installs are labeled from
+// build information, and every label round-trips through linker flags.
 func TestGeneratorVersion(t *testing.T) {
 	sum := testRunnerRelease.Sum
 	for _, test := range []struct {

@@ -39,6 +39,7 @@ func main() {
 	}
 }
 
+// newApp builds the CLI; `--version` prints the same generator label Plans record.
 func newApp() *cli.App {
 	var workCancel context.CancelFunc
 	app := &cli.App{
