@@ -115,10 +115,18 @@ func TestGeneratorVersion(t *testing.T) {
 			info: releasedGeneratorBuildInfo("v1.2.3", sum, "go1.27.3"), want: "v1.2.3 (unknown)"},
 		{name: "unstamped prerelease install", version: UnstampedGeneratorVersion, commit: UnstampedGeneratorCommit,
 			info: releasedGeneratorBuildInfo("v1.3.0-rc.1", sum, "go1.27.3"), want: "v1.3.0-rc.1 (unknown)"},
+		{name: "unstamped commit install", version: UnstampedGeneratorVersion, commit: UnstampedGeneratorCommit,
+			info: releasedGeneratorBuildInfo("v1.2.4-0.20261028120000-abcdefabcdef", sum, "go1.27.3"), want: "dev (abcdefabcdef)"},
+		{name: "unstamped commit install before any tag", version: UnstampedGeneratorVersion, commit: UnstampedGeneratorCommit,
+			info: releasedGeneratorBuildInfo("v0.0.0-20261028120000-abcdefabcdef", sum, "go1.27.3"), want: "dev (abcdefabcdef)"},
 		{name: "unstamped other module", version: UnstampedGeneratorVersion, commit: UnstampedGeneratorCommit,
 			info: &debug.BuildInfo{Main: debug.Module{Path: "example.com/fork", Version: "v1.2.3", Sum: sum}}, want: "dev (unknown)"},
+		{name: "unstamped other module commit install", version: UnstampedGeneratorVersion, commit: UnstampedGeneratorCommit,
+			info: &debug.BuildInfo{Main: debug.Module{Path: "example.com/fork", Version: "v1.2.4-0.20261028120000-abcdefabcdef", Sum: sum}}, want: "dev (unknown)"},
 		{name: "stamped release install", version: "v9.9.9", commit: "cafef00d",
 			info: releasedGeneratorBuildInfo("v1.2.3", sum, "go1.27.3"), want: "v9.9.9 (cafef00d)"},
+		{name: "stamped commit install", version: "v9.9.9", commit: "cafef00d",
+			info: releasedGeneratorBuildInfo("v1.2.4-0.20261028120000-abcdefabcdef", sum, "go1.27.3"), want: "v9.9.9 (cafef00d)"},
 		{name: "stamped commit only", version: UnstampedGeneratorVersion, commit: "cafef00d",
 			info: releasedGeneratorBuildInfo("v1.2.3", sum, "go1.27.3"), want: "dev (cafef00d)"},
 	} {
@@ -150,6 +158,30 @@ func TestRenderGitHubLabelsUnstampedReleasedGenerator(t *testing.T) {
 		t.Fatalf("released generator bundle omits %q", required)
 	}
 	if got := GeneratorVersion("v1.2.3", UnstampedGeneratorCommit); got != plan.GeneratorVersion {
+		t.Fatalf("restamped runner label = %q; want %q", got, plan.GeneratorVersion)
+	}
+}
+
+// An unstamped `go install …@<commit>` generator is a development build: its
+// Plan records the commit its pseudo-version encodes, and the source bootstrap
+// restamps that same label into the runner built from the checkout.
+func TestRenderGitHubLabelsUnstampedCommitGenerator(t *testing.T) {
+	useGitHubGeneratorBuildInfo(t, releasedGeneratorBuildInfo("v1.2.4-0.20261028120000-abcdefabcdef", testRunnerRelease.Sum, "go1.27.3"))
+	plan := githubTestPlan(t)
+	plan.GeneratorVersion = GeneratorVersion(UnstampedGeneratorVersion, UnstampedGeneratorCommit)
+	bundle, err := RenderGitHub(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := expandedGitHubWorkflow(t, bundle)
+	required := "go install -trimpath -ldflags '-X main.version=dev -X main.commit=abcdefabcdef' ./cmd/nvkr\n"
+	if !bytes.Contains(workflow, []byte(required)) {
+		t.Fatalf("commit generator bundle omits %q", required)
+	}
+	if bytes.Contains(workflow, []byte(nvkrRunnerPackage+"@")) {
+		t.Fatal("commit generator bundle installs a published runner module")
+	}
+	if got := GeneratorVersion(UnstampedGeneratorVersion, "abcdefabcdef"); got != plan.GeneratorVersion {
 		t.Fatalf("restamped runner label = %q; want %q", got, plan.GeneratorVersion)
 	}
 }

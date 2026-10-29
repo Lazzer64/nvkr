@@ -42,9 +42,12 @@ differs, so repositories without NVKR source, such as a customer recipes reposit
 generated them. The committed-generation check guards rendering differences between NVKR revisions; it is
 not a trust control over the runner, which the exact version and checksum pin provides. Such an install
 carries no linker stamps, so its generator version label comes from the same build information: the release
-version with an `unknown` commit, because module-mode builds record no VCS revision. Linker stamps still take
-precedence, and an unstamped development build keeps the fixed `dev (unknown)` label so committed bundles do
-not depend on the checked-out commit. The label is descriptive and grants no authority.
+version with an `unknown` commit, because module-mode builds record no VCS revision. A module-mode install of
+a commit (`go install …/cmd/nvkr@<commit>`, recorded as a pseudo-version with a module checksum) is a
+development build labeled `dev` with the 12-character revision its pseudo-version encodes. Linker stamps still
+take precedence, and other unstamped development builds, including checkout builds, keep the fixed
+`dev (unknown)` label so committed bundles do not depend on the checked-out commit. The label is descriptive
+and grants no authority.
 A future provider must satisfy its evidence admission before receiving an implementation. Adapters map **job/step
 topology and artifact transport only**, never build semantics. Adding an engine is one thin adapter; adding a
 component is one catalog entry and no code. Definition v5 names each output and its exact catalog producers.
