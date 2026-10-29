@@ -40,7 +40,11 @@ information records that version and its module checksum) emits bootstraps that 
 release with the generator's Go release and refuse a runner whose recorded module version or checksum
 differs, so repositories without NVKR source, such as a customer recipes repository, run the release that
 generated them. The committed-generation check guards rendering differences between NVKR revisions; it is
-not a trust control over the runner, which the exact version and checksum pin provides.
+not a trust control over the runner, which the exact version and checksum pin provides. Such an install
+carries no linker stamps, so its generator version label comes from the same build information: the release
+version with an `unknown` commit, because module-mode builds record no VCS revision. Linker stamps still take
+precedence, and an unstamped development build keeps the fixed `dev (unknown)` label so committed bundles do
+not depend on the checked-out commit. The label is descriptive and grants no authority.
 A future provider must satisfy its evidence admission before receiving an implementation. Adapters map **job/step
 topology and artifact transport only**, never build semantics. Adding an engine is one thin adapter; adding a
 component is one catalog entry and no code. Definition v5 names each output and its exact catalog producers.

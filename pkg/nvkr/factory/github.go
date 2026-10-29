@@ -640,8 +640,7 @@ type githubRunnerRelease struct {
 // local checkout, is a development build that builds the runner from source.
 func githubRunnerReleaseForGenerator() (githubRunnerRelease, error) {
 	info, ok := readGitHubGeneratorBuildInfo()
-	if !ok || info.Main.Path != githubRunnerModule || info.Main.Sum == "" ||
-		!githubReleaseVersionPattern.MatchString(info.Main.Version) || githubPseudoVersionPattern.MatchString(info.Main.Version) {
+	if !releasedGeneratorBuild(info, ok) {
 		return githubRunnerRelease{}, nil
 	}
 	if !githubModuleSumPattern.MatchString(info.Main.Sum) {
@@ -652,6 +651,14 @@ func githubRunnerReleaseForGenerator() (githubRunnerRelease, error) {
 		return githubRunnerRelease{}, e.New(e.CodeEngineCapability, "released generator %s was built with unreleased Go toolchain %s", info.Main.Version, info.GoVersion)
 	}
 	return githubRunnerRelease{Version: info.Main.Version, Sum: info.Main.Sum, GoVersion: goVersion[1]}, nil
+}
+
+// releasedGeneratorBuild reports whether info is a module-mode install of an
+// exact NVKR release: the build records the release version and its module
+// checksum. Checkout builds record no checksum, and pseudo-versions name no release.
+func releasedGeneratorBuild(info *debug.BuildInfo, ok bool) bool {
+	return ok && info != nil && info.Main.Path == githubRunnerModule && info.Main.Sum != "" &&
+		githubReleaseVersionPattern.MatchString(info.Main.Version) && !githubPseudoVersionPattern.MatchString(info.Main.Version)
 }
 
 // githubRunnerModule is the module that owns nvkrRunnerPackage.

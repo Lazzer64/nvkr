@@ -176,7 +176,7 @@ func cmdFactory() *cli.Command {
 	}
 }
 
-func factoryGeneratorVersion() string { return version + " (" + commit + ")" }
+func factoryGeneratorVersion() string { return factory.GeneratorVersion(version, commit) }
 
 // Provider adapters supply selectors and diagnostics only. Plan admission and all
 // execution/transport behavior remain in the factory module.
