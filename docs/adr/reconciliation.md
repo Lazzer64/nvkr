@@ -2976,6 +2976,29 @@ through the current head. The hosted Run above predates this internal extraction
 code; bundle identity does not make it a hosted execution of the refactored code. No hosted Run of the
 current head is recorded.
 
+Partitioned failure handling is contract-tested locally on the reference Plan and its finalizer, not
+externally exercised. The fixture compiles six repeated reference outputs into 72 operations; it does not
+cover the maintained product's native-disk, aggregate or Helm stage diversity. The contract evaluates
+outcomes over the model's partitions and hands them to the finalizer in collector shape; rendered
+worker/inline placement, worker guard expressions and worker report reconstruction are outside it. On
+that compiled partitioned per-output Plan, simulated provider outcomes for release verification failure,
+cancellation after the first worker, successful and failed recovery after an ancestor failure, and skipped descendants match
+flat ancestor evaluation for every original operation. Those outcomes, in the caller's collector shape,
+pass through finalizer recovery: each restore outcome follows its exact producer result, and restore
+validation refuses every incomplete set with `NVKR-E-PROVENANCE-MISSING`. This includes an inconsistent
+description in which only an operation that restores nothing failed. A worker that never reports, and
+missing, foreign, duplicate, malformed, unsupported, truncated or status-inconsistent member reports and
+canceled collectors, are refused with `NVKR-E-INVALID-CATALOG` before any recovery work. Finalizer
+cancellation returns `NVKR-E-TIMEOUT`. A lost worker is refused as an unaccounted report; it is not
+recorded as a per-operation cancellation. GitHub cancellation timing, worker startup failure and runner
+cleanup are not shown by these contracts. No Run has yet exercised a full-product partitioned failure or
+cancellation. Before the merge with main, the change passed the full local gate on Go 1.27.3 Darwin
+ARM64. Uncached `go test ./...` passed with `-timeout=90m`; under Go's default 10-minute timeout the
+lifecycle package timed out on that loaded shared host. The CI factory and lifecycle shards passed locally
+inside the 20-minute `GO_TEST_TIMEOUT` shard default. The gate also covered golangci-lint 2.14.0 with zero
+issues, vet, formatting, license headers, shellcheck, the CI-tool tests and vulnerability scanning. After
+the merge with main, merge-gate Actions run 40962543119 passed every factory, lifecycle and package shard.
+
 Earlier flat-layout measurements recorded 564 original jobs and 16 collectors, down from
 596 original jobs and 16 collectors in the private-storage draft based on the same upstream code.
 The production dependency graph then had 1,375 edges, down from 1,438. Logical Plan identity and original
