@@ -99,6 +99,9 @@ type Environment struct {
 	// GitHubRuntimePlan compiles current catalog pins at dispatch while retaining
 	// the reviewed named production workflow and its complete execution policy.
 	GitHubRuntimePlan bool `json:"githubRuntimePlan,omitempty"`
+	// GitHubExecutionPartitions distributes one Run across same-commit worker
+	// workflows while preserving the Definition's single release boundary.
+	GitHubExecutionPartitions bool `json:"githubExecutionPartitions,omitempty"`
 	// GitHubRuntimeSource permits one exact repository revision to be frozen
 	// for this production runtime Plan; the coordinator selects the main commit.
 	GitHubRuntimeSource *GitHubRuntimeSource `json:"githubRuntimeSource,omitempty"`

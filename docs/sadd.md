@@ -576,8 +576,9 @@ material where applicable. These dependencies cannot be replaced by caller-suppl
 Compilation resolves the selected Definition, Environment, and component catalogs into a plan, validates the
 complete artifact graph, and renders only admitted engines and lanes. The committed bundle is regenerated from
 the same inputs and engine; missing, extra or changed owned files cause drift failure (ADR-21).
-GitHub keeps named jobs, prerequisite closure and conditions visible in the entry workflow. All jobs retain
-their runner, permissions and time bounds inline. Manifest-owned composite actions expose fixed interfaces
+In the default flat projection, GitHub keeps named jobs, prerequisite closure and conditions visible in the
+entry workflow, and all jobs retain their runner, permissions and time bounds inline. Opt-in partitioning
+moves them, with those controls, into workers described below. Manifest-owned composite actions expose fixed interfaces
 for node/source execution, preparation, output collection and transport. Grouped jobs reuse the node interface; optional slots and
 individual transfer calls preserve arbitrary admitted output counts without new action variants. One canonical
 invocation-data member holds parameters with named operation roles. The runtime descriptor operation
@@ -589,7 +590,8 @@ Before checkout or input transfer, disk producers reject missing, symlink or non
 If the runner cannot open the fixed device read/write, one bounded noninteractive permission bootstrap
 sets mode 0666 and requires a successful open afterward. Failed mutation or access remains a capability
 rejection. Full helper-owned capacity and held KVM API admission remain required before work.
-Operator setup, timed producers and steps with referenced outcomes/outputs remain inline in the entry workflow.
+In the default flat projection, operator setup, timed producers and steps with referenced outcomes/outputs
+remain inline in the entry workflow; opt-in partition workers carry those jobs instead, except OIDC signers.
 This includes finalization and the final Run upload used by the
 closing summary; shared recovery precedes inline finalization. Static Plan/manifest references and source scheduling by target/consumer cohort
 reduce routine pin churn without changing executable Plan/IR identities. Workflow bytes remain stable only
@@ -628,13 +630,23 @@ a bounded two-hour budget for setup, transport, authentication and final record 
 Carrier and GHCR publication admission use the automatic repository token for source metadata, separately
 from the credential that accesses package metadata and registry bytes. Producers receive neither through
 these admission paths.
-Admission bounds expanded YAML parsing events as well as file bytes. No producer acquires a new cross-output barrier. Redundant dependency edges are removed only with the full
+Admission bounds expanded YAML parsing events as well as file bytes. The default flat projection adds no cross-output barrier. Redundant dependency edges are removed only with the full
 prerequisite closure preserved; authored setup, runtime variables, images or services that mention the
 direct dependency context retain the original lists.
 Large finalizers receive exact original job results through fixed, bounded collectors. A collector must
 succeed and report its complete Plan-derived membership before recovery; its aggregate status never replaces
-individual producer outcomes. Producer matrix and reusable callable scheduling remain deferred
-(ADR-18 §8); ADR-21 separately admits the fixed native qualification worker and its selected-platform matrix.
+individual producer outcomes. Opt-in execution partitioning groups dependency layers into same-commit callable
+workers, with original job IDs and per-job controls. OIDC-signing jobs stay in the entry workflow to preserve
+the authored signer identity policy. Partitions may delay independent work behind an earlier
+group, but original prerequisite results govern ordinary job admission. One complete Plan and one finalizer
+retain the Run and Release boundary. Exact regeneration admits every worker and caller connection under the
+same ownership manifest. Factory's provider-independent execution graph owns operation membership,
+success/completion conditions, recovery prerequisites, partition validation and exact outcome accounting;
+GitHub renders the typed model rather than deriving scheduling semantics from YAML. Reconciliation records
+full development execution and hosted signing/verification evidence. Local equivalence contracts cover
+failure and cancellation; full-product provider recovery and qualification remain unproven (ADR-18 §8).
+Producer matrices remain deferred; ADR-21 separately
+admits the fixed native qualification worker and its selected-platform matrix.
 
 An explicit GitHub development Environment selects a separate fixed bundle. It shares the
 compiler, helper and complete output checks with production, while keeping its Plan, workflow and
