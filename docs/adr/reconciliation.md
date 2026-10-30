@@ -2944,7 +2944,7 @@ missing, extra, failed, skipped, canceled, oversized and inconsistent reports, i
 An opt-in `githubExecutionPartitions` projection now generates bounded same-commit workers beneath one
 Definition/Plan/Run/Release. Focused local tests cover deterministic grouping, original job membership,
 worker/caller generation, exact-member tamper refusal and manifest retirement. The maintained development
-input projects to 21 workers with a 368,371-byte entry. OIDC-signing jobs remain inline to preserve the
+input projected to 21 workers with a 368,371-byte entry before timeout splitting and fragment forwarding (below). OIDC-signing jobs remain inline to preserve the
 entry certificate identity; generated caller/workers pass actionlint. These are
 local generation measurements, not product execution evidence. A separate minimal diagnostic at commit
 `902f3febd10cd61abecb82571f66283857169851` observed successful result forwarding on
@@ -3079,6 +3079,23 @@ estimates a 17–26% shorter development makespan across three assumed capacity 
 loss on any measured Plan. These are local simulated contracts, not hosted wall-time evidence. The hosted
 development Run above used the original depth grouping; the timeout grouping has not been externally
 exercised.
+
+Entry-workflow reduction keeps every signer inline. Workers now export per-consumer result fragments, and the
+entry joins one fragment per worker instead of re-projecting each member from the worker's complete report.
+Regeneration through `run generate` leaves the development Plan byte-identical. Against the 30-worker timeout
+layout, the entry falls from 373,817 to 264,038 bytes. The workers grow by 185,152 bytes in total, so the complete bundle grows by 75,373
+bytes, and the largest file is now the entry.
+Signer jobs and the finalizer are byte-identical. Expanded parsing events in the entry are unchanged at
+13,308, because signers dominate them: 139 OIDC jobs account for 10,984 events. The flat default producer
+remains at 394,695 bytes and 47,055 events, which is 94.1% of the 50,000-event bound. Its 139 signers
+account for 10,984 of those events. Contracts resolve every forwarded fragment back to the exact
+Plan-derived collector members, statuses and worker dependency reads. They also check that an unreported
+worker's fallback reproduces the replaced projection's null results and empty statuses. They also require each committed
+producer's OIDC jobs to sit in the entry workflow named by its anchored signer policy, and that policy to
+admit no other committed workflow file. Lowering refuses worker or caller `id-token` declarations with
+`CodeEngineCapability`. These are local generation and contract results. The hosted Run 40727132359 above
+predates fragment forwarding, so hosted execution of the new forwarding, including failure and cancellation
+reporting, is unrecorded. Signer relocation remains a proposed ADR-18 §8 design with no implementation.
 
 Earlier flat-layout measurements recorded 564 original jobs and 16 collectors, down from
 596 original jobs and 16 collectors in the private-storage draft based on the same upstream code.

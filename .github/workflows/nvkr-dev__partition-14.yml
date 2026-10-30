@@ -10,6 +10,24 @@ name: NVKR execution partition
         value: ${{ jobs.nvkr-partition-results.outputs.results }}
       statuses:
         value: ${{ jobs.nvkr-partition-results.outputs.statuses }}
+      nvkr-partition-18:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-partition-18 }}
+      nvkr-results-00:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-00 }}
+      nvkr-results-00-statuses:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-00-statuses }}
+      nvkr-results-02:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-02 }}
+      nvkr-results-02-statuses:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-02-statuses }}
+      nvkr-results-05:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-05 }}
+      nvkr-results-05-statuses:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-05-statuses }}
+      nvkr-results-0c:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-0c }}
+      nvkr-results-0c-statuses:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-0c-statuses }}
     secrets:
       NVKR_CI_STORAGE_READ_TOKEN:
         required: true
@@ -144,6 +162,15 @@ jobs:
     outputs:
       results: ${{ toJSON(needs) }}
       statuses: ${{ join(needs.*.result, ' ') }}
+      nvkr-partition-18: ${{ format('"nvkr-package-capnico-controller":{0},"nvkr-package-cluster-api-provider-provisioned":{1},"nvkr-package-cwe":{2},"nvkr-package-nico-reference-profiles-fixture":{3}', toJSON(needs['nvkr-package-capnico-controller']), toJSON(needs['nvkr-package-cluster-api-provider-provisioned']), toJSON(needs['nvkr-package-cwe']), toJSON(needs['nvkr-package-nico-reference-profiles-fixture'])) }}
+      nvkr-results-00: ${{ format('"nvkr-package-nico-reference-profiles-fixture":{0}', toJSON(needs['nvkr-package-nico-reference-profiles-fixture'])) }}
+      nvkr-results-00-statuses: ${{ format('{0}', needs['nvkr-package-nico-reference-profiles-fixture'].result) }}
+      nvkr-results-02: ${{ format('"nvkr-package-capnico-controller":{0}', toJSON(needs['nvkr-package-capnico-controller'])) }}
+      nvkr-results-02-statuses: ${{ format('{0}', needs['nvkr-package-capnico-controller'].result) }}
+      nvkr-results-05: ${{ format('"nvkr-package-cwe":{0}', toJSON(needs['nvkr-package-cwe'])) }}
+      nvkr-results-05-statuses: ${{ format('{0}', needs['nvkr-package-cwe'].result) }}
+      nvkr-results-0c: ${{ format('"nvkr-package-cluster-api-provider-provisioned":{0}', toJSON(needs['nvkr-package-cluster-api-provider-provisioned'])) }}
+      nvkr-results-0c-statuses: ${{ format('{0}', needs['nvkr-package-cluster-api-provider-provisioned'].result) }}
     steps:
       - name: Forward provider results
         run: ':'

@@ -10,6 +10,30 @@ name: NVKR execution partition
         value: ${{ jobs.nvkr-partition-results.outputs.results }}
       statuses:
         value: ${{ jobs.nvkr-partition-results.outputs.statuses }}
+      nvkr-partition-04:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-partition-04 }}
+      nvkr-partition-06:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-partition-06 }}
+      nvkr-partition-07:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-partition-07 }}
+      nvkr-partition-09:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-partition-09 }}
+      nvkr-partition-10:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-partition-10 }}
+      nvkr-partition-11:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-partition-11 }}
+      nvkr-partition-13:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-partition-13 }}
+      nvkr-partition-14:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-partition-14 }}
+      nvkr-results-03:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-03 }}
+      nvkr-results-03-statuses:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-03-statuses }}
+      nvkr-results-0e:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-0e }}
+      nvkr-results-0e-statuses:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-0e-statuses }}
     secrets:
       NVKR_CI_STORAGE_READ_TOKEN:
         required: true
@@ -86,6 +110,18 @@ jobs:
     outputs:
       results: ${{ toJSON(needs) }}
       statuses: ${{ join(needs.*.result, ' ') }}
+      nvkr-partition-04: ${{ format('"nvkr-tool-syft":{0}', toJSON(needs['nvkr-tool-syft'])) }}
+      nvkr-partition-06: ${{ format('"nvkr-tool-syft":{0}', toJSON(needs['nvkr-tool-syft'])) }}
+      nvkr-partition-07: ${{ format('"nvkr-tool-syft":{0}', toJSON(needs['nvkr-tool-syft'])) }}
+      nvkr-partition-09: ${{ format('"nvkr-tool-syft":{0}', toJSON(needs['nvkr-tool-syft'])) }}
+      nvkr-partition-10: ${{ format('"nvkr-tool-syft":{0}', toJSON(needs['nvkr-tool-syft'])) }}
+      nvkr-partition-11: ${{ format('"nvkr-tool-syft":{0}', toJSON(needs['nvkr-tool-syft'])) }}
+      nvkr-partition-13: ${{ format('"nvkr-tool-syft":{0}', toJSON(needs['nvkr-tool-syft'])) }}
+      nvkr-partition-14: ${{ format('"nvkr-tool-syft":{0}', toJSON(needs['nvkr-tool-syft'])) }}
+      nvkr-results-03: ${{ format('"nvkr-tool-cosign":{0}', toJSON(needs['nvkr-tool-cosign'])) }}
+      nvkr-results-03-statuses: ${{ format('{0}', needs['nvkr-tool-cosign'].result) }}
+      nvkr-results-0e: ${{ format('"nvkr-tool-syft":{0}', toJSON(needs['nvkr-tool-syft'])) }}
+      nvkr-results-0e-statuses: ${{ format('{0}', needs['nvkr-tool-syft'].result) }}
     steps:
       - name: Forward provider results
         run: ':'

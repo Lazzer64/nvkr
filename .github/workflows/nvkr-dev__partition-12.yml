@@ -10,6 +10,26 @@ name: NVKR execution partition
         value: ${{ jobs.nvkr-partition-results.outputs.results }}
       statuses:
         value: ${{ jobs.nvkr-partition-results.outputs.statuses }}
+      nvkr-results-00:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-00 }}
+      nvkr-results-00-statuses:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-00-statuses }}
+      nvkr-results-03:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-03 }}
+      nvkr-results-03-statuses:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-03-statuses }}
+      nvkr-results-05:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-05 }}
+      nvkr-results-05-statuses:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-05-statuses }}
+      nvkr-results-0a:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-0a }}
+      nvkr-results-0a-statuses:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-0a-statuses }}
+      nvkr-results-0b:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-0b }}
+      nvkr-results-0b-statuses:
+        value: ${{ jobs.nvkr-partition-results.outputs.nvkr-results-0b-statuses }}
     secrets:
       NVKR_CI_STORAGE_READ_TOKEN:
         required: true
@@ -173,6 +193,16 @@ jobs:
     outputs:
       results: ${{ toJSON(needs) }}
       statuses: ${{ join(needs.*.result, ' ') }}
+      nvkr-results-00: ${{ format('"nvkr-package-publication-temporal-ui-image":{0}', toJSON(needs['nvkr-package-publication-temporal-ui-image'])) }}
+      nvkr-results-00-statuses: ${{ format('{0}', needs['nvkr-package-publication-temporal-ui-image'].result) }}
+      nvkr-results-03: ${{ format('"nvkr-package-publication-temporal-admin-tools-image":{0}', toJSON(needs['nvkr-package-publication-temporal-admin-tools-image'])) }}
+      nvkr-results-03-statuses: ${{ format('{0}', needs['nvkr-package-publication-temporal-admin-tools-image'].result) }}
+      nvkr-results-05: ${{ format('"nvkr-package-publication-temporal-server-image":{0}', toJSON(needs['nvkr-package-publication-temporal-server-image'])) }}
+      nvkr-results-05-statuses: ${{ format('{0}', needs['nvkr-package-publication-temporal-server-image'].result) }}
+      nvkr-results-0a: ${{ format('"nvkr-package-publication-spire-tpm-server-image":{0}', toJSON(needs['nvkr-package-publication-spire-tpm-server-image'])) }}
+      nvkr-results-0a-statuses: ${{ format('{0}', needs['nvkr-package-publication-spire-tpm-server-image'].result) }}
+      nvkr-results-0b: ${{ format('"nvkr-package-publication-temporal":{0}', toJSON(needs['nvkr-package-publication-temporal'])) }}
+      nvkr-results-0b-statuses: ${{ format('{0}', needs['nvkr-package-publication-temporal'].result) }}
     steps:
       - name: Forward provider results
         run: ':'
