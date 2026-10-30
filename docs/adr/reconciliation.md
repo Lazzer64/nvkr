@@ -661,6 +661,12 @@ observations, without a shared Run/artifact record or a committed test of these 
 establish independently verifiable OS-material placement or a current product build. Offline input
 compilation and catalog-copy checks establish only the authored selections and bindings.
 
+The simplified Ubuntu 26.04 ARM64 SDK/package exercise remains a developer-local operator observation
+in the `unqualified-local-execution` lane. No shared immutable Run or artifact reference is available;
+local measurements do not establish an independently verifiable current build, reproduction,
+OS-material assembly, installation, dependency inspection or runtime acceptance. The other SDK routes
+remain unexercised; signing and publication remain deferred.
+
 Historical observations used the retired patched recipes and extra Debian execution protocol. Standalone
 package/image/chart payloads were removed during authorized cleanup. Their identities and observation scope
 remain in the [immutable prior record](https://github.com/dsx-ai-factory/nvkr/blob/7951d85513caa8fcfa576f9315372ab907f6d9c7/definitions/nvsentinel/README.md).
