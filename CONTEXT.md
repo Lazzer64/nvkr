@@ -449,8 +449,8 @@ _Avoid_: Build status, local clock, mutable release contents
 Reusable producer, source, tool, and pin declarations from which Definitions select their inputs.
 A registry may select shared, digest-pinned declaration fragments; its lock still owns the complete expanded
 source and artifact key sets. Fragments are authoring inputs, not additional lifecycle objects.
-A registry may also extend one commit- and digest-pinned remote base registry and change it with JSON Patch
-operations; its lock pins the merged key set and records no inheritance.
+A registry may also extend one remote base registry by URL and change it with JSON Patch operations; its
+lock pins the merged key set and records no inheritance.
 Command operands may reference confined files; loading expands their exact bytes into the existing argv.
 Captured compile inputs retain these files, while resolved command identities exclude their paths.
 _Avoid_: Inventory, registry destination

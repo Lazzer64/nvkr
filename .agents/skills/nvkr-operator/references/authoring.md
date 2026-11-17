@@ -70,8 +70,8 @@ new required outputs instead of fabricating a comparison.
 For source changes, inspect `catalog pin --help` and `catalog bump --help`; use their documented `--check`
 preview where supported, then apply the explicitly requested update. Source pin flags precede the positional
 source key. Use `catalog pin-artifacts` for its supported acquired-artifact path, reading its distinct options
-rather than assuming every pin command has check mode. For a registry that extends a remote base, change its
-`extends.source` URL commit and `sha256` together only when explicitly asked (see the [remote catalog
+rather than assuming every pin command has check mode. For a registry that extends a remote base, edit its
+`extends` URL or patches only when explicitly asked (see the [remote catalog
 section](../../../../docs/catalogs-and-components.md#extend-a-remote-catalog)), then pin the merged sources.
 Derived members update through their owning source. The
 [pin-set guide](../../../../docs/generic-pin-set-example.md) and [catalog maintenance

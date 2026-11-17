@@ -6,13 +6,10 @@ package catalog
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/url"
 	"path"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -21,65 +18,49 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-const (
-	remoteBaseHost = "raw.githubusercontent.com"
-	// MaxBasePatchOperations bounds the RFC 6902 operations one registry applies to its base.
-	MaxBasePatchOperations = 256
-)
+// MaxBasePatchOperations bounds the RFC 6902 operations one registry applies to its base.
+const MaxBasePatchOperations = 256
 
-var (
-	githubNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
-	fullCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
-)
-
-// RemoteDataProvider admits commit-addressed remote base inputs (ADR-22). The
-// loader authenticates every result; implementations only fetch bounded bytes.
+// RemoteDataProvider admits remote base registry inputs (ADR-22). The loader
+// validates every result; implementations only fetch bounded bytes.
 type RemoteDataProvider interface {
 	ReadRemoteContext(context.Context, string) ([]byte, error)
 }
 
-// registryExtends is the authored remote base reference. The registry is the
-// only owner of the base identity; the lock never records inheritance.
+// registryExtends is the authored remote base reference and the patch
+// operations that change it. The lock never records inheritance.
 type registryExtends struct {
 	Source  remoteBaseSource  `json:"source"`
 	Patches []json.RawMessage `json:"patches,omitempty"`
 }
 
-// remoteBaseSource is the commit-addressed base file and its exact-byte digest.
+// remoteBaseSource names the base registry file. Its URL may follow a branch
+// or tag; the lock pins the merged sources, not the base bytes.
 type remoteBaseSource struct {
-	URL    string `json:"url"`
-	SHA256 string `json:"sha256"`
+	URL string `json:"url"`
 }
 
-// baseLocation is a parsed commit-addressed raw.githubusercontent.com file.
+// baseLocation is a parsed HTTPS file location: one origin and a canonical path.
 type baseLocation struct {
-	owner, repo, commit string
-	file                string // repository-relative path
+	origin string // https://host
+	file   string // path below the origin, without a leading slash
 }
 
-// parseRemoteInputURL admits exactly one canonical commit-addressed GitHub raw
-// file. Branches, tags, short commits and any ambiguous URL spelling fail.
+// parseRemoteInputURL admits one canonical HTTPS file URL. Credentials, ports,
+// queries, fragments, percent escapes and dot segments fail rather than
+// leaving any ambiguity about which file is read.
 func parseRemoteInputURL(raw string) (baseLocation, error) {
 	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme != "https" || parsed.Host != remoteBaseHost || parsed.User != nil ||
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.Port() != "" || parsed.User != nil ||
 		parsed.Opaque != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" ||
 		parsed.RawPath != "" || strings.ContainsAny(raw, "%\\\x00") || parsed.String() != raw {
-		return baseLocation{}, e.New(e.CodeInvalidCatalog,
-			"remote base %q must be a canonical https://%s/<owner>/<repo>/<commit>/<path> URL", raw, remoteBaseHost)
+		return baseLocation{}, e.New(e.CodeInvalidCatalog, "remote base %q must be a canonical https://<host>/<path> URL", raw)
 	}
-	parts := strings.SplitN(strings.TrimPrefix(parsed.Path, "/"), "/", 4)
-	if len(parts) != 4 || !githubNamePattern.MatchString(parts[0]) || !githubNamePattern.MatchString(parts[1]) ||
-		strings.Trim(parts[1], ".") == "" {
-		return baseLocation{}, e.New(e.CodeInvalidCatalog, "remote base %q must name one GitHub owner and repository", raw)
-	}
-	if !fullCommitPattern.MatchString(parts[2]) {
-		return baseLocation{}, e.New(e.CodeInvalidCatalog,
-			"remote base %q must name a full 40-character lowercase commit, not a branch, tag or short commit", raw)
-	}
-	if err := validateCatalogPath(parts[3]); err != nil {
+	file := strings.TrimPrefix(parsed.Path, "/")
+	if err := validateCatalogPath(file); err != nil {
 		return baseLocation{}, e.Wrap(e.CodeInvalidCatalog, err, "remote base %q path", raw)
 	}
-	return baseLocation{owner: parts[0], repo: parts[1], commit: parts[2], file: parts[3]}, nil
+	return baseLocation{origin: "https://" + parsed.Host, file: file}, nil
 }
 
 // ValidateRemoteInputURL checks a remote catalog input location before any I/O.
@@ -99,17 +80,17 @@ func parseBaseURL(raw string) (baseLocation, error) {
 	return location, nil
 }
 
-// sibling resolves a path relative to the base registry's directory. Leading
-// parent segments may reach sibling inputs but never leave the repository.
+// sibling resolves a path relative to the base registry's directory on the same
+// origin. Leading parent segments may reach sibling inputs, never above the origin.
 func (location baseLocation) sibling(name string) (string, error) {
 	joined := path.Join(path.Dir(location.file), name)
 	if joined == "." || joined == ".." || strings.HasPrefix(joined, "../") {
-		return "", e.New(e.CodeInvalidCatalog, "remote base input %q leaves the base repository", name)
+		return "", e.New(e.CodeInvalidCatalog, "remote base input %q leaves the base origin", name)
 	}
 	if err := validateCatalogPath(joined); err != nil {
 		return "", err
 	}
-	return "https://" + remoteBaseHost + "/" + location.owner + "/" + location.repo + "/" + location.commit + "/" + joined, nil
+	return location.origin + "/" + joined, nil
 }
 
 // readRemote fetches one remote input through the bound provider's capability
@@ -191,7 +172,7 @@ func (provider remoteBaseProvider) ReadDirContext(_ context.Context, name string
 }
 
 func (provider remoteBaseProvider) Name() string {
-	return "remote:" + provider.location.owner + "/" + provider.location.repo + "@" + provider.location.commit
+	return "remote:" + provider.location.origin + "/" + provider.location.file
 }
 
 // memoryPatchFiles serves authenticated base patch bytes to resolvePatches.
@@ -240,20 +221,12 @@ func expandBase(reg *registryDoc, providers []DataProvider) error {
 	if err != nil {
 		return err
 	}
-	if !strings.HasPrefix(reg.Extends.Source.SHA256, "sha256:") || len(reg.Extends.Source.SHA256) != 71 ||
-		strings.Trim(reg.Extends.Source.SHA256[7:], "0123456789abcdef") != "" {
-		return e.New(e.CodeUnpinnedSource, "remote base %s needs a lowercase sha256:<64-hex> digest", reg.Extends.Source.URL)
-	}
 	if len(reg.Extends.Patches) > MaxBasePatchOperations {
 		return e.New(e.CodeInvalidCatalog, "remote base exceeds the %d-operation patch bound", MaxBasePatchOperations)
 	}
 	raw, err := parent.readRemote(reg.Extends.Source.URL)
 	if err != nil {
 		return err
-	}
-	sum := sha256.Sum256(raw)
-	if "sha256:"+hex.EncodeToString(sum[:]) != reg.Extends.Source.SHA256 {
-		return e.New(e.CodeInvalidCatalog, "remote base %s bytes do not match %s", reg.Extends.Source.URL, reg.Extends.Source.SHA256)
 	}
 	baseProvider := &boundContextProvider{ctx: parent.ctx, provider: remoteBaseProvider{parent: parent, location: location}}
 	base, err := decodeBaseRegistry(raw, reg.Extends.Source.URL, baseProvider)
@@ -264,6 +237,10 @@ func expandBase(reg *registryDoc, providers []DataProvider) error {
 	patched, err := applyBasePatches(base, reg.Extends.Patches)
 	if err != nil {
 		return err
+	}
+	// A child that declares no metadata presents the base's; its own wins whole.
+	if reg.Metadata == (Metadata{}) {
+		reg.Metadata = base.Metadata
 	}
 	return unionBase(reg, patched, declared, baseProvider)
 }

@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: nvkr.dev/catalog/v3
+kind: SourceBuildRegistry
+extends:
+  source:
+    url: https://raw.githubusercontent.com/dsx-ai-factory/nvkr/refs/tags/v0.1.0/inputs/catalogs/nvke/release/registry.yaml
+  patches:
+    - {op: replace, path: /sources/nvke/constraint, value: v0.23.1}
+    - {op: replace, path: /sources/nvke-cli/constraint, value: v0.23.1}
+    - {op: replace, path: /sources/nvke-helm/constraint, value: v0.23.1}

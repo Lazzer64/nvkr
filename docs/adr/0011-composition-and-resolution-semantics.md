@@ -35,7 +35,7 @@ This is an exact union of named declarations before ordinary pin resolution. Col
 import other fragments or override fields. Component source-key bindings are explicit and do not rewrite
 commands or material edges. Output selection and resolved graph identity are unchanged.
 
-A registry may also `extends` one commit- and digest-pinned remote base registry (ADR-22). This is the single
+A registry may also `extends` one remote base registry named by URL (ADR-22). This is the single
 permitted inheritance level: a base cannot itself extend. RFC 6902 JSON Patch operations authored beside the
 base reference are the only way to change inherited declarations. The child's own declarations are an exact
 union with the patched base; collisions fail, with no implicit override, precedence or deep merge. Resolved

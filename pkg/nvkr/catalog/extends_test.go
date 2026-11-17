@@ -24,10 +24,9 @@ import (
 )
 
 const (
-	extendsCommit = "36c4128e0d5a3b0e6b1f6f2c9d1e0a7b4c3d2e1f"
-	extendsRoot   = "https://raw.githubusercontent.com/acme/catalogs/" + extendsCommit + "/"
-	extendsBase   = extendsRoot + "catalogs/base/registry.yaml"
-	extendsPatch  = "diff --git a/README b/README\n"
+	extendsRoot  = "https://raw.githubusercontent.com/acme/catalogs/refs/tags/v0.1.0/"
+	extendsBase  = extendsRoot + "catalogs/base/registry.yaml"
+	extendsPatch = "diff --git a/README b/README\n"
 )
 
 // extendsFixture is a remote base exercising every relative input kind: a
@@ -135,8 +134,8 @@ type extendsChild struct {
 func (f *extendsFixture) child(t *testing.T) extendsChild {
 	t.Helper()
 	return extendsChild{
-		APIVersion: catalogAPIVersion, Kind: catalogKind, Metadata: f.base.Metadata,
-		Extends: &registryExtends{Source: remoteBaseSource{URL: extendsBase, SHA256: digestOf(f.files["catalogs/base/registry.yaml"])}},
+		APIVersion: catalogAPIVersion, Kind: catalogKind,
+		Extends: &registryExtends{Source: remoteBaseSource{URL: extendsBase}},
 	}
 }
 
@@ -239,31 +238,11 @@ func TestExtendsFailsClosed(t *testing.T) {
 		code   e.Code
 	}{
 		{"missing source", func(_ *extendsFixture, c *extendsChild) { c.Extends.Source = remoteBaseSource{} }, e.CodeInvalidCatalog},
-		{"wrong digest", func(_ *extendsFixture, c *extendsChild) { c.Extends.Source.SHA256 = digestOf([]byte("other")) }, e.CodeInvalidCatalog},
-		{"missing digest", func(_ *extendsFixture, c *extendsChild) { c.Extends.Source.SHA256 = "" }, e.CodeUnpinnedSource},
-		{"uppercase digest", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.Source.SHA256 = strings.ToUpper(c.Extends.Source.SHA256)
-		}, e.CodeUnpinnedSource},
-		{"branch ref", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.Source.URL = "https://raw.githubusercontent.com/acme/catalogs/refs/heads/main/catalogs/base/registry.yaml"
-		}, e.CodeInvalidCatalog},
-		{"tag ref", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.Source.URL = "https://raw.githubusercontent.com/acme/catalogs/refs/tags/v0.1.0/catalogs/base/registry.yaml"
-		}, e.CodeInvalidCatalog},
-		{"short commit", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.Source.URL = "https://raw.githubusercontent.com/acme/catalogs/36c4128/catalogs/base/registry.yaml"
-		}, e.CodeInvalidCatalog},
-		{"uppercase commit", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.Source.URL = strings.Replace(c.Extends.Source.URL, extendsCommit, strings.ToUpper(extendsCommit), 1)
-		}, e.CodeInvalidCatalog},
 		{"http", func(_ *extendsFixture, c *extendsChild) {
 			c.Extends.Source.URL = strings.Replace(c.Extends.Source.URL, "https", "http", 1)
 		}, e.CodeInvalidCatalog},
-		{"other host", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.Source.URL = strings.Replace(c.Extends.Source.URL, remoteBaseHost, "example.com", 1)
-		}, e.CodeInvalidCatalog},
 		{"port", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.Source.URL = strings.Replace(c.Extends.Source.URL, remoteBaseHost, remoteBaseHost+":443", 1)
+			c.Extends.Source.URL = strings.Replace(c.Extends.Source.URL, "githubusercontent.com", "githubusercontent.com:443", 1)
 		}, e.CodeInvalidCatalog},
 		{"query", func(_ *extendsFixture, c *extendsChild) { c.Extends.Source.URL += "?token=x" }, e.CodeInvalidCatalog},
 		{"fragment", func(_ *extendsFixture, c *extendsChild) { c.Extends.Source.URL += "#x" }, e.CodeInvalidCatalog},
@@ -279,15 +258,11 @@ func TestExtendsFailsClosed(t *testing.T) {
 		{"missing base", func(_ *extendsFixture, c *extendsChild) {
 			c.Extends.Source.URL = strings.Replace(c.Extends.Source.URL, "base/", "missing/", 1)
 		}, e.CodeFetchFailed},
-		{"nested extends", func(f *extendsFixture, c *extendsChild) {
-			raw := append(f.files["catalogs/base/registry.yaml"], []byte("extends:\n  source:\n    url: "+extendsBase+"\n    sha256: sha256:"+strings.Repeat("0", 64)+"\n")...)
-			f.files["catalogs/base/registry.yaml"] = raw
-			c.Extends.Source.SHA256 = digestOf(raw)
+		{"nested extends", func(f *extendsFixture, _ *extendsChild) {
+			f.files["catalogs/base/registry.yaml"] = append(f.files["catalogs/base/registry.yaml"], []byte("extends:\n  source:\n    url: "+extendsBase+"\n")...)
 		}, e.CodeInvalidCatalog},
-		{"unknown base field", func(f *extendsFixture, c *extendsChild) {
-			raw := append(f.files["catalogs/base/registry.yaml"], []byte("recipes: {}\n")...)
-			f.files["catalogs/base/registry.yaml"] = raw
-			c.Extends.Source.SHA256 = digestOf(raw)
+		{"unknown base field", func(f *extendsFixture, _ *extendsChild) {
+			f.files["catalogs/base/registry.yaml"] = append(f.files["catalogs/base/registry.yaml"], []byte("recipes: {}\n")...)
 		}, e.CodeInvalidCatalog},
 		{"changed base fragment", func(f *extendsFixture, _ *extendsChild) {
 			f.files["catalogs/shared/sources.yaml"] = append(f.files["catalogs/shared/sources.yaml"], '\n')
@@ -406,7 +381,7 @@ func TestExtendsLockMatchesMergedKeySetAndWritesUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(written), "extends") || strings.Contains(string(written), extendsCommit) {
+	if strings.Contains(string(written), "extends") || strings.Contains(string(written), "v0.1.0") {
 		t.Fatal("lock must not record inheritance")
 	}
 
@@ -415,5 +390,62 @@ func TestExtendsLockMatchesMergedKeySetAndWritesUnchanged(t *testing.T) {
 	writeExtendsChild(t, dir, child, lockFixture(t))
 	if _, err := LoadContext(t.Context(), Dir(dir)); catalogErrorCode(err) != e.CodeInvalidCatalog {
 		t.Fatalf("orphan pin for a removed base source: %v", err)
+	}
+}
+
+// TestExtendsNVKEReleaseExample replays the NVKE release example: a registry that
+// holds only a tag-addressed base URL and constraint patches, with the complete
+// merged lock. The base bytes are inputs/catalogs/nvke/release at nvkr v0.1.0.
+// Pin-set rederivation needs the NVKE upstream and is outside this offline test.
+func TestExtendsNVKEReleaseExample(t *testing.T) {
+	const (
+		root    = "testdata/extends-nvke-v0.1.0/"
+		baseURL = "https://raw.githubusercontent.com/dsx-ai-factory/nvkr/refs/tags/v0.1.0/inputs/catalogs/nvke/release/"
+	)
+	fetched := map[string]int{}
+	fetch := func(_ context.Context, location string) ([]byte, error) {
+		fetched[location]++
+		name, ok := strings.CutPrefix(location, baseURL)
+		if !ok {
+			return nil, e.New(e.CodeFetchFailed, "GET %s returned HTTP 404 Not Found", location)
+		}
+		return os.ReadFile(filepath.Join(root, "base", filepath.FromSlash(name)))
+	}
+	provider, err := BindContext(t.Context(), DirWithRemote(root+"child", fetch))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := readRegistry(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"nvke", "nvke-cli", "nvke-helm"} {
+		if got := reg.Sources[name].Constraint; got != "v0.23.1" {
+			t.Errorf("source %s constraint = %q, want the patched v0.23.1", name, got)
+		}
+	}
+	if reg.Metadata.Name != "nvke-controller" {
+		t.Errorf("metadata = %+v, want the base's", reg.Metadata)
+	}
+	lock, err := readLock(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateLockAgainstRegistry(reg, lock, true); err != nil {
+		t.Fatalf("example lock does not match the merged registry: %v", err)
+	}
+	component := "nvke-controller-profiles-image"
+	resolved, err := resolveComponent(component, reg.Components[component], reg.Sources, lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resolvePatches(reg.patchProvider(component, provider), component, &resolved, reg.Components[component].Patches); err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Commit != "347baabc64ba320176c6c2ef956e555350124d19" || len(resolved.Patches) != 1 {
+		t.Fatalf("component did not resolve against the example lock: commit %s, %d patches", resolved.Commit, len(resolved.Patches))
+	}
+	if fetched[baseURL+RegistryFile] != 1 || fetched[baseURL+"patches/profiles-image.patch"] != 1 {
+		t.Fatalf("unexpected fetches: %v", fetched)
 	}
 }

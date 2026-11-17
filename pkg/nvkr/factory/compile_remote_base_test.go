@@ -5,8 +5,6 @@ package factory
 
 import (
 	"context"
-	"crypto/sha256"
-	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -18,7 +16,7 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-const remoteBaseRoot = "https://raw.githubusercontent.com/acme/catalogs/36c4128e0d5a3b0e6b1f6f2c9d1e0a7b4c3d2e1f/catalog/"
+const remoteBaseRoot = "https://raw.githubusercontent.com/acme/catalogs/refs/heads/main/catalog/"
 
 func TestCompileSnapshotCapturesRemoteBase(t *testing.T) {
 	root, _, _ := snapshotFixture(t)
@@ -52,8 +50,7 @@ func TestCompileSnapshotCapturesRemoteBase(t *testing.T) {
 		t.Fatal(err)
 	}
 	child := map[string]any{"apiVersion": base["apiVersion"], "kind": base["kind"], "metadata": base["metadata"],
-		"extends": map[string]any{"source": map[string]any{"url": remoteBaseRoot + catalog.RegistryFile,
-			"sha256": fmt.Sprintf("sha256:%x", sha256.Sum256(remote[remoteBaseRoot+catalog.RegistryFile]))}}}
+		"extends": map[string]any{"source": map[string]any{"url": remoteBaseRoot + catalog.RegistryFile}}}
 	writeSnapshotFixtureDocument(t, root, "catalog/registry.yaml", child)
 	if err := os.RemoveAll(filepath.Join(root, "catalog", "patches")); err != nil {
 		t.Fatal(err)

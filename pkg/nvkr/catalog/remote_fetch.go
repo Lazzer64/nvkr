@@ -18,7 +18,7 @@ const (
 	maxRemoteCacheEntries = 256
 )
 
-// RemoteFetchFunc fetches one validated, commit-addressed remote catalog input.
+// RemoteFetchFunc fetches one validated remote catalog input URL.
 type RemoteFetchFunc func(context.Context, string) ([]byte, error)
 
 // DirWithRemote returns Dir with an explicit remote base transport. Callers
@@ -42,8 +42,8 @@ func (provider dirProvider) ReadRemoteContext(ctx context.Context, location stri
 	return fetch(ctx, location)
 }
 
-// remoteFetcher memoizes commit-addressed bytes for one process. Commit URLs
-// name immutable Git content; every consumer still authenticates declared digests.
+// remoteFetcher memoizes fetched bytes for one process, so every load and lock
+// write in that process reads the same base even if its branch or tag moves.
 type remoteFetcher struct {
 	client *http.Client
 

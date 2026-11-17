@@ -98,40 +98,46 @@ Moving identical inline bytes into a file therefore preserves those identities. 
 can differ in transport identity; they must be authenticated by their existing consuming boundary.
 This authoring form establishes no execution or release acceptance.
 
-**Remote base registries.** A registry may declare one `extends` base:
+**Remote base registries.** A registry may declare one `extends` base by URL:
 
 ```yaml
+apiVersion: nvkr.dev/catalog/v3
+kind: SourceBuildRegistry
 extends:
   source:
-    url: https://raw.githubusercontent.com/<owner>/<repo>/<40-hex commit>/<path>/registry.yaml
-    sha256: sha256:<64 lowercase hex>
+    url: https://raw.githubusercontent.com/<owner>/<repo>/refs/tags/<tag>/<path>/registry.yaml
   patches:                     # optional RFC 6902 operations on the expanded base
-    - {op: replace, path: /components/<name>/platforms, value: [linux/arm64]}
+    - {op: replace, path: /sources/<name>/constraint, value: v0.23.1}
 ```
 
-The URL names exactly one `raw.githubusercontent.com` file at a full lowercase commit; branch and tag
-names, short commits, other hosts, ports, user information, queries, fragments, percent escapes and
-non-canonical paths fail `invalid-catalog`. The registry is the only place the base identity lives. The lock
-is unaware of inheritance: it remains lock v1 and must match the complete merged key set exactly.
-Authors write both `source` values; NVKR never resolves a branch or tag into them. Moving the base is an ordinary
-reviewed registry edit, after which `catalog pin` and `bump` read the merged declarations like any other
-registry.
+The URL names one canonical HTTPS `registry.yaml` file; it may address a branch, tag or commit. User
+information, ports, queries, fragments, percent escapes and dot segments fail `invalid-catalog`. The lock is
+unaware of inheritance: it remains lock v1 with no base entry and must match the complete merged key set
+exactly. `catalog pin` and `bump` read the merged declarations like any other registry, so a patched
+constraint resolves to an ordinary pin.
 
-Loading fetches the base over HTTPS without redirects, under the per-file and aggregate catalog byte bounds,
-and rejects bytes that differ from `sha256`. The base must be strict catalog v3 without its own `extends`; its
-metadata is discarded. Its relative inputs are fetched from the same commit, resolved against the base's
-directory with the ordinary path rules: fragment imports (whose declared digests still authenticate them),
-patch files (authenticated by their declared digests) and file-backed command operands (bound only by the
-commit-addressed location). Loading then expands the base's operands and fragments, applies the patch
+The base bytes are not pinned. Every directory load reads what the URL serves at that moment (one process
+memoizes each URL, so a load and the lock write it authorizes agree). A branch or a moved tag can therefore
+change inherited declarations without a lock diff. The lock still catches added or removed sources and
+artifacts, pin-set disagreement and unpinned inputs; a changed build declaration surfaces as Plan or
+generated-bundle drift (`run generate --check`), not as a lock change. Authors who need a stable base address
+a commit or an immutable tag.
+
+Loading fetches the base over HTTPS without redirects, under the per-file and aggregate catalog byte bounds.
+The base must be strict catalog v3 without its own `extends`; a child that declares no metadata presents the
+base's. Relative inputs are fetched from the same origin, resolved against the base's directory with the
+ordinary path rules: fragment imports and patch files keep their declared digests, and file-backed command
+operands are bound only by location. Loading expands the base's operands and fragments, applies the patch
 operations to its `{sources, components}` document, strict-decodes the result and unions it with the child's
 own declarations and fragments. Operation paths must lie under `/sources/` or `/components/`; at most 256
 operations are accepted; a failed `test`, an unknown target or a collision fails `invalid-catalog`. A
 patched component may keep or drop the base's patch-file declarations but cannot add or alter one.
 
-Compile snapshots capture each remote input keyed by its URL; replay never consults the network. Providers
-that cannot fetch remote inputs fail `engine-capability`. Resolved catalog and Build identity exclude the
-URL, digest and patch operations and bind the expanded values. The digest and commit authenticate bytes,
-not publisher trust. This authoring form establishes no execution or release acceptance.
+Compile snapshots capture each remote input keyed by its URL; replay never consults the network, so a
+captured Plan is unaffected by later base changes. Providers that cannot fetch remote inputs fail
+`engine-capability`. Resolved catalog and Build identity exclude the URL and patch operations and bind the
+expanded values; extending a base without patches yields that base's own identity. This authoring form
+establishes no execution or release acceptance.
 
 Multiple components may share one source and therefore **bump atomically** (e.g. the Kubernetes-core binaries
 move together on a single lock entry).
@@ -488,7 +494,8 @@ remain follow-ups owned by ADR-11/13; this pinning contract does not implement t
 **Negative / costs**
 - Two files to understand (declare vs. resolve) and a load-time resolution step.
 - A registry with a remote base needs HTTPS access to that base on every directory load; only compile
-  snapshot replay is offline.
+  snapshot replay is offline. Its base bytes are not pinned, so a moving branch or tag changes inherited
+  declarations without a lock diff.
 - `catalog bump` needs network + git to resolve tags/commits and prebuilt digests; loading a pin set also
   requires its pinned Git objects.
 - A shared source means a bump moves several components at once (atomicity is intended, but coarse).
@@ -520,9 +527,10 @@ remain follow-ups owned by ADR-11/13; this pinning contract does not implement t
   modules of a monorepo to move together and re-introduces the churn `tagPrefix` exists to avoid.
 - **Resolve upstream version ranges at pin time.** Rejected — NVKR would re-decide what the upstream already
   decided, and two pins of the same tree could differ. A pin set reads exact declared versions (§7).
-- **Extend a remote base by branch or tag URL.** Rejected — every load would read whatever the ref names at
-  that moment. The registry records the resolved commit and digest instead.
-- **Record or flatten the remote base in the lock.** Rejected — the lock would own declarations as well as
+- **Pin the base by digest in the registry or by commit in the lock.** Not adopted — the registry stays a
+  URL plus patches and the lock stays inheritance-free; Plan drift and snapshot capture bound the effect of
+  a moving base instead.
+- **Flatten the base declarations into the lock.** Rejected — the lock would own declarations as well as
   pins, and local operand edits could leave flattened content silently stale.
 - **Hand-author each member pin and diff it against the upstream set by review.** Rejected — an unchecked
   convention. Re-derivation at validation time makes it a property the tooling enforces.
