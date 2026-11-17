@@ -61,6 +61,48 @@ Keep coordinated source roles aligned through a reviewed complete-lock update. A
 `pinnedBy` only when its owner explicitly maps an upstream version file to that member. See
 [catalog maintenance](catalog-maintenance.md) and [the pin-set example](generic-pin-set-example.md).
 
+## Extend a remote catalog
+
+A registry can inherit every source and component of one registry published in a GitHub repository, then
+change what it needs with [RFC 6902](https://www.rfc-editor.org/rfc/rfc6902) JSON Patch operations:
+
+```yaml
+apiVersion: nvkr.dev/catalog/v3
+kind: SourceBuildRegistry
+metadata:
+  name: nvke-arm64-site
+extends:
+  url: https://raw.githubusercontent.com/dsx-ai-factory/nvkr/1bfd35a07720938ad76e07f0c79807e36ee2ffd6/inputs/catalogs/nvke/release/registry.yaml
+  sha256: sha256:7cd81055f2e883077bcfc887f3e04e040d84fc806686eb1432a65833982722d6
+  patches:
+    - {op: test, path: /components/nvke-controller-chart/source, value: nvke-helm}
+    - {op: replace, path: /components/nvke-controller-chart/platforms, value: [linux/arm64]}
+```
+
+The URL always names a full commit, and `sha256` covers the base file's exact bytes. Let the tool write
+both from a branch or tag:
+
+```sh
+nvkr catalog extends --dir <catalog> \
+  --url https://raw.githubusercontent.com/dsx-ai-factory/nvkr/refs/heads/main/inputs/catalogs/nvke/release/registry.yaml
+nvkr catalog extends --dir <catalog> --ref refs/tags/v0.1.0   # move an existing base to another branch or tag
+```
+
+The command resolves the ref, checks that the result still loads, and rewrites only those two values.
+`--check` previews the change and returns `NVKR-E-DIFF`. Short commits are rejected.
+
+Loading fetches the base and its relative inputs (fragments, patch files and command-file operands) from
+that commit, applies the patches in order to its `sources` and `components`, then adds this registry's own
+declarations. Patch paths must start with `/sources/` or `/components/`. A name that collides with the
+base fails; change inherited entries with patches instead. Patches can drop the base's patch files but
+cannot add or change one. A base cannot extend another registry.
+
+`pins.lock.yaml` has no inheritance record. It pins the complete merged set of sources, so run
+`catalog pin` or `catalog bump` after changing the base. Loading needs HTTPS access to
+`raw.githubusercontent.com`; captured compile inputs keep the fetched bytes, so snapshot replay does not.
+The resolved catalog identity binds the merged values: extending a base without patches produces the
+same identity as that base loaded locally.
+
 ## Choose components for an output
 
 A **component** has an exact catalog key, such as `app-cli`, and a **producer** that builds or downloads

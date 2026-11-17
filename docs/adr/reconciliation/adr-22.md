@@ -22,6 +22,17 @@ lock resolution. Catalog tests cover aliasing, collisions, unknown inputs, conte
 provider admission and resource bounds; factory snapshot tests cover complete capture and replay. These
 contracts preserve resolved producer values and do not establish fresh build or runtime acceptance.
 
+Remote base registries (`extends`) are implemented for directory loads, lock maintenance and compile
+snapshots. Catalog contracts cover commit-only URL admission, base and fragment digests, base patch-file and
+command-operand fetches at the pinned commit, RFC 6902 application and path confinement, collisions, nested
+bases, provider admission and byte bounds, an inheritance-free lock over the merged key set, and identity
+equal to the same base loaded locally. `catalog extends` contracts cover branch, annotated-tag and
+slash-containing ref resolution with a fake `ls-remote`, byte-preserving rewrites, `--check`, candidate
+admission and the writer guard. `TestCompileSnapshotCapturesRemoteBase` covers capture, network-free replay
+and missing or tampered remote inputs. No maintained catalog extends a remote base and no hosted Run has
+loaded one; the providers used by the SDK client and toolchain repinning reject `extends` with
+`engine-capability`.
+
 File operands in build/vendor argv expand through bounded context-aware catalog providers.
 `TestCommandFilesIdentityGoldens` freezes equal inline/file Build and VendorSpec identities;
 catalog contracts cover byte preservation, platform overrides, confinement and resource limits.

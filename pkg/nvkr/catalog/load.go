@@ -85,7 +85,7 @@ func load(ctx context.Context, p DataProvider) (*Catalog, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := resolvePatches(p, name, &c, reg.Components[name].Patches); err != nil {
+		if err := resolvePatches(reg.patchProvider(name, p), name, &c, reg.Components[name].Patches); err != nil {
 			return nil, err
 		}
 		cat.Components[name] = c
@@ -153,6 +153,9 @@ func decodeRegistry(raw []byte, where string, providers ...DataProvider) (*regis
 		return nil, e.New(e.CodeInvalidCatalog, "catalog kind %q is unsupported; want exactly %q", reg.Kind, catalogKind)
 	}
 	if err := expandFragments(&reg, providers); err != nil {
+		return nil, err
+	}
+	if err := expandBase(&reg, providers); err != nil {
 		return nil, err
 	}
 	if err := validateRegistryDeclarations(&reg); err != nil {

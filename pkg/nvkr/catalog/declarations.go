@@ -42,12 +42,18 @@ const (
 // registryDoc is the hand-authored registry as parsed from disk, before sources
 // and lock pins are merged in.
 type registryDoc struct {
+	Extends    *registryExtends        `json:"extends,omitempty"`
 	Imports    []fragmentImport        `json:"imports,omitempty"`
 	APIVersion string                  `json:"apiVersion"`
 	Kind       string                  `json:"kind"`
 	Metadata   Metadata                `json:"metadata"`
 	Sources    map[string]Source       `json:"sources"`
 	Components map[string]rawComponent `json:"components"`
+
+	// inherited marks components from the remote base; their patch files are
+	// served from basePatchFiles, never from the child's root.
+	inherited      map[string]bool
+	basePatchFiles map[string][]byte
 }
 
 // rawComponent is a component as authored: it references a source by name and

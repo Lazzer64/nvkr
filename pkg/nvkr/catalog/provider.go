@@ -59,7 +59,10 @@ type ContextDataProvider interface {
 // dirProvider resolves every path component beneath one held root without following
 // symlinks. Platform helpers use descriptor-relative opens on supported Unix hosts;
 // unsupported hosts fail closed rather than falling back to pathname checks.
-type dirProvider struct{ root string }
+type dirProvider struct {
+	root   string
+	remote RemoteFetchFunc // nil uses the default commit-addressed HTTPS fetcher
+}
 
 // ReadFile and ReadDir satisfy the parser seam only to fail closed: directory
 // reads are authority-bearing I/O and run only through BindContext.

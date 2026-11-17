@@ -52,6 +52,8 @@ The tool and its catalogs are separate products: the tool owns resolution and ve
 provide reusable component producers and pins, including tool releases and GitHub actions.
 Explicit digest-pinned fragments share authored declarations before resolution; each catalog retains its own
 complete lock. Snapshot capture includes those fragment bytes and replay remains confined to captured inputs.
+A registry may extend one commit- and digest-pinned remote base and patch it with RFC 6902 operations;
+its lock pins the merged declarations, and snapshot capture records the fetched base inputs (ADR-11/22).
 File-backed build/vendor argv operands expand to exact bytes during catalog loading and join that captured
 closure; their paths do not enter resolved command identities (ADR-22).
 [ADR-22](adr/0022-catalog-pinning-and-the-lock-contract.md#github-action-dependencies) owns how generated

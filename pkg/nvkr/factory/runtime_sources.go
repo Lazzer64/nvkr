@@ -27,7 +27,7 @@ func CheckFrozenAuthoredInputs(ctx context.Context, plan *Plan, root string) err
 		return err
 	}
 	state := newInputState()
-	state.source = catalog.Dir(root).(catalog.ContextDataProvider)
+	state.source = captureSource(root)
 	for _, file := range plan.RuntimeInputs.Files {
 		raw, err := state.readFile(ctx, file.Path)
 		if err != nil {

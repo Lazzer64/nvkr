@@ -8,7 +8,6 @@ import (
 	"path"
 	"strings"
 
-	"github.com/dsx-ai-factory/nvkr/pkg/nvkr/catalog"
 	authored "github.com/dsx-ai-factory/nvkr/pkg/nvkr/definition"
 	e "github.com/dsx-ai-factory/nvkr/pkg/nvkr/errors"
 )
@@ -73,7 +72,7 @@ func checkGitHubRuntimeAuthoredInputs(ctx context.Context, plan *Plan, root stri
 	}
 	if plan.Composition != nil {
 		state := newInputState()
-		state.source = catalog.Dir(root).(catalog.ContextDataProvider)
+		state.source = captureSource(root)
 		raw, err := state.readFile(ctx, plan.DefinitionPath)
 		if err != nil {
 			return err

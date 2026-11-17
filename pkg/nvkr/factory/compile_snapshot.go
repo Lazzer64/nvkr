@@ -27,6 +27,14 @@ type InputSnapshot struct {
 	EnvironmentPath string                    `json:"environmentPath"`
 	Files           []InputFile               `json:"files"`
 	Directories     []InputDirectory          `json:"directories"`
+	Remote          []InputRemote             `json:"remote,omitempty"`
+}
+
+// InputRemote records one commit-addressed remote catalog input (ADR-22). Its
+// bytes stay descriptive: replay re-authenticates them through catalog loading.
+type InputRemote struct {
+	URL  string `json:"url"`
+	Data []byte `json:"data"`
 }
 
 type InputFile struct {
@@ -56,7 +64,7 @@ func CaptureCompileFiles(ctx context.Context, root, definitionPath, environmentP
 		return nil, InputSnapshot{}, e.New(e.CodeEngineCapability, "input capture requires bounded no-follow filesystem support")
 	}
 	state := newInputState()
-	state.source = catalog.Dir(root).(catalog.ContextDataProvider)
+	state.source = captureSource(root)
 	plan, err := compileInputState(ctx, state, definitionPath, environmentPath, generatorVersion)
 	if err != nil {
 		return nil, InputSnapshot{}, err
@@ -86,6 +94,9 @@ func CompileSnapshot(ctx context.Context, snapshot InputSnapshot, generatorVersi
 	for _, directory := range snapshot.Directories {
 		state.directories[directory.Path] = append([]string(nil), directory.Entries...)
 	}
+	for _, remote := range snapshot.Remote {
+		state.remote[remote.URL] = append([]byte(nil), remote.Data...)
+	}
 	plan, err := compileInputState(ctx, state, snapshot.DefinitionPath, snapshot.EnvironmentPath, generatorVersion)
 	if err != nil {
 		return nil, err
@@ -112,7 +123,8 @@ func CompileSnapshot(ctx context.Context, snapshot InputSnapshot, generatorVersi
 			return nil, err
 		}
 	}
-	if len(state.usedFiles) != len(state.files) || len(state.usedDirectories) != len(state.directories) {
+	if len(state.usedFiles) != len(state.files) || len(state.usedDirectories) != len(state.directories) ||
+		len(state.usedRemote) != len(state.remote) {
 		return nil, e.New(e.CodeInvalidCatalog, "input snapshot contains files or directory facts outside the compiled closure")
 	}
 	return plan, nil
@@ -277,6 +289,10 @@ func (provider *snapshotCatalogProvider) ReadFileContext(ctx context.Context, na
 		return nil, err
 	}
 	return provider.state.readFile(ctx, path.Join(provider.prefix, name))
+}
+
+func (provider *snapshotCatalogProvider) ReadRemoteContext(ctx context.Context, location string) ([]byte, error) {
+	return provider.state.readRemote(ctx, location)
 }
 
 func (provider *snapshotCatalogProvider) ReadDirContext(ctx context.Context, name string) ([]string, error) {

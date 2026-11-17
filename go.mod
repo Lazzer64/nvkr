@@ -12,6 +12,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.6
 	github.com/aws/smithy-go v1.28.7
 	github.com/dsx-ai-factory/nvke/agent v0.4.0
+	github.com/evanphx/json-patch/v5 v5.9.11
 	github.com/gdamore/tcell/v2 v2.13.10
 	github.com/google/go-containerregistry v0.22.1
 	github.com/moby/sys/mountinfo v0.7.3

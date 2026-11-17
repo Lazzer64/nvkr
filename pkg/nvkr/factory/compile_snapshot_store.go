@@ -19,18 +19,67 @@ import (
 // read the first time it is used, including shared base catalogs and patches.
 type inputState struct {
 	revisions       []*catalog.SourceRevision
-	source          catalog.ContextDataProvider
+	source          inputSource
 	files           map[string][]byte
 	directories     map[string][]string
+	remote          map[string][]byte
 	usedFiles       map[string]bool
 	usedDirectories map[string]bool
+	usedRemote      map[string]bool
 	totalBytes      int64
 	entries         int
 }
 
+// inputSource is the capture-time host: local authored files plus the
+// commit-addressed remote base inputs a registry may extend.
+type inputSource interface {
+	catalog.ContextDataProvider
+	catalog.RemoteDataProvider
+}
+
+// captureSource binds capture to the host repository. Tests substitute the
+// remote transport; catalog loading still authenticates every remote byte.
+var captureSource = func(root string) inputSource { return catalog.Dir(root).(inputSource) }
+
 func newInputState() *inputState {
-	return &inputState{files: map[string][]byte{}, directories: map[string][]string{},
-		usedFiles: map[string]bool{}, usedDirectories: map[string]bool{}}
+	return &inputState{files: map[string][]byte{}, directories: map[string][]string{}, remote: map[string][]byte{},
+		usedFiles: map[string]bool{}, usedDirectories: map[string]bool{}, usedRemote: map[string]bool{}}
+}
+
+// readRemote captures a remote catalog input on first use; replay serves only
+// captured bytes and never consults the network.
+func (state *inputState) readRemote(ctx context.Context, location string) ([]byte, error) {
+	if err := snapshotContext(ctx); err != nil {
+		return nil, err
+	}
+	if err := catalog.ValidateRemoteInputURL(location); err != nil {
+		return nil, err
+	}
+	raw, found := state.remote[location]
+	if !found {
+		if state.source == nil {
+			return nil, e.New(e.CodeInvalidCatalog, "input snapshot is missing remote input %q", location)
+		}
+		if state.entries >= catalog.MaxCatalogDirectoryEntries {
+			return nil, e.New(e.CodeInvalidCatalog, "input snapshot exceeds its entry bound")
+		}
+		var err error
+		raw, err = state.source.ReadRemoteContext(ctx, location)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, e.Wrap(e.CodeTimeout, ctx.Err(), "capturing remote input %q", location)
+			}
+			return nil, err
+		}
+		if int64(len(raw)) > catalog.MaxCatalogTotalBytes-state.totalBytes {
+			return nil, e.New(e.CodeInvalidCatalog, "input snapshot exceeds its aggregate byte bound")
+		}
+		state.totalBytes += int64(len(raw))
+		state.entries++
+		state.remote[location] = append([]byte(nil), raw...)
+	}
+	state.usedRemote[location] = true
+	return append([]byte(nil), raw...), nil
 }
 
 func (state *inputState) readFile(ctx context.Context, name string) ([]byte, error) {
@@ -110,6 +159,9 @@ func (state *inputState) snapshot(definitionPath, environmentPath string) InputS
 	for _, name := range sortedKeys(state.directories) {
 		result.Directories = append(result.Directories, InputDirectory{Path: name, Entries: append([]string{}, state.directories[name]...)})
 	}
+	for _, location := range sortedKeys(state.remote) {
+		result.Remote = append(result.Remote, InputRemote{URL: location, Data: append([]byte(nil), state.remote[location]...)})
+	}
 	return result
 }
 
@@ -132,13 +184,25 @@ func validateInputSnapshot(snapshot InputSnapshot) error {
 			return err
 		}
 	}
-	entries := len(snapshot.Files) + len(snapshot.Directories)
+	entries := len(snapshot.Files) + len(snapshot.Directories) + len(snapshot.Remote)
 	if entries > catalog.MaxCatalogDirectoryEntries {
 		return e.New(e.CodeInvalidCatalog, "input snapshot exceeds its entry bound")
 	}
 	files := map[string]bool{}
 	var total int64
 	previous := ""
+	for _, remote := range snapshot.Remote {
+		if err := catalog.ValidateRemoteInputURL(remote.URL); err != nil {
+			return err
+		}
+		if remote.URL <= previous || int64(len(remote.Data)) > catalog.MaxCatalogFileBytes ||
+			int64(len(remote.Data)) > catalog.MaxCatalogTotalBytes-total {
+			return e.New(e.CodeInvalidCatalog, "input snapshot remote inputs must be sorted, unique and within byte bounds")
+		}
+		previous = remote.URL
+		total += int64(len(remote.Data))
+	}
+	previous = ""
 	for _, file := range snapshot.Files {
 		if err := validateInputPath(file.Path); err != nil {
 			return err

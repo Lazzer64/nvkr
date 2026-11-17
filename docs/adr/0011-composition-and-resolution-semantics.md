@@ -26,7 +26,7 @@ complete required build graph directly from those producers.
 Each Definition output declares a concrete target platform, or an explicit required platform set for an OCI image index, and a nonempty explicit component selection.
 The output uses the Definition's catalog stack unless it supplies its own.
 Catalog sources, tools and components are reusable. There is no authored Recipe, reusable build
-group, criteria query, wildcard, specificity rule, inheritance chain, mixin, enable/disable merge, or reserved-axis
+group, criteria query, wildcard, specificity rule, multi-level inheritance chain, mixin, enable/disable merge, or reserved-axis
 activation. Removed fields and reserved legacy `overlays/` and `mixins/` directory layouts fail closed; they
 must not become ignored inputs.
 
@@ -34,6 +34,12 @@ Catalog registries may select explicit declarations from digest-pinned `CatalogF
 This is an exact union of named declarations before ordinary pin resolution. Collisions fail; fragments cannot
 import other fragments or override fields. Component source-key bindings are explicit and do not rewrite
 commands or material edges. Output selection and resolved graph identity are unchanged.
+
+A registry may also `extends` one commit- and digest-pinned remote base registry (ADR-22). This is the single
+permitted inheritance level: a base cannot itself extend. RFC 6902 JSON Patch operations authored beside the
+base reference are the only way to change inherited declarations. The child's own declarations are an exact
+union with the patched base; collisions fail, with no implicit override, precedence or deep merge. Resolved
+graph identity binds the expanded values, not the base reference or patch operations.
 
 Admission checks the complete catalog, unique selected IDs, supported target declarations, exact source/artifact/
 tool pins, and the producer route before graph generation or external work. Unknown components and unsupported
