@@ -41,9 +41,14 @@ type RemoteDataProvider interface {
 // registryExtends is the authored remote base reference. The registry is the
 // only owner of the base identity; the lock never records inheritance.
 type registryExtends struct {
-	URL     string            `json:"url"`
-	SHA256  string            `json:"sha256"`
+	Source  remoteBaseSource  `json:"source"`
 	Patches []json.RawMessage `json:"patches,omitempty"`
+}
+
+// remoteBaseSource is the commit-addressed base file and its exact-byte digest.
+type remoteBaseSource struct {
+	URL    string `json:"url"`
+	SHA256 string `json:"sha256"`
 }
 
 // baseLocation is a parsed commit-addressed raw.githubusercontent.com file.
@@ -213,7 +218,7 @@ func (files memoryPatchFiles) Name() string { return files.name }
 // files: the child's own root, or the bytes fetched from its remote base.
 func (reg *registryDoc) patchProvider(component string, local DataProvider) DataProvider {
 	if reg.inherited[component] {
-		return memoryPatchFiles{name: reg.Extends.URL, files: reg.basePatchFiles}
+		return memoryPatchFiles{name: reg.Extends.Source.URL, files: reg.basePatchFiles}
 	}
 	return local
 }
@@ -231,27 +236,27 @@ func expandBase(reg *registryDoc, providers []DataProvider) error {
 	if !ok {
 		return e.New(e.CodeEngineCapability, "remote base registries require a context-bound provider")
 	}
-	location, err := parseBaseURL(reg.Extends.URL)
+	location, err := parseBaseURL(reg.Extends.Source.URL)
 	if err != nil {
 		return err
 	}
-	if !strings.HasPrefix(reg.Extends.SHA256, "sha256:") || len(reg.Extends.SHA256) != 71 ||
-		strings.Trim(reg.Extends.SHA256[7:], "0123456789abcdef") != "" {
-		return e.New(e.CodeUnpinnedSource, "remote base %s needs a lowercase sha256:<64-hex> digest", reg.Extends.URL)
+	if !strings.HasPrefix(reg.Extends.Source.SHA256, "sha256:") || len(reg.Extends.Source.SHA256) != 71 ||
+		strings.Trim(reg.Extends.Source.SHA256[7:], "0123456789abcdef") != "" {
+		return e.New(e.CodeUnpinnedSource, "remote base %s needs a lowercase sha256:<64-hex> digest", reg.Extends.Source.URL)
 	}
 	if len(reg.Extends.Patches) > MaxBasePatchOperations {
 		return e.New(e.CodeInvalidCatalog, "remote base exceeds the %d-operation patch bound", MaxBasePatchOperations)
 	}
-	raw, err := parent.readRemote(reg.Extends.URL)
+	raw, err := parent.readRemote(reg.Extends.Source.URL)
 	if err != nil {
 		return err
 	}
 	sum := sha256.Sum256(raw)
-	if "sha256:"+hex.EncodeToString(sum[:]) != reg.Extends.SHA256 {
-		return e.New(e.CodeInvalidCatalog, "remote base %s bytes do not match %s", reg.Extends.URL, reg.Extends.SHA256)
+	if "sha256:"+hex.EncodeToString(sum[:]) != reg.Extends.Source.SHA256 {
+		return e.New(e.CodeInvalidCatalog, "remote base %s bytes do not match %s", reg.Extends.Source.URL, reg.Extends.Source.SHA256)
 	}
 	baseProvider := &boundContextProvider{ctx: parent.ctx, provider: remoteBaseProvider{parent: parent, location: location}}
-	base, err := decodeBaseRegistry(raw, reg.Extends.URL, baseProvider)
+	base, err := decodeBaseRegistry(raw, reg.Extends.Source.URL, baseProvider)
 	if err != nil {
 		return err
 	}
@@ -374,7 +379,7 @@ func unionBase(reg *registryDoc, patched baseDeclarations, declared map[patchDec
 	}
 	for _, name := range sortedKeys(patched.Sources) {
 		if _, duplicate := reg.Sources[name]; duplicate {
-			return e.New(e.CodeInvalidCatalog, "source %q collides with remote base %s; patch the base instead", name, reg.Extends.URL)
+			return e.New(e.CodeInvalidCatalog, "source %q collides with remote base %s; patch the base instead", name, reg.Extends.Source.URL)
 		}
 		reg.Sources[name] = patched.Sources[name]
 	}
@@ -382,7 +387,7 @@ func unionBase(reg *registryDoc, patched baseDeclarations, declared map[patchDec
 	reg.basePatchFiles = map[string][]byte{}
 	for _, name := range sortedKeys(patched.Components) {
 		if _, duplicate := reg.Components[name]; duplicate {
-			return e.New(e.CodeInvalidCatalog, "component %q collides with remote base %s; patch the base instead", name, reg.Extends.URL)
+			return e.New(e.CodeInvalidCatalog, "component %q collides with remote base %s; patch the base instead", name, reg.Extends.Source.URL)
 		}
 		component := patched.Components[name]
 		for _, declaration := range component.Patches {

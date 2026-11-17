@@ -72,21 +72,22 @@ kind: SourceBuildRegistry
 metadata:
   name: nvke-arm64-site
 extends:
-  url: https://raw.githubusercontent.com/dsx-ai-factory/nvkr/1bfd35a07720938ad76e07f0c79807e36ee2ffd6/inputs/catalogs/nvke/release/registry.yaml
-  sha256: sha256:7cd81055f2e883077bcfc887f3e04e040d84fc806686eb1432a65833982722d6
+  source:
+    url: https://raw.githubusercontent.com/dsx-ai-factory/nvkr/1bfd35a07720938ad76e07f0c79807e36ee2ffd6/inputs/catalogs/nvke/release/registry.yaml
+    sha256: sha256:7cd81055f2e883077bcfc887f3e04e040d84fc806686eb1432a65833982722d6
   patches:
     - {op: test, path: /components/nvke-controller-chart/source, value: nvke-helm}
     - {op: replace, path: /components/nvke-controller-chart/platforms, value: [linux/arm64]}
 ```
 
-The URL must name a full 40-character commit; branch names, tags and short commits are rejected, so
+The source URL must name a full 40-character commit; branch names, tags and short commits are rejected, so
 the base never changes underneath the catalog. `sha256` covers the base file's exact bytes:
 
 ```sh
 curl -fsSL <url> | shasum -a 256
 ```
 
-To move to a newer base, change both values in a reviewed edit.
+To move to a newer base, change both `source` values in a reviewed edit.
 
 Loading fetches the base and its relative inputs (fragments, patch files and command-file operands) from
 that commit, applies the patches in order to its `sources` and `components`, then adds this registry's own

@@ -52,8 +52,8 @@ func TestCompileSnapshotCapturesRemoteBase(t *testing.T) {
 		t.Fatal(err)
 	}
 	child := map[string]any{"apiVersion": base["apiVersion"], "kind": base["kind"], "metadata": base["metadata"],
-		"extends": map[string]any{"url": remoteBaseRoot + catalog.RegistryFile,
-			"sha256": fmt.Sprintf("sha256:%x", sha256.Sum256(remote[remoteBaseRoot+catalog.RegistryFile]))}}
+		"extends": map[string]any{"source": map[string]any{"url": remoteBaseRoot + catalog.RegistryFile,
+			"sha256": fmt.Sprintf("sha256:%x", sha256.Sum256(remote[remoteBaseRoot+catalog.RegistryFile]))}}}
 	writeSnapshotFixtureDocument(t, root, "catalog/registry.yaml", child)
 	if err := os.RemoveAll(filepath.Join(root, "catalog", "patches")); err != nil {
 		t.Fatal(err)

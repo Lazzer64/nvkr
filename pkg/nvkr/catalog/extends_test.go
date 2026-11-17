@@ -136,7 +136,7 @@ func (f *extendsFixture) child(t *testing.T) extendsChild {
 	t.Helper()
 	return extendsChild{
 		APIVersion: catalogAPIVersion, Kind: catalogKind, Metadata: f.base.Metadata,
-		Extends: &registryExtends{URL: extendsBase, SHA256: digestOf(f.files["catalogs/base/registry.yaml"])},
+		Extends: &registryExtends{Source: remoteBaseSource{URL: extendsBase, SHA256: digestOf(f.files["catalogs/base/registry.yaml"])}},
 	}
 }
 
@@ -238,53 +238,56 @@ func TestExtendsFailsClosed(t *testing.T) {
 		mutate func(*extendsFixture, *extendsChild)
 		code   e.Code
 	}{
-		{"wrong digest", func(_ *extendsFixture, c *extendsChild) { c.Extends.SHA256 = digestOf([]byte("other")) }, e.CodeInvalidCatalog},
-		{"missing digest", func(_ *extendsFixture, c *extendsChild) { c.Extends.SHA256 = "" }, e.CodeUnpinnedSource},
-		{"uppercase digest", func(_ *extendsFixture, c *extendsChild) { c.Extends.SHA256 = strings.ToUpper(c.Extends.SHA256) }, e.CodeUnpinnedSource},
+		{"missing source", func(_ *extendsFixture, c *extendsChild) { c.Extends.Source = remoteBaseSource{} }, e.CodeInvalidCatalog},
+		{"wrong digest", func(_ *extendsFixture, c *extendsChild) { c.Extends.Source.SHA256 = digestOf([]byte("other")) }, e.CodeInvalidCatalog},
+		{"missing digest", func(_ *extendsFixture, c *extendsChild) { c.Extends.Source.SHA256 = "" }, e.CodeUnpinnedSource},
+		{"uppercase digest", func(_ *extendsFixture, c *extendsChild) {
+			c.Extends.Source.SHA256 = strings.ToUpper(c.Extends.Source.SHA256)
+		}, e.CodeUnpinnedSource},
 		{"branch ref", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.URL = "https://raw.githubusercontent.com/acme/catalogs/refs/heads/main/catalogs/base/registry.yaml"
+			c.Extends.Source.URL = "https://raw.githubusercontent.com/acme/catalogs/refs/heads/main/catalogs/base/registry.yaml"
 		}, e.CodeInvalidCatalog},
 		{"tag ref", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.URL = "https://raw.githubusercontent.com/acme/catalogs/refs/tags/v0.1.0/catalogs/base/registry.yaml"
+			c.Extends.Source.URL = "https://raw.githubusercontent.com/acme/catalogs/refs/tags/v0.1.0/catalogs/base/registry.yaml"
 		}, e.CodeInvalidCatalog},
 		{"short commit", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.URL = "https://raw.githubusercontent.com/acme/catalogs/36c4128/catalogs/base/registry.yaml"
+			c.Extends.Source.URL = "https://raw.githubusercontent.com/acme/catalogs/36c4128/catalogs/base/registry.yaml"
 		}, e.CodeInvalidCatalog},
 		{"uppercase commit", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.URL = strings.Replace(c.Extends.URL, extendsCommit, strings.ToUpper(extendsCommit), 1)
+			c.Extends.Source.URL = strings.Replace(c.Extends.Source.URL, extendsCommit, strings.ToUpper(extendsCommit), 1)
 		}, e.CodeInvalidCatalog},
 		{"http", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.URL = strings.Replace(c.Extends.URL, "https", "http", 1)
+			c.Extends.Source.URL = strings.Replace(c.Extends.Source.URL, "https", "http", 1)
 		}, e.CodeInvalidCatalog},
 		{"other host", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.URL = strings.Replace(c.Extends.URL, remoteBaseHost, "example.com", 1)
+			c.Extends.Source.URL = strings.Replace(c.Extends.Source.URL, remoteBaseHost, "example.com", 1)
 		}, e.CodeInvalidCatalog},
 		{"port", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.URL = strings.Replace(c.Extends.URL, remoteBaseHost, remoteBaseHost+":443", 1)
+			c.Extends.Source.URL = strings.Replace(c.Extends.Source.URL, remoteBaseHost, remoteBaseHost+":443", 1)
 		}, e.CodeInvalidCatalog},
-		{"query", func(_ *extendsFixture, c *extendsChild) { c.Extends.URL += "?token=x" }, e.CodeInvalidCatalog},
-		{"fragment", func(_ *extendsFixture, c *extendsChild) { c.Extends.URL += "#x" }, e.CodeInvalidCatalog},
+		{"query", func(_ *extendsFixture, c *extendsChild) { c.Extends.Source.URL += "?token=x" }, e.CodeInvalidCatalog},
+		{"fragment", func(_ *extendsFixture, c *extendsChild) { c.Extends.Source.URL += "#x" }, e.CodeInvalidCatalog},
 		{"escape", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.URL = strings.Replace(c.Extends.URL, "base/", "base%2F", 1)
+			c.Extends.Source.URL = strings.Replace(c.Extends.Source.URL, "base/", "base%2F", 1)
 		}, e.CodeInvalidCatalog},
 		{"dot segment", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.URL = strings.Replace(c.Extends.URL, "base/", "unrelated/../base/", 1)
+			c.Extends.Source.URL = strings.Replace(c.Extends.Source.URL, "base/", "unrelated/../base/", 1)
 		}, e.CodeInvalidCatalog},
 		{"not a registry", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.URL = strings.Replace(c.Extends.URL, RegistryFile, "other.yaml", 1)
+			c.Extends.Source.URL = strings.Replace(c.Extends.Source.URL, RegistryFile, "other.yaml", 1)
 		}, e.CodeInvalidCatalog},
 		{"missing base", func(_ *extendsFixture, c *extendsChild) {
-			c.Extends.URL = strings.Replace(c.Extends.URL, "base/", "missing/", 1)
+			c.Extends.Source.URL = strings.Replace(c.Extends.Source.URL, "base/", "missing/", 1)
 		}, e.CodeFetchFailed},
 		{"nested extends", func(f *extendsFixture, c *extendsChild) {
-			raw := append(f.files["catalogs/base/registry.yaml"], []byte("extends:\n  url: "+extendsBase+"\n  sha256: sha256:"+strings.Repeat("0", 64)+"\n")...)
+			raw := append(f.files["catalogs/base/registry.yaml"], []byte("extends:\n  source:\n    url: "+extendsBase+"\n    sha256: sha256:"+strings.Repeat("0", 64)+"\n")...)
 			f.files["catalogs/base/registry.yaml"] = raw
-			c.Extends.SHA256 = digestOf(raw)
+			c.Extends.Source.SHA256 = digestOf(raw)
 		}, e.CodeInvalidCatalog},
 		{"unknown base field", func(f *extendsFixture, c *extendsChild) {
 			raw := append(f.files["catalogs/base/registry.yaml"], []byte("recipes: {}\n")...)
 			f.files["catalogs/base/registry.yaml"] = raw
-			c.Extends.SHA256 = digestOf(raw)
+			c.Extends.Source.SHA256 = digestOf(raw)
 		}, e.CodeInvalidCatalog},
 		{"changed base fragment", func(f *extendsFixture, _ *extendsChild) {
 			f.files["catalogs/shared/sources.yaml"] = append(f.files["catalogs/shared/sources.yaml"], '\n')

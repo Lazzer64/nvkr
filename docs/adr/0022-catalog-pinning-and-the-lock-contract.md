@@ -102,8 +102,9 @@ This authoring form establishes no execution or release acceptance.
 
 ```yaml
 extends:
-  url: https://raw.githubusercontent.com/<owner>/<repo>/<40-hex commit>/<path>/registry.yaml
-  sha256: sha256:<64 lowercase hex>
+  source:
+    url: https://raw.githubusercontent.com/<owner>/<repo>/<40-hex commit>/<path>/registry.yaml
+    sha256: sha256:<64 lowercase hex>
   patches:                     # optional RFC 6902 operations on the expanded base
     - {op: replace, path: /components/<name>/platforms, value: [linux/arm64]}
 ```
@@ -112,7 +113,7 @@ The URL names exactly one `raw.githubusercontent.com` file at a full lowercase c
 names, short commits, other hosts, ports, user information, queries, fragments, percent escapes and
 non-canonical paths fail `invalid-catalog`. The registry is the only place the base identity lives. The lock
 is unaware of inheritance: it remains lock v1 and must match the complete merged key set exactly.
-Authors write both values; NVKR never resolves a branch or tag into them. Moving the base is an ordinary
+Authors write both `source` values; NVKR never resolves a branch or tag into them. Moving the base is an ordinary
 reviewed registry edit, after which `catalog pin` and `bump` read the merged declarations like any other
 registry.
 
