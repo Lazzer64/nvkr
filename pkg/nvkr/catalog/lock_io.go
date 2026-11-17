@@ -164,11 +164,18 @@ func WriteLockContext(ctx context.Context, dir string, lock *PinLock) error {
 		return err
 	}
 
-	release, err := acquireCatalogWriter(abs)
+	guard, err := os.OpenFile(filepath.Join(abs, "."+LockFile+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return err
+		return e.Wrap(e.CodeInvalidCatalog, err, "opening lock writer guard")
 	}
-	defer release()
+	defer guard.Close()
+	if err := syscall.Flock(int(guard.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return e.New(e.CodeWriteConflict, "another catalog lock writer is active")
+		}
+		return e.Wrap(e.CodeInvalidCatalog, err, "locking lock writer guard")
+	}
+	defer func() { _ = syscall.Flock(int(guard.Fd()), syscall.LOCK_UN) }() // best effort during return
 	if err := requireCatalogContext(ctx, "catalog lock write"); err != nil {
 		return err
 	}
@@ -205,41 +212,9 @@ func WriteLockContext(ctx context.Context, dir string, lock *PinLock) error {
 		return err
 	}
 
-	if err := replaceCatalogFile(ctx, abs, LockFile, out); err != nil {
-		return err
-	}
-	lock.APIVersion = candidate.APIVersion
-	lock.Kind = candidate.Kind
-	lock.revision = revisionOf(out, true, abs).withRegistry(registryRaw)
-	return nil
-}
-
-// acquireCatalogWriter serializes same-checkout registry and lock writers with
-// one kernel-released advisory lock. A concurrent writer is a write conflict.
-func acquireCatalogWriter(abs string) (func(), error) {
-	guard, err := os.OpenFile(filepath.Join(abs, "."+LockFile+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	tmp, err := os.CreateTemp(abs, "."+LockFile+".stage-*")
 	if err != nil {
-		return nil, e.Wrap(e.CodeInvalidCatalog, err, "opening lock writer guard")
-	}
-	if err := syscall.Flock(int(guard.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = guard.Close()
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return nil, e.New(e.CodeWriteConflict, "another catalog lock writer is active")
-		}
-		return nil, e.Wrap(e.CodeInvalidCatalog, err, "locking lock writer guard")
-	}
-	return func() {
-		_ = syscall.Flock(int(guard.Fd()), syscall.LOCK_UN) // best effort during return
-		_ = guard.Close()
-	}, nil
-}
-
-// replaceCatalogFile stages out beside name, fsyncs it, renames it into place and
-// fsyncs the directory. Cancellation before rename aborts and removes the stage.
-func replaceCatalogFile(ctx context.Context, abs, name string, out []byte) error {
-	tmp, err := os.CreateTemp(abs, "."+name+".stage-*")
-	if err != nil {
-		return e.Wrap(e.CodeInvalidCatalog, err, "staging %s", name)
+		return e.Wrap(e.CodeInvalidCatalog, err, "staging %s", LockFile)
 	}
 	tmpName := tmp.Name()
 	committed := false
@@ -250,35 +225,35 @@ func replaceCatalogFile(ctx context.Context, abs, name string, out []byte) error
 	}()
 	if err := tmp.Chmod(0o644); err != nil {
 		_ = tmp.Close()
-		return e.Wrap(e.CodeInvalidCatalog, err, "setting staged %s permissions", name)
+		return e.Wrap(e.CodeInvalidCatalog, err, "setting staged lock permissions")
 	}
 	written, err := io.Copy(tmp, catalogContextReader{ctx: ctx, reader: bytes.NewReader(out)})
 	if err != nil || written != int64(len(out)) {
 		_ = tmp.Close()
 		if ctx.Err() != nil {
-			return normalizeCatalogContextError(ctx, err, "catalog file write")
+			return normalizeCatalogContextError(ctx, err, "catalog lock write")
 		}
 		if err == nil {
 			err = io.ErrShortWrite
 		}
-		return e.Wrap(e.CodeInvalidCatalog, err, "writing staged %s", name)
+		return e.Wrap(e.CodeInvalidCatalog, err, "writing staged %s", LockFile)
 	}
-	if err := requireCatalogContext(ctx, "catalog file write"); err != nil {
+	if err := requireCatalogContext(ctx, "catalog lock write"); err != nil {
 		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		return e.Wrap(e.CodeInvalidCatalog, err, "syncing staged %s", name)
+		return e.Wrap(e.CodeInvalidCatalog, err, "syncing staged %s", LockFile)
 	}
 	if err := tmp.Close(); err != nil {
-		return e.Wrap(e.CodeInvalidCatalog, err, "closing staged %s", name)
+		return e.Wrap(e.CodeInvalidCatalog, err, "closing staged %s", LockFile)
 	}
-	if err := requireCatalogContext(ctx, "catalog file write"); err != nil {
+	if err := requireCatalogContext(ctx, "catalog lock write"); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpName, filepath.Join(abs, name)); err != nil {
-		return e.Wrap(e.CodeInvalidCatalog, err, "atomically replacing %s", name)
+	if err := os.Rename(tmpName, target); err != nil {
+		return e.Wrap(e.CodeInvalidCatalog, err, "atomically replacing %s", LockFile)
 	}
 	dirHandle, err := os.Open(abs)
 	if err != nil {
@@ -292,6 +267,9 @@ func replaceCatalogFile(ctx context.Context, abs, name string, out []byte) error
 		return e.Wrap(e.CodeInvalidCatalog, err, "closing catalog directory")
 	}
 	committed = true
+	lock.APIVersion = candidate.APIVersion
+	lock.Kind = candidate.Kind
+	lock.revision = revisionOf(out, true, abs).withRegistry(registryRaw)
 	return nil
 }
 

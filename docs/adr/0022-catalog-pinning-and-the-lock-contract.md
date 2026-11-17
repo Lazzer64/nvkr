@@ -112,13 +112,9 @@ The URL names exactly one `raw.githubusercontent.com` file at a full lowercase c
 names, short commits, other hosts, ports, user information, queries, fragments, percent escapes and
 non-canonical paths fail `invalid-catalog`. The registry is the only place the base identity lives. The lock
 is unaware of inheritance: it remains lock v1 and must match the complete merged key set exactly.
-`catalog extends` is the only mutable-ref path. `--url` accepts a raw URL whose ref segment is
-`refs/heads/<branch>`, `refs/tags/<tag>` or a full commit; the repository's advertised refs decide where a
-slash-containing ref ends, and zero or several candidates fail. `--ref` re-resolves the current base's
-repository and path. Resolution uses `git ls-remote`, peeling annotated tags. The command fetches the base at
-that commit, admits the complete rewritten registry, and replaces only `url` and `sha256` under the catalog
-writer guard and a registry byte CAS. `catalog pin` and `bump` then read the merged declarations like any
-other registry.
+Authors write both values; NVKR never resolves a branch or tag into them. Moving the base is an ordinary
+reviewed registry edit, after which `catalog pin` and `bump` read the merged declarations like any other
+registry.
 
 Loading fetches the base over HTTPS without redirects, under the per-file and aggregate catalog byte bounds,
 and rejects bytes that differ from `sha256`. The base must be strict catalog v3 without its own `extends`; its

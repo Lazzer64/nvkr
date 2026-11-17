@@ -257,18 +257,6 @@ func cmdCatalog() *cli.Command {
 				Action: func(c *cli.Context) error { return pinSources(c, true) },
 			},
 			{
-				Name:  "extends",
-				Usage: "resolve a registry's remote base to one commit and rewrite its extends url and sha256",
-				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "url", Usage: "raw.githubusercontent.com registry URL at refs/heads/<branch>, refs/tags/<tag> or a full commit"},
-					&cli.StringFlag{Name: "ref", Usage: "refs/heads/<branch>, refs/tags/<tag> or a full commit for the registry's current base"},
-					&cli.BoolFlag{Name: "check", Usage: "resolve and show the base update without writing"},
-					&cli.StringFlag{Name: "dir", Required: true, Usage: "on-disk catalog directory to update"},
-					&cli.DurationFlag{Name: "timeout", Value: 5 * time.Minute, Usage: "maximum duration for ref resolution and base fetches"},
-				},
-				Action: updateCatalogBase,
-			},
-			{
 				Name:      "pin-artifacts",
 				Usage:     "resolve prebuilt component digests (per arch) and write them to the lock's artifacts section",
 				ArgsUsage: "[component...]",
@@ -344,45 +332,6 @@ func pinSources(c *cli.Context, bump bool) error {
 		fmt.Printf("wrote %d pin(s) to %s/%s\n", update.Changed, c.String("dir"), catalog.LockFile)
 	}
 	return nil
-}
-
-// updateCatalogBase maps flags to the catalog-owned base update. The lock is
-// untouched; `catalog pin` reconciles it with the merged declarations.
-func updateCatalogBase(c *cli.Context) error {
-	if c.Args().Len() != 0 {
-		return e.New(e.CodeUsage, "catalog extends takes no positional arguments")
-	}
-	view, err := selectCommandPresentation(c)
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(c.Context, c.Duration("timeout"))
-	defer cancel()
-	update, err := catalog.UpdateBaseContext(ctx, catalog.BaseUpdateRequest{
-		Directory: c.String("dir"), URL: c.String("url"), Ref: c.String("ref"), Check: c.Bool("check"),
-	})
-	if view.tui {
-		display := catalogCommandDisplay("Catalog base")
-		display.Fields = []progress.Field{{Label: "Ref", Value: update.Ref},
-			{Label: "Before", Value: orNone(update.BeforeURL)}, {Label: "After", Value: orNone(update.AfterURL)},
-			{Label: "SHA-256", Value: orNone(update.AfterSHA)}, {Label: "State", Value: catalogUpdateState(c.Bool("check"), update.Changed, err)}}
-		return showCommandResult(c, view, display, err)
-	}
-	var coded *e.Error
-	if err != nil && !(errors.As(err, &coded) && coded.Code == e.CodeDiff) {
-		return err
-	}
-	switch {
-	case !update.Changed:
-		fmt.Printf("  base already at %s (%s)\n", update.AfterURL, update.AfterSHA)
-	case update.WroteResult:
-		fmt.Printf("  base %s -> %s\n  sha256 %s -> %s\nwrote %s/%s; run `nvkr catalog pin` if inherited sources changed\n",
-			orNone(update.BeforeURL), update.AfterURL, orNone(update.BeforeSHA), update.AfterSHA, c.String("dir"), catalog.RegistryFile)
-	default:
-		fmt.Printf("  base %s -> %s\n  sha256 %s -> %s\n(dry-run) %s/%s would change\n",
-			orNone(update.BeforeURL), update.AfterURL, orNone(update.BeforeSHA), update.AfterSHA, c.String("dir"), catalog.RegistryFile)
-	}
-	return err
 }
 
 func pinArtifacts(c *cli.Context) error {

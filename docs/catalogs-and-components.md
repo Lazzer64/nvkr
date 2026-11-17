@@ -79,17 +79,14 @@ extends:
     - {op: replace, path: /components/nvke-controller-chart/platforms, value: [linux/arm64]}
 ```
 
-The URL always names a full commit, and `sha256` covers the base file's exact bytes. Let the tool write
-both from a branch or tag:
+The URL must name a full 40-character commit; branch names, tags and short commits are rejected, so
+the base never changes underneath the catalog. `sha256` covers the base file's exact bytes:
 
 ```sh
-nvkr catalog extends --dir <catalog> \
-  --url https://raw.githubusercontent.com/dsx-ai-factory/nvkr/refs/heads/main/inputs/catalogs/nvke/release/registry.yaml
-nvkr catalog extends --dir <catalog> --ref refs/tags/v0.1.0   # move an existing base to another branch or tag
+curl -fsSL <url> | shasum -a 256
 ```
 
-The command resolves the ref, checks that the result still loads, and rewrites only those two values.
-`--check` previews the change and returns `NVKR-E-DIFF`. Short commits are rejected.
+To move to a newer base, change both values in a reviewed edit.
 
 Loading fetches the base and its relative inputs (fragments, patch files and command-file operands) from
 that commit, applies the patches in order to its `sources` and `components`, then adds this registry's own
